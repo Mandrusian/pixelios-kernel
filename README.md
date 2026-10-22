@@ -4,7 +4,7 @@
 
 **Apple's XNU kernel and iOS 16 userland on a Google Pixel 6a (Tensor G1).**
 
-[![xnu build](https://github.com/PixOS-Project/pixelios/actions/workflows/xnu.yml/badge.svg)](https://github.com/PixOS-Project/pixelios/actions/workflows/xnu.yml)
+[![xnu build](https://github.com/PixOS-Project/pixelios-kernel/actions/workflows/xnu.yml/badge.svg)](https://github.com/PixOS-Project/pixelios-kernel/actions/workflows/xnu.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 PixeliOS is a research port. A small bare-metal **shim** is loaded with a temporary
@@ -54,7 +54,7 @@ then lives in the phone's `userdata` partition. It is inspired by, and builds on
 ## Quick start
 
 ```sh
-git clone https://github.com/PixOS-Project/pixelios && cd pixelios
+git clone https://github.com/PixOS-Project/pixelios-kernel && cd pixelios-kernel
 tools/setup-upstream.sh          # fetch ios-sweet at the pinned commit and patch it (see docs/CREDITS.md)
 tools/fetch-android-tools.sh     # mkbootimg / avbtool from AOSP
 tools/pix build bluejay --avb --qrlog
@@ -100,7 +100,7 @@ fastboot boot -> ABL -> shim (EL2, read-only, MMU off)
 `tools/pix devices | check | build | new-device` is the entry point. **Another Pixel?** Start with
 [Adding a device](https://github.com/PixOS-Project/pixelios-site/blob/main/docs/PORTING.md); Pixel 6 and 6 Pro share the 6a's SoC tree.
 
-Documentation site: <https://pixos-project.github.io/pixelios/>.
+Documentation site: <https://pixos-project.github.io/pixelios-site/>.
 
 ## Roadmap and contributing
 
