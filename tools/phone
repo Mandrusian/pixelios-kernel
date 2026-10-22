@@ -1,0 +1,686 @@
+#!/usr/bin/env python3
+"""Unified state-machine tool to observe and transition the Pixel phone state.
+
+Usage:
+  tools/phone goto TARGET [--timeout S] [--dry-run] [--yes-user-actions]
+  tools/phone state
+  tools/phone --self-test
+
+TARGET is one of: fastboot, recovery, android, ios, absent.
+Output: <= 6 short lines, last line:
+  RESULT: PASS|FAIL|PARTIAL|ERROR state=<final> target=<target> steps=<n>
+Exit codes: 0 PASS / 1 FAIL or PARTIAL / 2 ERROR.
+Details logged to logs/phone/<timestamp>/phone.log.
+
+Hardware and protocol citations:
+  - Shim USB gadget VID:PID 1209:0001 (CDC-ACM serial log, /dev/ttyACM*):
+    shim/usbproto.c:33-44, tools/usb-log.py:5,24-25, device/google/bluejay/docs/GATE0.md:163,
+    device/google/bluejay/docs/GATE0_RESULTS.md:25, docs/tasks/usb-stage2.md:23, tools/probe-run:74.
+  - iOS XNU USB Ethernet CDC-ECM gadget VID:PID 1209:0001, host MAC 02:00:5e:77:ee:01,
+    IP 192.168.7.2, UDP console log port 5140:
+    tools/xrun:61-69, tools/usbnet-log.py:3-10,36-39, tools/sweet-usbnet.sh:6,16,26,
+    docs/HANDOFF.md:496, docs/research/03-patch-inventory.md:117,
+    docs/research/09-xnu-usb-gs101.md:100,183.
+  - Fastboot USB IDs 18d1:d001 / 18d1:4ee0:
+    tools/phone-state:6, tools/hang-recover:49.
+  - Recovery/Android -> Fastboot (adb reboot bootloader):
+    tools/to-fastboot.sh:14, tools/hang-recover:62, docs/reviews/pstore-review-1.md:82,
+    docs/HANDOFF.md:67,357,365, NOTES.md:38.
+  - Self-reset timer bounds:
+    tools/hang-recover:10 (90s wait bound, 300s cap), tools/probe-run:9 (30s bound),
+    tools/xrun:37-39,83-88, docs/HANDOFF.md:354,368.
+  - Staged USBNET command:
+    tools/sweet-usbnet.sh:16, tools/xrun:63.
+"""
+
+import argparse
+import datetime
+import os
+import re
+import subprocess
+import sys
+import time
+
+ALLOWED_TARGETS = {"fastboot", "recovery", "android", "ios", "absent"}
+# Test hook only: multiplies the wait bounds that decide when to ask the user (the unit tests cannot wait 90 s).
+BOUND_SCALE = float(os.environ.get("PHONE_BOUND_SCALE", "1"))
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# Host staged USB-net command (printed for user reference, NEVER run via sudo)
+# Citation: tools/sweet-usbnet.sh:16, tools/xrun:63
+STAGED_USBNET_CMD = (
+    "USBNET: sudo sh -c 'i=$(ip -o link | grep -i 02:00:5e:77:ee:01 | "
+    "cut -d: -f2 | cut -d@ -f1 | xargs); ip addr replace 192.168.7.1/24 dev $i && "
+    "ip link set $i up'"
+)
+
+# -----------------------------------------------------------------------------
+# COMMAND ALLOWLIST (DATA)
+#
+# Fixed allowlist of permitted adb and fastboot commands.
+# Any command outside this set raises AssertionError in code and is refused.
+# Partition writes, flashing, erasing, and relocking are strictly forbidden.
+# -----------------------------------------------------------------------------
+COMMAND_ALLOWLIST = {
+    ("adb", "reboot", "bootloader"),
+    ("adb", "get-state"),
+    ("adb", "devices"),
+    ("adb", "shell", "getprop", "ro.product.device"),
+    ("adb", "shell", "getprop", "sys.boot_completed"),
+    ("fastboot", "devices"),
+    ("fastboot", "getvar", "product"),
+    (os.path.join(REPO_ROOT, "tools", "sweet-reset-bl"),),
+}
+
+# -----------------------------------------------------------------------------
+# TRANSITION TABLE (DATA)
+#
+# Only transitions established in existing tools/ or docs/ are present.
+# Any unlisted transition is treated as "unknown transition: needs measuring"
+# per AGENTS.md rule 7.
+#
+# Fields per step:
+#   cmd: list of arguments or None
+#   bound_s: max seconds to wait for this step before escalating / user action
+#   postcondition: state expected after step
+#   citation: tool / doc citation establishing this behavior
+#   user_action: message to print if software path not available or timed out
+# -----------------------------------------------------------------------------
+TRANSITION_TABLE = {
+    # Target: fastboot
+    ("recovery", "fastboot"): {
+        "steps": [
+            {
+                "cmd": ["adb", "reboot", "bootloader"],
+                "bound_s": 20,
+                "postcondition": "fastboot",
+                "citation": "tools/to-fastboot.sh:14, tools/hang-recover:62",
+                "user_action": None,
+            }
+        ]
+    },
+    ("android", "fastboot"): {
+        "steps": [
+            {
+                "cmd": ["adb", "reboot", "bootloader"],
+                "bound_s": 20,
+                "postcondition": "fastboot",
+                "citation": "tools/to-fastboot.sh:14, NOTES.md:38",
+                "user_action": None,
+            }
+        ]
+    },
+    ("booting", "fastboot"): {
+        "steps": [
+            {
+                "cmd": ["adb", "reboot", "bootloader"],
+                "bound_s": 30,
+                "postcondition": "fastboot",
+                "citation": "tools/to-fastboot.sh:11-14",
+                "user_action": None,
+            }
+        ]
+    },
+    ("ios", "fastboot"): {
+        # Phone resets via self-reset timer (sweetrestart= / watchdog; tools/hang-recover:10, tools/xrun:83-88)
+        # Software reset lands in recovery; adb reboot bootloader then brings it to fastboot.
+        "steps": [
+            {
+                # image with sweetremote=1 (xnu patch 0100): UDP magic -> PMU reset into the bootloader
+                "cmd": [os.path.join(REPO_ROOT, "tools", "sweet-reset-bl")],
+                "bound_s": 15,
+                "postcondition": "fastboot",
+                "citation": "xnu/patches/0100-sweet-remote-reset.patch, tools/sweet-reset-bl",
+                "user_action": None,
+            },
+            {
+                "cmd": None,
+                "bound_s": 90,
+                "postcondition": "fastboot",
+                "citation": "tools/hang-recover:10, tools/xrun:83-88, docs/HANDOFF.md:357,365",
+                "user_action": "NEED USER: hold Power+VolDown",
+            }
+        ]
+    },
+    ("shim-probe", "fastboot"): {
+        # Shim resets via watchdog or PSCI SYSTEM_RESET (tools/probe-run:9, tools/hang-recover:10)
+        "steps": [
+            {
+                "cmd": None,
+                "bound_s": 30,
+                "postcondition": "fastboot",
+                "citation": "tools/probe-run:9,74, tools/hang-recover:10",
+                "user_action": "NEED USER: hold Power+VolDown",
+            }
+        ]
+    },
+    ("hung", "fastboot"): {
+        # Present on USB but unresponsive; wait short bound then request user action
+        "steps": [
+            {
+                "cmd": None,
+                "bound_s": 10,
+                "postcondition": "fastboot",
+                "citation": "tools/hang-recover:10,21",
+                "user_action": "NEED USER: hold Power+VolDown",
+            }
+        ]
+    },
+    ("absent", "fastboot"): {
+        "steps": [
+            {
+                "cmd": None,
+                "bound_s": 1,
+                "postcondition": "fastboot",
+                "citation": "tools/hang-recover:21",
+                "user_action": "NEED USER: check cable / hold Power+VolDown",
+            }
+        ]
+    },
+
+    # Target: recovery
+    ("ios", "recovery"): {
+        # Software reset lands in recovery per docs/HANDOFF.md:357,365
+        "steps": [
+            {
+                "cmd": None,
+                "bound_s": 90,
+                "postcondition": "recovery",
+                "citation": "docs/HANDOFF.md:357,365, tools/hang-recover:10",
+                "user_action": "NEED USER: hold Power+VolDown",
+            }
+        ]
+    },
+    ("shim-probe", "recovery"): {
+        "steps": [
+            {
+                "cmd": None,
+                "bound_s": 30,
+                "postcondition": "recovery",
+                "citation": "docs/HANDOFF.md:357,365, tools/probe-run:9",
+                "user_action": "NEED USER: hold Power+VolDown",
+            }
+        ]
+    },
+    ("hung", "recovery"): {
+        "steps": [
+            {
+                "cmd": None,
+                "bound_s": 10,
+                "postcondition": "recovery",
+                "citation": "tools/hang-recover:10",
+                "user_action": "NEED USER: hold Power+VolDown",
+            }
+        ]
+    },
+    ("absent", "recovery"): {
+        "steps": [
+            {
+                "cmd": None,
+                "bound_s": 1,
+                "postcondition": "recovery",
+                "citation": "tools/hang-recover:21",
+                "user_action": "NEED USER: check cable / hold Power+VolDown",
+            }
+        ]
+    },
+
+    # Target: android
+    # fastboot -> android is NOT listed: `fastboot reboot` is not used by any tool in this repo (docs/research/10:66 only mentions it
+    # as the caller of a setter), so it is "unknown transition: needs measuring" (AGENTS.md rule 7).
+    ("hung", "android"): {
+        "steps": [
+            {
+                "cmd": None,
+                "bound_s": 10,
+                "postcondition": "android",
+                "citation": "tools/hang-recover:10",
+                "user_action": "NEED USER: hold Power+VolDown",
+            }
+        ]
+    },
+    ("absent", "android"): {
+        "steps": [
+            {
+                "cmd": None,
+                "bound_s": 1,
+                "postcondition": "android",
+                "citation": "tools/hang-recover:21",
+                "user_action": "NEED USER: check cable / hold Power+VolDown",
+            }
+        ]
+    },
+
+    # Target: absent
+    ("fastboot", "absent"): {
+        "steps": [
+            {
+                "cmd": None,
+                "bound_s": 1,
+                "postcondition": "absent",
+                "citation": "tools/hang-recover:21",
+                "user_action": "NEED USER: disconnect USB cable or power off phone",
+            }
+        ]
+    },
+    ("recovery", "absent"): {
+        "steps": [
+            {
+                "cmd": None,
+                "bound_s": 1,
+                "postcondition": "absent",
+                "citation": "tools/hang-recover:21",
+                "user_action": "NEED USER: disconnect USB cable or power off phone",
+            }
+        ]
+    },
+    ("android", "absent"): {
+        "steps": [
+            {
+                "cmd": None,
+                "bound_s": 1,
+                "postcondition": "absent",
+                "citation": "tools/hang-recover:21",
+                "user_action": "NEED USER: disconnect USB cable or power off phone",
+            }
+        ]
+    },
+    ("ios", "absent"): {
+        "steps": [
+            {
+                "cmd": None,
+                "bound_s": 1,
+                "postcondition": "absent",
+                "citation": "tools/hang-recover:21",
+                "user_action": "NEED USER: disconnect USB cable or power off phone",
+            }
+        ]
+    },
+    ("hung", "absent"): {
+        "steps": [
+            {
+                "cmd": None,
+                "bound_s": 1,
+                "postcondition": "absent",
+                "citation": "tools/hang-recover:21",
+                "user_action": "NEED USER: disconnect USB cable or power off phone",
+            }
+        ]
+    },
+}
+
+
+def get_log_dir():
+    ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    log_dir = os.path.join(REPO_ROOT, "logs", "phone", ts)
+    os.makedirs(log_dir, exist_ok=True)
+    return log_dir
+
+
+class Logger:
+    def __init__(self, log_path=None):
+        self.log_file = open(log_path, "a", encoding="utf-8") if log_path else None
+        self.console_lines = []
+        self.user_prompt_emitted = False
+
+    def log(self, msg):
+        if self.log_file:
+            self.log_file.write(f"{msg}\n")
+            self.log_file.flush()
+
+    def console(self, msg, flush=False):
+        self.log(msg)
+        self.console_lines.append(msg)
+        print(msg, flush=flush)
+
+    def emit_user_prompt(self, msg):
+        if not self.user_prompt_emitted:
+            print(msg, flush=True)
+            self.user_prompt_emitted = True
+            self.log(msg)
+
+    def close(self):
+        if self.log_file:
+            self.log_file.close()
+            self.log_file = None
+
+
+def make_report(logger, verdict, state, target, steps, extra_lines=None):
+    """Output at most 6 short lines to console, ending with RESULT line."""
+    if extra_lines:
+        for ln in extra_lines[:4]:
+            print(ln, flush=True)
+            if logger:
+                logger.log(ln)
+    final_line = f"RESULT: {verdict} state={state} target={target} steps={steps}"
+    print(final_line, flush=True)
+    if logger:
+        logger.log(final_line)
+    if verdict == "PASS":
+        return 0
+    elif verdict in ("FAIL", "PARTIAL"):
+        return 1
+    else:
+        return 2
+
+
+def redact_serials(text):
+    """Strip or redact device serial numbers from command output to comply with safety rules."""
+    if not text:
+        return ""
+    redacted = re.sub(
+        r"^([a-zA-Z0-9_\-]+)\s+(device|recovery|bootloader|fastboot)",
+        r"[REDACTED_SERIAL] \2",
+        text,
+        flags=re.M,
+    )
+    return redacted
+
+
+def assert_command_allowed(cmd):
+    """Safety assertion: verify cmd is in COMMAND_ALLOWLIST.
+    Refuses any flashing, wiping, partition modification, or unauthorized operations.
+    """
+    cmd_tuple = tuple(cmd)
+    if cmd_tuple not in COMMAND_ALLOWLIST:
+        raise AssertionError(
+            f"Safety check failed: command {cmd} is not in the allowed command set! Refusing execution."
+        )
+
+
+def run_bounded(cmd, timeout_s=8, logger=None):
+    """Run an external command bounded by timeout (using SIGKILL on expiry)."""
+    if logger:
+        logger.log(f"run_bounded: {' '.join(cmd)} (timeout={timeout_s}s)")
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
+        out = redact_serials(res.stdout)
+        err = redact_serials(res.stderr)
+        if logger:
+            logger.log(f"  exit {res.returncode}")
+            if out:
+                logger.log(f"  stdout: {out.strip()}")
+            if err:
+                logger.log(f"  stderr: {err.strip()}")
+        return res.returncode, out, err
+    except subprocess.TimeoutExpired:
+        if logger:
+            logger.log(f"  command timed out after {timeout_s}s")
+        return 124, "", "timed out"
+    except FileNotFoundError as e:
+        if logger:
+            logger.log(f"  command not found: {e}")
+        return 127, "", str(e)
+
+
+def verify_bluejay_target(transport, logger=None):
+    """Safety wrapper verification:
+    Confirms target device reports 'bluejay'.
+    - For adb: checks ro.product.device == bluejay.
+    - For fastboot: checks fastboot getvar product == bluejay ONLY when USB ID is 18d1:d001 or 18d1:4ee0.
+    Returns True if confirmed bluejay, False otherwise.
+    """
+    if transport == "adb":
+        rc, out, _ = safe_device_cmd(
+            ["adb", "shell", "getprop", "ro.product.device"],
+            timeout_s=4,
+            logger=logger,
+            skip_bluejay_check=True,
+        )
+        if rc == 0 and "bluejay" in out.strip():
+            return True
+        if logger:
+            logger.log(f"verify_bluejay_target(adb): device reported '{out.strip()}', not bluejay")
+        return False
+
+    elif transport == "fastboot":
+        # Check USB ID first to avoid the 120s hang if not in bootloader
+        rc_usb, usb_out, _ = run_bounded(["lsusb"], timeout_s=4, logger=logger)
+        is_fastboot_usb = (
+            rc_usb == 0
+            and re.search(r"ID 18d1:(d001|4ee0)\b", usb_out, re.IGNORECASE) is not None
+        )
+        if not is_fastboot_usb:
+            if logger:
+                logger.log("verify_bluejay_target(fastboot): USB ID is not 18d1:d001/4ee0; skipping getvar to avoid 120s hang")
+            return False
+
+        rc, out, err = safe_device_cmd(
+            ["fastboot", "getvar", "product"],
+            timeout_s=4,
+            logger=logger,
+            skip_bluejay_check=True,
+        )
+        combined = f"{out}\n{err}"
+        if "product: bluejay" in combined or "product:\tbluejay" in combined:
+            return True
+        if logger:
+            logger.log(f"verify_bluejay_target(fastboot): getvar output did not match bluejay: {combined.strip()}")
+        return False
+
+    return False
+
+
+def safe_device_cmd(cmd, timeout_s=15, logger=None, skip_bluejay_check=False):
+    """Single safety wrapper for every adb/fastboot call.
+    1. Asserts command is in COMMAND_ALLOWLIST.
+    2. Confirms target device is verified 'bluejay' before sending command.
+    3. Redacts serial numbers from output.
+    Any non-bluejay target results in refusal and no command being sent.
+    """
+    assert_command_allowed(cmd)
+
+    if not skip_bluejay_check:
+        transport = cmd[0]
+        if transport in ("adb", "fastboot"):
+            if not verify_bluejay_target(transport, logger=logger):
+                if logger:
+                    logger.log(f"safe_device_cmd: REFUSED {cmd} - target device is not verified bluejay")
+                return 1, "", "REFUSED: target is not verified bluejay (other-device)"
+
+    return run_bounded(cmd, timeout_s=timeout_s, logger=logger)
+
+
+def observe_state(logger=None):
+    """Observation layer classifying device state into:
+    absent, fastboot, recovery, android, booting, ios, shim-probe, hung, other-device.
+    Reuses tools/phone-state probe logic without duplicating probing code.
+    """
+    # 1. Check for iOS (XNU): ping 192.168.7.2 with 1s timeout (tools/sweet-usbnet.sh:26, docs/HANDOFF.md:496)
+    rc, _, _ = run_bounded(["ping", "-c", "1", "-W", "1", "192.168.7.2"], timeout_s=2, logger=logger)
+    if rc == 0:
+        if logger:
+            logger.log("observe_state: ping 192.168.7.2 answered -> state=ios")
+        return "ios"
+
+    # 2. Check lsusb for USB IDs
+    rc_usb, usb_out, _ = run_bounded(["lsusb"], timeout_s=5, logger=logger)
+    usb_has_gadget = (rc_usb == 0 and "1209:0001" in usb_out)
+    usb_has_google = (rc_usb == 0 and re.search(r"ID 18d1:", usb_out, re.IGNORECASE) is not None)
+
+    # If 1209:0001 gadget is on USB, check whether it is CDC-ECM (ios) or CDC-ACM (shim-probe)
+    # MAC 02:00:5e:77:ee:01 citation: tools/sweet-usbnet.sh:16, docs/HANDOFF.md:496, docs/research/03-patch-inventory.md:117
+    if usb_has_gadget:
+        _, link_out, _ = run_bounded(["ip", "-o", "link"], timeout_s=2, logger=logger)
+        if "02:00:5e:77:ee:01" in link_out.lower():
+            if logger:
+                logger.log("observe_state: 1209:0001 with MAC 02:00:5e:77:ee:01 -> state=ios")
+            return "ios"
+        if logger:
+            logger.log("observe_state: 1209:0001 CDC-ACM gadget -> state=shim-probe")
+        return "shim-probe"
+
+    # 3. Call tools/phone-state to reuse its adb/fastboot bluejay probing logic
+    ps_bin = os.environ.get("PHONE_STATE_BIN") or os.path.join(REPO_ROOT, "tools", "phone-state")
+    rc_ps, ps_out, _ = run_bounded([ps_bin], timeout_s=12, logger=logger)
+
+    # Parse RESULT: PASS|FAIL|ERROR state=<state> product=<prod>
+    m = re.search(r"^RESULT:\s+([A-Z]+)\s+state=(\w+)\s+product=(\w+)", ps_out, re.M)
+    if m:
+        _, ps_state, ps_prod = m.groups()
+        if logger:
+            logger.log(f"observe_state: phone-state returned rc={rc_ps} state={ps_state} product={ps_prod}")
+
+        if ps_state in ("fastboot", "recovery", "android", "booting") and ps_prod == "bluejay":
+            return ps_state
+
+        if ps_prod not in ("bluejay", "unknown"):
+            return "other-device"
+
+    # Distinguish hung vs other-device vs absent
+    # Requirement 2:
+    #   hung: USB present (ID 18d1:...) but neither adb nor fastboot responds
+    #   other-device: USB present, adb or fastboot responds, but reports product != bluejay
+    rc_adb, adb_out, _ = run_bounded(["adb", "devices"], timeout_s=2, logger=logger)
+    has_adb_dev = (rc_adb == 0 and bool(re.search(r"^\S+\s+(device|recovery|sideload)", adb_out, re.M)))
+
+    has_fb_dev = False
+    if rc_usb == 0 and re.search(r"ID 18d1:(d001|4ee0)\b", usb_out, re.IGNORECASE):
+        rc_fb, fb_out, _ = run_bounded(["fastboot", "devices"], timeout_s=2, logger=logger)
+        has_fb_dev = (rc_fb == 0 and bool(re.search(r"^\S+\s+fastboot", fb_out, re.M)))
+
+    if has_adb_dev or has_fb_dev:
+        return "other-device"
+
+    if usb_has_google:
+        return "hung"
+
+    return "absent"
+
+
+def cmd_state(args, logger):
+    state = observe_state(logger=logger)
+    verdict = "FAIL" if state in ("other-device", "hung") else "PASS"
+    return make_report(logger, verdict, state, "none", 0)
+
+
+def cmd_goto(args, logger):
+    target = args.target
+    if target not in ALLOWED_TARGETS:
+        return make_report(logger, "ERROR", "unknown", target, 0, [f"Invalid target: {target}"])
+
+    # Always print staged USBNET command when ios is involved or requested
+    if target == "ios":
+        logger.console(STAGED_USBNET_CMD, flush=True)
+
+    state = observe_state(logger=logger)
+    if state == "ios" and target != "ios":
+        logger.console(STAGED_USBNET_CMD, flush=True)
+
+    if state == "other-device":
+        return make_report(logger, "FAIL", state, target, 0, ["Safety: other-device detected; refusing commands"])
+
+    if state == target:
+        return make_report(logger, "PASS", state, target, 0)
+
+    # Check transition table
+    trans = TRANSITION_TABLE.get((state, target))
+    if trans is None:
+        msg = f"unknown transition: needs measuring ({state} -> {target})"
+        logger.log(msg)
+        return make_report(logger, "FAIL", state, target, 0, [msg])
+
+    if args.dry_run:
+        logger.log(f"dry-run: planned {len(trans['steps'])} step(s) to transition {state} -> {target}")
+        return make_report(logger, "PASS", state, target, 0, ["dry-run: no commands executed"])
+
+    steps_done = 0
+    start_time = time.time()
+    seen_state, state_since = None, start_time
+
+    while (time.time() - start_time) < args.timeout:
+        state = observe_state(logger=logger)
+        if state != seen_state:
+            seen_state, state_since = state, time.time()
+        if state == target:
+            return make_report(logger, "PASS", state, target, steps_done)
+        if state == "other-device":
+            return make_report(logger, "FAIL", state, target, steps_done, ["Safety: other-device detected; refusing commands"])
+
+        cur_trans = TRANSITION_TABLE.get((state, target))
+        if cur_trans is None:
+            msg = f"unknown transition: needs measuring ({state} -> {target})"
+            return make_report(logger, "FAIL", state, target, steps_done, [msg])
+
+        for step in cur_trans["steps"]:
+            if (time.time() - start_time) >= args.timeout:
+                break
+            # A wait-only step (cmd None) names how long the phone's own reset normally takes (bound_s): ask the user only after
+            # that, never at once (the phone may be about to reset by itself).
+            if step.get("user_action") and (step.get("cmd") or (time.time() - state_since) >= step.get("bound_s", 0) * BOUND_SCALE):
+                logger.emit_user_prompt(step["user_action"])
+            cmd = step.get("cmd")
+            if cmd:
+                rem_time = max(1, int(args.timeout - (time.time() - start_time)))
+                step_bound = min(step.get("bound_s", 15), rem_time)
+                steps_done += 1
+                rc, _, err = safe_device_cmd(cmd, timeout_s=step_bound, logger=logger)
+                if "REFUSED" in err:
+                    return make_report(logger, "FAIL", "other-device", target, steps_done, ["Device is not bluejay"])
+                state = observe_state(logger=logger)
+                if state == target:
+                    return make_report(logger, "PASS", state, target, steps_done)
+
+        time.sleep(0.5)
+
+    state = observe_state(logger=logger)
+    verdict = "PASS" if state == target else "FAIL"
+    return make_report(logger, verdict, state, target, steps_done, ["Timeout exceeded"] if verdict == "FAIL" else None)
+
+
+def cmd_self_test(args, logger):
+    test_script = os.path.join(REPO_ROOT, "tools", "test_phone_sm.py")
+    res = subprocess.run([sys.executable, test_script], capture_output=True, text=True)
+    if res.returncode == 0:
+        if res.stderr:
+            print(res.stderr.strip(), flush=True)
+        print("self-test PASS", flush=True)
+        return make_report(logger, "PASS", "fastboot", "fastboot", 0)
+    else:
+        if res.stdout:
+            print(res.stdout.strip(), flush=True)
+        if res.stderr:
+            print(res.stderr.strip(), file=sys.stderr, flush=True)
+        print("self-test FAIL", flush=True)
+        return make_report(logger, "FAIL", "unknown", "fastboot", 0, ["Self-test failed"])
+
+
+def main(argv=None):
+    if argv is None:
+        argv = sys.argv[1:]
+
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    subparsers = parser.add_subparsers(dest="command")
+
+    goto_p = subparsers.add_parser("goto", help="Transition phone to TARGET")
+    goto_p.add_argument("target", choices=sorted(ALLOWED_TARGETS))
+    goto_p.add_argument("--timeout", type=int, default=300, help="Overall timeout in seconds (default 300)")
+    goto_p.add_argument("--dry-run", action="store_true", help="Plan actions without running commands")
+    goto_p.add_argument("--yes-user-actions", action="store_true", help="Acknowledge manual user action instructions")
+
+    subparsers.add_parser("state", help="Report current observed phone state")
+
+    parser.add_argument("--self-test", action="store_true", help="Run self-tests")
+
+    args = parser.parse_args(argv)
+
+    log_dir = get_log_dir()
+    log_file = os.path.join(log_dir, "phone.log")
+    logger = Logger(log_file)
+    logger.log(f"Invocation: sys.argv={' '.join(sys.argv)}")
+
+    try:
+        if args.self_test:
+            return cmd_self_test(args, logger)
+        if args.command == "state":
+            return cmd_state(args, logger)
+        if args.command == "goto":
+            return cmd_goto(args, logger)
+        parser.print_usage(file=sys.stderr)
+        return make_report(logger, "ERROR", "unknown", "none", 0, ["Missing command"])
+    finally:
+        logger.close()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

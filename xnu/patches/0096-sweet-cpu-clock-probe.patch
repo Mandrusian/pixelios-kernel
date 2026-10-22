@@ -1,0 +1,70 @@
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -24,6 +24,8 @@
+ class SweetCPU;
+ static SweetCPU *sweet_cpus[MAX_CPUS];
+ static uint32_t sweet_cpus_registered;
++static uint64_t sweet_clk_ticks[SWEET_SMP_MAX_CPUS], sweet_clk_midr[SWEET_SMP_MAX_CPUS], sweet_clk_frq;
++static uint64_t sweet_clk_adds;
+ 
+ /* SMCCC 1.0: x0 is the signed PSCI result; do not assume x1-x17 survive. */
+ static int32_t
+@@ -167,6 +169,11 @@
+ 		}
+ 		IOLog("SWEET CPU: cpu=%u mpidr=0x%x came alive; SGI1 OK\n",
+ 		    i, topology->cpus[i].phys_id);
++		if (i < SWEET_SMP_MAX_CPUS) {
++			IOLog("SWEET CPU: cpu=%u midr=0x%llx cntfrq=%llu clock probe: %llu adds in %llu ticks -> ~%llu MHz\n",
++			    i, sweet_clk_midr[i], sweet_clk_frq, sweet_clk_adds, sweet_clk_ticks[i],
++			    sweet_clk_ticks[i] ? (sweet_clk_adds * sweet_clk_frq / sweet_clk_ticks[i]) / 1000000ULL : 0ULL);
++		}
+ 	}
+ 	/* Publish exactly once, after every selected CPU has completed initCPU(). */
+ 	ml_cpu_init_completed();
+@@ -185,6 +192,38 @@
+ 	IOCPU::free();
+ }
+ 
++/*
++ * Read-only clock estimate (no register writes): 8 dependent adds per iteration retire at one add per cycle on
++ * Cortex-A55/A76/X1 [guess: 1 cycle ALU latency], so MHz = adds * CNTFRQ / ticks. The bootloader leaves the
++ * CPU clocks at an unknown state and XNU has no cpufreq driver. Runs with IRQs masked, ~10 ms per CPU.
++ */
++static void
++sweet_cpu_clock_probe(unsigned int cpu)
++{
++	const uint64_t iters = 1000000, adds = iters * 8;
++	uint64_t ticks = 0, frq = __builtin_arm_rsr64("CNTFRQ_EL0");
++
++	for (int pass = 0; pass < 2; pass++) {
++		uint64_t x = 0, n = iters;
++		__builtin_arm_isb(0xf);
++		uint64_t t0 = __builtin_arm_rsr64("CNTVCT_EL0");
++		__asm__ volatile (
++			"1:\n\t"
++			"add %0, %0, #1\n\tadd %0, %0, #1\n\tadd %0, %0, #1\n\tadd %0, %0, #1\n\t"
++			"add %0, %0, #1\n\tadd %0, %0, #1\n\tadd %0, %0, #1\n\tadd %0, %0, #1\n\t"
++			"subs %1, %1, #1\n\tb.ne 1b"
++			: "+r"(x), "+r"(n) : : "cc");
++		__builtin_arm_isb(0xf);
++		ticks = __builtin_arm_rsr64("CNTVCT_EL0") - t0;
++	}
++	if (cpu < SWEET_SMP_MAX_CPUS) {   /* IOLog is not safe at splsched: startAll prints it */
++		sweet_clk_ticks[cpu] = ticks;
++		sweet_clk_midr[cpu] = __builtin_arm_rsr64("MIDR_EL1") & 0xffffffffULL;
++	}
++	sweet_clk_frq = frq;
++	sweet_clk_adds = adds;
++}
++
+ void
+ SweetCPU::initCPU(bool boot)
+ {
+@@ -203,6 +242,7 @@
+ 	kprintf("SWEET CPU: cpu=%u entered initCPU mpidr=0x%llx EL%llu IRQs=%u\n",
+ 	    getCPUNumber(), __builtin_arm_rsr64("MPIDR_EL1") & 0xffffULL,
+ 	    __builtin_arm_rsr64("CurrentEL") >> 2, ml_get_interrupts_enabled());
++	sweet_cpu_clock_probe(getCPUNumber());
+ 	__atomic_store_n(&initialized, 1, __ATOMIC_RELEASE);
+ }
+ 

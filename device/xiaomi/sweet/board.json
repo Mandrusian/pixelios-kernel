@@ -1,0 +1,15 @@
+{
+  "name": "Redmi Note 10 Pro",
+  "codename": "sweet",
+  "soc": "qualcomm/sm7150",
+  "status": "upstream legacy (ios-sweet); QEMU testing only",
+  "dram_banks": [
+    ["0x80000000", "0x80000000"],
+    ["0x100000000", "0xfcc00000"]
+  ],
+  "fb_base": "0x9c000000",
+  "fb_size": "0x1700000",
+  "fb_width": 1080,
+  "fb_height": 2400,
+  "fb_stride": 4320
+}

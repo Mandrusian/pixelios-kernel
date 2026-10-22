@@ -1,0 +1,87 @@
+diff --git a/bsd/dev/sweet_touch_gs101.c b/bsd/dev/sweet_touch_gs101.c
+index 6683693..443109a 100644
+--- a/bsd/dev/sweet_touch_gs101.c
++++ b/bsd/dev/sweet_touch_gs101.c
+@@ -13,7 +13,8 @@
+  *   sweettouchclk=0|1|2  0 (default) only READ the CMU_PERIC1 clock registers (always printed, "SWEET TOUCH: cmu");
+  *                        1 also force the USI11 clock chain (docs/research/19 section 6 steps 1,3,4,5: user mux,
+  *                        then gates ipclk_4, pclk_4, rstnsync); 2 additionally QCH |= ENABLE|CLOCK_REQ (step 6).
+- *                        The OPTION register (step 7) and the divider are never written.
++ *                        3 additionally sets CG_VAL of the CMU_TOP PERIC1_IP gate (the cmu_top line is printed in every run).
++ *                        The OPTION register (step 7) and the dividers are never written.
+  *   sweettouchvar=0|1    1: if the first identify times out, try up to 5 SPI/USI variants (A..E below) and stop at the
+  *                        first whose burst completes, then identify again (default 0: only the register dump runs)
+  *
+@@ -137,6 +138,12 @@ static struct {
+ 		uint32_t sel_bit, busy_bit, manual_bit, val_bit, auto_bit, qch_en_bit, qch_req_bit;
+ 		vm_offset_t va;
+ 	} cmu;
++	struct {                          /* CMU_TOP PERIC1_IP chain (docs/research/19 section 1); ok = all props present */
++		bool ok;
++		uint64_t base, size;
++		uint32_t mux, div, gate, gate_bit;
++		vm_offset_t va;
++	} top;
+ 	int clk_mode, var;
+ 	uint32_t last_st, last_ch;   /* STATUS / CH_CFG at the last burst timeout */
+ 	int mode, mux_force;
+@@ -449,6 +456,14 @@ tg_parse_cmu(DTEntry node)
+ 	tg.cmu.base = reg[0];
+ 	tg.cmu.size = reg[1];
+ 	tg.cmu.ok = true;
++	if (tg_dt_u64(node, "cmutop-reg", reg, 2) && tg_dt_u32(node, "cmutop-mux", &tg.top.mux, 1) &&
++	    tg_dt_u32(node, "cmutop-div", &tg.top.div, 1) && tg_dt_u32(node, "cmutop-gate", &tg.top.gate, 1) &&
++	    tg_dt_u32(node, "cmutop-gate-bit", &tg.top.gate_bit, 1) && tg.top.mux < reg[1] && tg.top.div < reg[1] &&
++	    tg.top.gate < reg[1] && tg.top.gate_bit < 32u) {
++		tg.top.base = reg[0];
++		tg.top.size = reg[1];
++		tg.top.ok = true;
++	}
+ }
+ 
+ /* ---- CMU_PERIC1 clock chain of USI11 (docs/research/19) ---- */
+@@ -472,6 +487,11 @@ tg_cmu_dump(void)
+ 	    tg.cmu.option, tg_cmu_rd(tg.cmu.option), tg.cmu.mux_usi, tg_cmu_rd(tg.cmu.mux_usi),
+ 	    tg.cmu.mux_bus, tg_cmu_rd(tg.cmu.mux_bus), tg.cmu.mux_bus_auto, tg_cmu_rd(tg.cmu.mux_bus_auto),
+ 	    tg.cmu.mux_usi_auto, tg_cmu_rd(tg.cmu.mux_usi_auto), tg.cmu.div, tg_cmu_rd(tg.cmu.div));
++	if (tg.top.ok) {
++		printf("SWEET TOUCH: cmu_top %#llx: PERIC1_IP mux[%#x]=%#x div[%#x]=%#x gate[%#x]=%#x\n",
++		    (unsigned long long)tg.top.base, tg.top.mux, tg_rd(tg.top.va, tg.top.mux), tg.top.div,
++		    tg_rd(tg.top.va, tg.top.div), tg.top.gate, tg_rd(tg.top.va, tg.top.gate));
++	}
+ 	printf("SWEET TOUCH: cmu gates: ipclk_4[%#x]=%#x pclk_4[%#x]=%#x rstnsync[%#x]=%#x QCH[%#x]=%#x\n",
+ 	    tg.cmu.gate_ipclk, tg_cmu_rd(tg.cmu.gate_ipclk), tg.cmu.gate_pclk, tg_cmu_rd(tg.cmu.gate_pclk),
+ 	    tg.cmu.gate_rstn, tg_cmu_rd(tg.cmu.gate_rstn), tg.cmu.qch, tg_cmu_rd(tg.cmu.qch));
+@@ -513,6 +533,12 @@ tg_cmu_enable(void)
+ 	if (!tg.cmu.ok || tg.clk_mode < 1) {
+ 		return true;
+ 	}
++	if (tg.clk_mode >= 3 && tg.top.ok) {    /* CG_VAL of the TOP gate only; mux and divider are left as ABL set them */
++		uint32_t g = tg_rd(tg.top.va, tg.top.gate), b = 1u << tg.top.gate_bit;
++		tg_wr(tg.top.va, tg.top.gate, g | b);
++		printf("SWEET TOUCH: cmu_top gate [%#x]: %#x -> wrote %#x -> %#x\n", tg.top.gate, g, g | b,
++		    tg_rd(tg.top.va, tg.top.gate));
++	}
+ 	v = tg_cmu_rd(tg.cmu.mux_usi);
+ 	printf("SWEET TOUCH: cmu: sweettouchclk=%d, forcing the USI11 clock chain\n", tg.clk_mode);
+ 	if (v & sel) {
+@@ -554,6 +580,10 @@ tg_map_all(void)
+ 	tg.usi = tg.spi ? tg.spi + (vm_offset_t)tg.usi_off : 0;
+ 	if (tg.cmu.ok) {
+ 		tg.cmu.va = tg_map(tg.cmu.base, tg.cmu.size);
++		if (tg.top.ok && !(tg.top.va = tg_map(tg.top.base, tg.top.size))) {
++			printf("SWEET TOUCH: cmu_top mapping failed, not used\n");
++			tg.top.ok = false;
++		}
+ 		if (!tg.cmu.va) {
+ 			printf("SWEET TOUCH: cmu mapping failed, CMU not used\n");
+ 			tg.cmu.ok = false;
+@@ -986,7 +1016,7 @@ sweet_touch_gs101_init(void)
+ 	}
+ 	tg_parse_cmu(node);
+ 	tg.var = var == 1;
+-	tg.clk_mode = clk < 0 ? 0 : clk > 2 ? 2 : clk;
++	tg.clk_mode = clk < 0 ? 0 : clk > 3 ? 3 : clk;
+ 	tg.mode = mode;
+ 	tg.delay_s = (uint32_t)delay_s;
+ 	tg.mux_force = mux == 1;

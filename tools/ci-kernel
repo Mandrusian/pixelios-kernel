@@ -1,0 +1,77 @@
+#!/bin/bash
+# Find (or dispatch) the xnu.yml CI run for a commit, wait for it, download + verify the kernel, print ONE short report.
+#   tools/ci-kernel [--commit SHA|HEAD] [--dispatch] [--expect-string STR]... [--out DIR] [--wait MIN]
+#   --out DIR   download there instead of ~/pixelios-artifacts/xnu-<short sha> (and do not prune old artifact dirs)
+# Prunes ~/pixelios-artifacts/xnu-<7 hex> dirs older than the 3 newest (only the ones this tool names; xnu-0089 etc. stay).
+# Progress: ~/pixelios-artifacts/scratch/ci-kernel-<short>.log. Exit: 0 PASS, 1 FAIL, 2 ERROR.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+A=${ARTIFACTS:-$HOME/pixelios-artifacts}
+commit=HEAD; dispatch=0; out=""; wait_min=25; strs=()
+while [ $# -gt 0 ]; do case "$1" in
+	--commit) commit=$2; shift 2 ;; --dispatch) dispatch=1; shift ;; --expect-string) strs+=("$2"); shift 2 ;;
+	--out) out=$2; shift 2 ;; --wait) wait_min=$2; shift 2 ;;
+	*) echo "unknown option $1 (see the header of tools/ci-kernel)" >&2; exit 2 ;; esac; done
+
+sha=$(git rev-parse "$commit^{commit}" 2>/dev/null) || { echo "RESULT: ERROR cannot resolve commit '$commit'"; exit 2; }
+short=${sha:0:7}; mkdir -p "$A/scratch"; LOG=$A/scratch/ci-kernel-$short.log; : >"$LOG"
+default_out=0; [ -n "$out" ] || { out=$A/xnu-$short; default_out=1; }
+
+# finish RESULT reason [extra lines...]: print the report, write report.json, exit with the right code
+finish() {
+	local res=$1 why=$2; shift 2
+	{ echo "RESULT: $res $why"; [ $# -eq 0 ] || printf '%s\n' "$@"; echo "log: $LOG"; } | tee "$LOG.report"
+	python3 -c 'import json,sys; print(json.dumps({"result":sys.argv[1],"reason":sys.argv[2],"commit":sys.argv[3],"run":sys.argv[4],"kernel":sys.argv[5],"report":sys.stdin.read().splitlines()},indent=1))' \
+		"$res" "$why" "$sha" "${run:-}" "${kernel:-}" <"$LOG.report" >"$LOG.json"
+	[ -f "${kernel:-/nonexistent}" ] && cp "$LOG.json" "$out/report.json" || true
+	case $res in PASS) exit 0 ;; ERROR) exit 2 ;; *) exit 1 ;; esac
+}
+run=""; kernel=""
+gh auth status >>"$LOG" 2>&1 || finish ERROR "gh is not authenticated"
+
+if [ "$dispatch" = 1 ]; then
+	gh workflow run xnu.yml --ref "$(git rev-parse --abbrev-ref HEAD)" >>"$LOG" 2>&1 || finish ERROR "gh workflow run failed (is the branch pushed?)"
+	sleep 10
+fi
+deadline=$(( $(date +%s) + wait_min * 60 ))
+while :; do
+	# a push-triggered run is cancelled by the dispatched one: skip cancelled runs, the dispatched run is the real one
+	run=$(gh run list --workflow xnu.yml --commit "$sha" --limit 10 --json databaseId,conclusion --jq '[.[] | select(.conclusion != "cancelled")][0].databaseId // empty' 2>>"$LOG" || true)
+	[ -n "$run" ] && break
+	[ "$(date +%s)" -lt "$deadline" ] || finish ERROR "no xnu.yml run for $short appeared within ${wait_min} min (not pushed? paths filter?)"
+	echo "waiting for a run of $short" >>"$LOG"; sleep 20
+done
+echo "run $run" >>"$LOG"
+left=$(( deadline - $(date +%s) )); [ "$left" -gt 60 ] || left=60
+timeout "$left" gh run watch "$run" --interval 20 --exit-status >>"$LOG" 2>&1 || true
+read -r status concl url < <(gh run view "$run" --json status,conclusion,url --jq '[.status,.conclusion,.url]|join(" ")')
+[ "$status" = completed ] || finish ERROR "run $run still $status after ${wait_min} min" "RUN: $run $url"
+if [ "$concl" != success ]; then
+	finish FAIL "CI run $run concluded $concl for $short" "RUN: $run $concl $url" "FAILED STEP LOG (last 25 lines):" \
+		"$(gh run view "$run" --log-failed 2>>"$LOG" | tail -n 25 | cut -c1-200)"
+fi
+
+mkdir -p "$out"
+if ! (cd "$out" && sha256sum -c --quiet SHA256SUMS) >>"$LOG" 2>&1; then     # already downloaded and intact = reuse (gh refuses to overwrite)
+	rm -f "$out"/kernel.* "$out"/SHA256SUMS
+	gh run download "$run" -n xnu-kernel -D "$out" >>"$LOG" 2>&1 || finish ERROR "artifact xnu-kernel download failed for run $run" "RUN: $run $concl $url"
+fi
+kernel=$out/kernel.development.sweet; [ -f "$kernel" ] || kernel=$(ls "$out"/kernel.* 2>/dev/null | grep -v '\.link$' | head -1 || true)
+[ -f "$kernel" ] || finish ERROR "artifact has no kernel.* file" "RUN: $run $concl $url"
+sums=ok; (cd "$out" && sha256sum -c SHA256SUMS >>"$LOG" 2>&1) || sums=MISMATCH
+lines=("RUN: $run (success) $url" "KERNEL: $kernel | sha256 $(sha256sum "$kernel" | cut -c1-16) | $(stat -c %s "$kernel") bytes | SHA256SUMS $sums")
+miss=0
+for s in ${strs[@]+"${strs[@]}"}; do
+	n=$(strings -a "$kernel" | grep -cF -- "$s" || true)
+	if [ "$n" -gt 0 ]; then lines+=("STRING FOUND   \"$s\" ($n hits)"); else lines+=("STRING MISSING \"$s\""); miss=$((miss + 1)); fi
+done
+if [ "$default_out" = 1 ]; then
+	pruned=()
+	# newest first; keep 3
+	while read -r d; do rm -rf -- "$d"; pruned+=("$d"); done < <(
+		find "$A" -maxdepth 1 -type d -regextype posix-extended -regex '.*/xnu-[0-9a-f]{7}' -printf '%T@ %p\n' | sort -rn | tail -n +4 | cut -d' ' -f2-)
+	lines+=("PRUNED: ${pruned[*]:-nothing}")
+fi
+[ "$sums" = ok ] || finish FAIL "run $run ok but the artifact does not match SHA256SUMS" "${lines[@]}"
+[ "$miss" = 0 ] || finish FAIL "run $run ok but $miss expected string(s) missing from the kernel" "${lines[@]}"
+finish PASS "CI run $run success for $short; kernel verified${strs[0]:+, ${#strs[@]} string(s) found}" "${lines[@]}"

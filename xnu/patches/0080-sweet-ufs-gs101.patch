@@ -1,0 +1,154 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -72,7 +72,8 @@
+ #define UFS_BLOCK       4096u
+ #define BOUNCE_SIZE     (1u << 20)
+ #define PRDT_CHUNK      (256u << 10)            /* PRDT byte count field: 18 bits */
+-#define PRDT_MAX        (BOUNCE_SIZE / PRDT_CHUNK)
++#define PRDT_CHUNK_GS   4096u                   /* gs101: each PRD entry moves at most 4 KiB */
++#define PRDT_MAX        (BOUNCE_SIZE / PRDT_CHUNK_GS)
+ #define CMD_TIMEOUT_NS  (5ull * NSEC_PER_SEC)
+ #define CMD_SPIN_NS     (50ull * NSEC_PER_USEC)
+ #define CMD_SLEEP_NS    (200ull * NSEC_PER_USEC)
+@@ -104,6 +105,7 @@
+ 	uint64_t dma_pa;
+ 	uint8_t lun;
+ 	uint8_t tag;
++	bool gs101;                             /* Pixel 6a: ADT compatible google,gs101-ufs */
+ 	uint64_t first_block, nblocks;          /* partition, in 4 KiB device blocks */
+ 	uint32_t secsize;                       /* logical sector size for the BSD layer */
+ 	bool writable;                          /* boot-arg ufsrw=1 */
+@@ -148,7 +150,10 @@
+ static int
+ ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+ {
+-	struct utrd *utrd = (struct utrd *)(su.dma + DMA_UTRL);
++	/* gs101: HCI_UTRL_NEXUS_TYPE is 0xFFFFFFFE, slot 0 is device management only: SCSI uses slot 1 */
++	const unsigned slot = su.gs101 ? 1 : 0;
++	const uint32_t slot_bit = 1u << slot;
++	struct utrd *utrd = (struct utrd *)(su.dma + DMA_UTRL) + slot;
+ 	struct ucd *ucd = (struct ucd *)(su.dma + DMA_UCD);
+ 	uint64_t ucd_pa = su.dma_pa + DMA_UCD, bounce_pa = su.dma_pa + DMA_BOUNCE;
+ 
+@@ -159,7 +164,7 @@
+ 	ucd->cmd[0] = 0x01;                     /* COMMAND UPIU */
+ 	ucd->cmd[1] = len ? (write ? 0x20 : 0x40) : 0x00;      /* W: data out, R: data in */
+ 	ucd->cmd[2] = su.lun;
+-	ucd->cmd[3] = ++su.tag;
++	ucd->cmd[3] = su.gs101 ? (uint8_t)slot : ++su.tag;
+ 	ucd->cmd[12] = (uint8_t)(len >> 24);
+ 	ucd->cmd[13] = (uint8_t)(len >> 16);
+ 	ucd->cmd[14] = (uint8_t)(len >> 8);
+@@ -171,20 +176,23 @@
+ 	utrd->dw2 = 0x0f;                       /* OCS invalid until updated */
+ 	utrd->ucdba = (uint32_t)ucd_pa;
+ 	utrd->ucdbau = (uint32_t)(ucd_pa >> 32);
+-	utrd->resp = (512u / 4) << 16 | (512u / 4);
++	/* gs101 (UFSHCD_QUIRK_PRDT_BYTE_GRAN): response/PRDT offsets and lengths in bytes. */
++	const uint32_t gran = su.gs101 ? 1 : 4;
++	const uint32_t prdt_chunk = su.gs101 ? PRDT_CHUNK_GS : PRDT_CHUNK;
++	utrd->resp = (512u / gran) << 16 | (512u / gran);
+ 	if (len) {
+ 		uint32_t n = 0;
+-		for (uint32_t done = 0; done < len; done += PRDT_CHUNK, n++) {
+-			uint32_t chunk = MIN(PRDT_CHUNK, len - done);
++		for (uint32_t done = 0; done < len; done += prdt_chunk, n++) {
++			uint32_t chunk = MIN(prdt_chunk, len - done);
+ 			ucd->prdt[n].addr_lo = (uint32_t)(bounce_pa + done);
+ 			ucd->prdt[n].addr_hi = (uint32_t)((bounce_pa + done) >> 32);
+ 			ucd->prdt[n].dbc = chunk - 1;
+ 		}
+-		utrd->prdt = (1024u / 4) << 16 | n;
++		utrd->prdt = (1024u / gran) << 16 | (su.gs101 ? 16 * n : n);
+ 	}
+ 
+ 	if (su.cache) {
+-		dma_clean(DMA_UTRL, sizeof(*utrd));
++		dma_clean(DMA_UTRL + slot * sizeof(*utrd), sizeof(*utrd));
+ 		dma_clean(DMA_UCD, 16 + cdb_len);
+ 		dma_sync(DMA_UCD + offsetof(struct ucd, resp), sizeof(ucd->resp));
+ 		if (len) {
+@@ -192,7 +200,7 @@
+ 			    (utrd->prdt & 0xffff) * sizeof(ucd->prdt[0]));
+ 		}
+ 	} else {
+-		dma_sync(DMA_UTRL, sizeof(*utrd));
++		dma_sync(DMA_UTRL + slot * sizeof(*utrd), sizeof(*utrd));
+ 		dma_sync(DMA_UCD, sizeof(*ucd));
+ 	}
+ 	if (len) {
+@@ -204,7 +212,7 @@
+ 	}
+ 	__builtin_arm_dsb(0xf);
+ 
+-	ufs_wr(REG_UTRLDBR, 1);
++	ufs_wr(REG_UTRLDBR, slot_bit);
+ 	uint64_t deadline;
+ 	nanoseconds_to_absolutetime(CMD_TIMEOUT_NS, &deadline);
+ 	deadline += mach_absolute_time();
+@@ -216,10 +224,11 @@
+ 		spin_until += mach_absolute_time();
+ 		nanoseconds_to_absolutetime(CMD_SLEEP_NS, &sleep_interval);
+ 	}
+-	while (ufs_rd(REG_UTRLDBR) & 1) {
++	while (ufs_rd(REG_UTRLDBR) & slot_bit) {
+ 		uint64_t now = mach_absolute_time();
+ 		if (now > deadline) {
+-			ufs_wr(REG_UTRLCLR, ~1u);
++			/* gs101 has an inverted UTRLCLR (write the slot mask); standard hosts want ~mask */
++			ufs_wr(REG_UTRLCLR, su.gs101 ? slot_bit : ~slot_bit);
+ 			printf("SWEET UFS: command 0x%02x timed out\n", cdb[0]);
+ 			return ETIMEDOUT;
+ 		}
+@@ -237,7 +246,15 @@
+ 	__builtin_arm_dsb(0xf);
+ 	ufs_wr(REG_IS, ufs_rd(REG_IS));         /* acknowledge completion status */
+ 
+-	dma_sync(DMA_UTRL, sizeof(*utrd));
++	/* gs101: the UTRD write-back can land a little after the doorbell clears */
++	for (int w = 0; su.gs101 && w < 100; w++) {
++		dma_sync(DMA_UTRL + slot * sizeof(*utrd), sizeof(*utrd));
++		if ((utrd->dw2 & 0xff) != 0x0f) {
++			break;
++		}
++		delay(1);
++	}
++	dma_sync(DMA_UTRL + slot * sizeof(*utrd), sizeof(*utrd));
+ 	if (su.cache) {
+ 		dma_sync(DMA_UCD + offsetof(struct ucd, resp), sizeof(ucd->resp));
+ 	} else {
+@@ -248,6 +265,9 @@
+ 	}
+ 
+ 	uint32_t ocs = utrd->dw2 & 0xff;
++	if (su.gs101 && ocs == 7 && (ucd->resp[6] || ucd->resp[7])) {
++		ocs = 0;        /* BROKEN_OCS_FATAL_ERROR: OCS 7 with a response present is a normal completion */
++	}
+ 	if (ocs || ucd->resp[0] != 0x21 || ucd->resp[6] || ucd->resp[7]) {
+ 		printf("SWEET UFS: command 0x%02x failed: ocs 0x%x upiu 0x%x response 0x%x status 0x%x\n",
+ 		    cdb[0], ocs, ucd->resp[0], ucd->resp[6], ucd->resp[7]);
+@@ -357,7 +377,8 @@
+ ufs_take_over_host(void)
+ {
+ 	uint32_t hce = ufs_rd(REG_HCE), hcs = ufs_rd(REG_HCS);
+-	if (!(hce & 1) || !(hcs & HCS_DP) || !(hcs & HCS_UTRLRDY)) {
++	/* gs101: the shim's cold init leaves HCE + link up; UTRLRDY only follows UTRLRSR below. */
++	if (!(hce & 1) || !(hcs & HCS_DP) || (!su.gs101 && !(hcs & HCS_UTRLRDY))) {
+ 		printf("SWEET UFS: host not ready (hce 0x%x hcs 0x%x)\n", hce, hcs);
+ 		return ENXIO;
+ 	}
+@@ -598,6 +619,14 @@
+ 		printf("SWEET UFS: no /sweet-ufs node in the device tree\n");
+ 		return ENXIO;
+ 	}
++	{
++		char const *compat = NULL;
++		unsigned int csize = 0;
++		if (SecureDTGetProperty(node, "compatible", (void const **)&compat, &csize) == kSuccess &&
++		    compat && csize >= 15 && strncmp(compat, "google,gs101-ufs", 15) == 0) {
++			su.gs101 = true;
++		}
++	}
+ 	PE_parse_boot_argn("ufsroot", want, sizeof(want));
+ 	uint32_t rw = 0;
+ 	PE_parse_boot_argn("ufsrw", &rw, sizeof(rw));

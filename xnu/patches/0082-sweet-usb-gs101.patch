@@ -1,0 +1,289 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -21,6 +21,8 @@
+ #include <vm/pmap.h>
+ #include <vm/vm_kern.h>
+ #include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include <libkern/libkern.h>
+ #include <kern/locks.h>
+ #include <sys/kpi_mbuf.h>
+ #include <sys/kpi_socket.h>
+@@ -38,8 +40,11 @@
+ #include <sys/kern_event.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern vm_offset_t ml_io_map_wcomb(vm_offset_t, vm_size_t);
+ void sweet_usb_probe(void);
+-static void sweet_usb_gadget_start(vm_offset_t dwc);
++static void sweet_usb_gadget_start(vm_offset_t dwc, uint64_t pool_pa);
++static bool sweet_usb_probe_gs101(int mode);
++static void usb_dump_dwc3(vm_offset_t dwc);
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ 
+ #define GCC_PA                  0x00100000
+@@ -73,6 +78,20 @@
+ 	return v;
+ }
+ 
++/* Read-only report of the DWC3 global/device registers (same offsets on Qualcomm and gs101). */
++static void
++usb_dump_dwc3(vm_offset_t dwc)
++{
++	printf("SWEET USB: DWC3 GSNPSID 0x%08x GCTL 0x%08x GSTS 0x%08x GUSB2PHYCFG 0x%08x\n",
++	    usb_rd(dwc, 0xc120), usb_rd(dwc, 0xc110), usb_rd(dwc, 0xc118), usb_rd(dwc, 0xc200));
++	printf("SWEET USB: DWC3 DCFG 0x%08x DCTL 0x%08x DEVTEN 0x%08x DSTS 0x%08x DALEPENA 0x%08x\n",
++	    usb_rd(dwc, 0xc700), usb_rd(dwc, 0xc704), usb_rd(dwc, 0xc708), usb_rd(dwc, 0xc70c),
++	    usb_rd(dwc, 0xc720));
++	printf("SWEET USB: DWC3 GEVNTADR 0x%08x%08x GEVNTSIZ 0x%08x GEVNTCOUNT 0x%08x GHWPARAMS0 0x%08x\n",
++	    usb_rd(dwc, 0xc404), usb_rd(dwc, 0xc400), usb_rd(dwc, 0xc408), usb_rd(dwc, 0xc40c),
++	    usb_rd(dwc, 0xc140));
++}
++
+ void
+ sweet_usb_probe(void)
+ {
+@@ -85,6 +104,10 @@
+ 	if (!enabled) {
+ 		return;
+ 	}
++	/* Pixel 6a (gs101): the ADT's /sweet-usb node selects a path without any Qualcomm block. */
++	if (sweet_usb_probe_gs101(enabled)) {
++		return;
++	}
+ 	vm_offset_t gcc = ml_io_map(GCC_PA, GCC_SIZE);
+ 	if (gcc == 0) {
+ 		printf("SWEET USB: GCC map failed\n");
+@@ -108,16 +131,9 @@
+ 		printf("SWEET USB: DWC3 map failed\n");
+ 		return;
+ 	}
+-	printf("SWEET USB: DWC3 GSNPSID 0x%08x GCTL 0x%08x GSTS 0x%08x GUSB2PHYCFG 0x%08x\n",
+-	    usb_rd(dwc, 0xc120), usb_rd(dwc, 0xc110), usb_rd(dwc, 0xc118), usb_rd(dwc, 0xc200));
+-	printf("SWEET USB: DWC3 DCFG 0x%08x DCTL 0x%08x DEVTEN 0x%08x DSTS 0x%08x DALEPENA 0x%08x\n",
+-	    usb_rd(dwc, 0xc700), usb_rd(dwc, 0xc704), usb_rd(dwc, 0xc708), usb_rd(dwc, 0xc70c),
+-	    usb_rd(dwc, 0xc720));
+-	printf("SWEET USB: DWC3 GEVNTADR 0x%08x%08x GEVNTSIZ 0x%08x GEVNTCOUNT 0x%08x GHWPARAMS0 0x%08x\n",
+-	    usb_rd(dwc, 0xc404), usb_rd(dwc, 0xc400), usb_rd(dwc, 0xc408), usb_rd(dwc, 0xc40c),
+-	    usb_rd(dwc, 0xc140));
++	usb_dump_dwc3(dwc);
+ 	if (enabled >= 2) {
+-		sweet_usb_gadget_start(dwc);
++		sweet_usb_gadget_start(dwc, 0);
+ 	}
+ 	if (cbcr[5] & CBCR_CLK_OFF) {
+ 		printf("SWEET USB: ahb2phy clock off; QUSB2 PHY not read\n");
+@@ -176,6 +192,7 @@
+ 
+ #define DCTL_RUN_STOP   (1u << 31)
+ #define DCTL_CSFTRST    (1u << 30)
++#define DCTL_ULSTCHNGREQ (0xfu << 5)
+ #define DSTS_DEVCTRLHLT (1u << 22)
+ 
+ #define DEPCMD_SETEPCONFIG      1
+@@ -222,6 +239,8 @@
+ 	vm_offset_t dwc;
+ 	vm_offset_t dma;
+ 	uint64_t    dma_pa;
++	bool        gs101;          /* Pixel 6a: ADT /sweet-usb compatible google,gs101-dwusb3 */
++	bool        dma_nc;         /* DMA area mapped non-cacheable (gs101 ABL pool): no cache maintenance */
+ 	uint32_t    evt_pos;
+ 	int         sleep_chan;
+ 	enum { EP0_SETUP, EP0_DATA, EP0_WAIT_STATUS2, EP0_WAIT_STATUS3, EP0_STATUS } state;
+@@ -254,6 +273,9 @@
+ static void
+ ud_sync(uint32_t off, uint32_t len)
+ {
++	if (ud.dma_nc) {
++		return;         /* normal non-cacheable mapping; dwc_wr's dsb orders the stores */
++	}
+ 	flush_dcache64((addr64_t)(ud.dma_pa + off), len, TRUE);
+ }
+ 
+@@ -273,7 +295,8 @@
+ 	dwc_wr(DEPCMDPAR1(ep), p1);
+ 	dwc_wr(DEPCMDPAR2(ep), p2);
+ 	dwc_wr(DEPCMD(ep), cmd | DEPCMD_CMDACT);
+-	for (int i = 0; i < 1000; i++) {
++	/* gs101: the shim waits up to 10 ms per endpoint command (shim/usbgadget.c USBG_CMD_TIMEOUT_MS) */
++	for (int i = 0; i < (ud.gs101 ? 10000 : 1000); i++) {
+ 		uint32_t v = dwc_rd(DEPCMD(ep));
+ 		if (!(v & DEPCMD_CMDACT)) {
+ 			uint32_t status = (v >> 12) & 0xf;
+@@ -848,22 +871,133 @@
+ 	}
+ }
+ 
++/*
++ * Pixel 6a (gs101). tools/mkadt.py adds /sweet-usb (compatible
++ * google,gs101-dwusb3) on bluejay only: reg = the DWC3 core (0x11110000),
++ * dma-pool-range = the "abl" reserved DRAM range. ABL leaves the DWC_usb31
++ * powered, in device role and halted (RUN_STOP=0, DALEPENA=3) with an event
++ * buffer of its own inside that range (GEVNTADR moves between boots), and
++ * the shim does not touch it on the --boot-xnu path; shim/usbgadget.c
++ * enumerates the same controller from exactly that state, so the same
++ * register sequence is used here and its DMA page is taken from the same
++ * place (shim/usbpool.c). sweetusb=2 starts the gadget as on sweet.
++ * Boot-arg sweetusbdma=1 instead takes the DMA area from the kernel's own
++ * RAM (kmem_alloc_contig, cacheable, ud_sync as on sweet): an experiment to
++ * learn whether the controller can DMA into the 0x88... bank (unknown).
++ * Returns false when there is no gs101 node (sweet takes the path above).
++ */
++#define GS101_COMPAT            "google,gs101-dwusb3"
++#define GS101_COMPAT_LEN        19
++#define GSNPSID                 0xc120
++#define GSNPSID_IP_USB31        0x3331  /* GSNPSID[31:16], observed 0x33313130 on bluejay */
++#define GCTL_PRTCAP(v)          (((v) >> 12) & 3)
++#define GCTL_PRTCAP_DEVICE      2
++#define DWC3_REGS_MIN           0xd000  /* up to the DEPCMD blocks of the endpoints used (0xc85c) */
++
++static bool
++sweet_usb_probe_gs101(int mode)
++{
++	DTEntry node;
++	char const *compat = NULL;
++	uintptr_t const *reg = NULL, *range = NULL;
++	unsigned int csize = 0, rsize = 0, psize = 0;
++	int dmamode = 0;
++	uint64_t pool_pa = 0;
++
++	if (SecureDTLookupEntry(NULL, "/sweet-usb", &node) != kSuccess ||
++	    SecureDTGetProperty(node, "compatible", (void const **)&compat, &csize) != kSuccess ||
++	    compat == NULL || csize <= GS101_COMPAT_LEN || strncmp(compat, GS101_COMPAT, GS101_COMPAT_LEN) != 0) {
++		return false;
++	}
++	ud.gs101 = true;
++	if (SecureDTGetProperty(node, "reg", (void const **)&reg, &rsize) != kSuccess ||
++	    rsize < 2 * sizeof(uintptr_t) || reg[1] < DWC3_REGS_MIN) {
++		printf("SWEET USB: gs101: /sweet-usb has no usable reg\n");
++		return true;
++	}
++	vm_offset_t dwc = ml_io_map(reg[0], reg[1]);
++	if (dwc == 0) {
++		printf("SWEET USB: DWC3 map failed\n");
++		return true;
++	}
++	usb_dump_dwc3(dwc);
++	/* Read-only identity checks before anything is written (shim/usbgadget.c refuses the same way). */
++	uint32_t id = usb_rd(dwc, GSNPSID), gctl = usb_rd(dwc, 0xc110);
++	if ((id >> 16) != GSNPSID_IP_USB31) {
++		printf("SWEET USB: gs101: unexpected GSNPSID 0x%08x, not touching the controller\n", id);
++		return true;
++	}
++	if (GCTL_PRTCAP(gctl) != GCTL_PRTCAP_DEVICE) {
++		printf("SWEET USB: gs101: core not in device role (GCTL 0x%08x)\n", gctl);
++		return true;
++	}
++	if (mode < 2) {
++		return true;
++	}
++	PE_parse_boot_argn("sweetusbdma", &dmamode, sizeof(dmamode));
++	if (dmamode != 1) {
++		if (SecureDTGetProperty(node, "dma-pool-range", (void const **)&range, &psize) != kSuccess ||
++		    psize < 2 * sizeof(uintptr_t)) {
++			printf("SWEET USB: gs101: /sweet-usb has no dma-pool-range\n");
++			return true;
++		}
++		uint64_t gev = ((uint64_t)usb_rd(dwc, 0xc404) << 32) | usb_rd(dwc, 0xc400);
++		uint64_t pool = gev & ~(uint64_t)0xfff;         /* shim/usbpool.c: the 4 KiB page of GEVNTADR */
++		/* io_map maps whole kernel pages: those, not just the pool, must lie inside the ABL range. */
++		uint64_t map_lo = pool & ~(uint64_t)PAGE_MASK;
++		uint64_t map_hi = (pool + UD_SIZE + PAGE_MASK) & ~(uint64_t)PAGE_MASK;
++		if (gev == 0 || map_lo < range[0] || map_hi < map_lo || map_hi > range[0] + range[1]) {
++			printf("SWEET USB: gs101: GEVNTADR 0x%llx not inside the abl range 0x%llx+0x%llx, no DMA pool\n",
++			    gev, (unsigned long long)range[0], (unsigned long long)range[1]);
++			return true;
++		}
++		pool_pa = pool;
++	}
++	printf("SWEET USB: gs101: DMA from %s\n", pool_pa ? "ABL's pool page" : "kernel RAM (sweetusbdma=1)");
++	sweet_usb_gadget_start(dwc, pool_pa);
++	return true;
++}
++
+ static void
+-sweet_usb_gadget_start(vm_offset_t dwc)
++sweet_usb_gadget_start(vm_offset_t dwc, uint64_t pool_pa)
+ {
+ 	thread_t thread;
+ 
+ 	ud.dwc = dwc;
+-	if (kmem_alloc_contig(kernel_map, &ud.dma, UD_SIZE, PAGE_MASK, 0, 0,
+-	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+-		printf("SWEET USB: no DMA memory\n");
+-		return;
+-	}
+-	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)ud.dma);
+-	if (!pn) {
+-		return;
++	if (pool_pa != 0) {
++		/*
++		 * gs101 option 1: the page ABL left the event buffer in (inside its
++		 * reserved "abl" range, validated by sweet_usb_probe_gs101), mapped
++		 * normal non-cacheable: the controller and the CPU then agree without
++		 * cache maintenance. The range is outside the kernel's RAM, so
++		 * ml_io_map_wcomb maps it as I/O (osfmk/arm/pmap/pmap.c honours the
++		 * caller's WIMG for pages that are not managed memory).
++		 */
++		ud.dma = ml_io_map_wcomb((vm_offset_t)pool_pa, UD_SIZE);
++		if (ud.dma == 0) {
++			printf("SWEET USB: DMA pool map failed\n");
++			return;
++		}
++		ud.dma_pa = pool_pa;
++		ud.dma_nc = true;
++		/* Drop whatever cached lines ABL left for this range, then start from zero. */
++		FlushPoC_DcacheRegion(ud.dma, UD_SIZE);
++		for (uint32_t o = 0; o < UD_SIZE; o += 4) {
++			*(volatile uint32_t *)(ud.dma + o) = 0;
++		}
++		__asm__ volatile ("dsb sy" ::: "memory");
++	} else {
++		if (kmem_alloc_contig(kernel_map, &ud.dma, UD_SIZE, PAGE_MASK, 0, 0,
++		    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++			printf("SWEET USB: no DMA memory\n");
++			return;
++		}
++		ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)ud.dma);
++		if (!pn) {
++			return;
++		}
++		ud.dma_pa = ptoa_64(pn);
+ 	}
+-	ud.dma_pa = ptoa_64(pn);
+ 	ud_if_create();
+ 
+ 	/* Device controller soft reset (PHY and global setup stay as ABL left them). */
+@@ -877,6 +1011,9 @@
+ 	if (dwc_rd(DCTL) & DCTL_CSFTRST) {
+ 		return;
+ 	}
++	if (ud.gs101) {
++		delay(50 * 1000);       /* shim/usbgadget.c: 50 ms after CSFTRST clears (DWC_usb31 revision unknown) */
++	}
+ 
+ 	dwc_wr(GEVNTADRLO, (uint32_t)(ud.dma_pa + UD_EVT));
+ 	dwc_wr(GEVNTADRHI, (uint32_t)((ud.dma_pa + UD_EVT) >> 32));
+@@ -902,7 +1039,8 @@
+ 	dwc_wr(DALEPENA, 0x3);
+ 	ud_start_setup();
+ 
+-	vm_offset_t qs = ml_io_map(QSCRATCH_PA, 0x100);
++	/* gs101 has no QSCRATCH wrapper: the shim enumerates with RUN_STOP alone (observed). */
++	vm_offset_t qs = ud.gs101 ? 0 : ml_io_map(QSCRATCH_PA, 0x100);
+ 	if (qs != 0) {
+ 		uint32_t hs = usb_rd(qs, QSCRATCH_HS_PHY_CTRL), ss = usb_rd(qs, QSCRATCH_SS_PHY_CTRL);
+ 		printf("SWEET USB: QSCRATCH HS_PHY_CTRL 0x%08x SS_PHY_CTRL 0x%08x GENERAL_CFG 0x%08x\n",
+@@ -914,7 +1052,11 @@
+ 		    usb_rd(qs, QSCRATCH_HS_PHY_CTRL), usb_rd(qs, QSCRATCH_SS_PHY_CTRL));
+ 	}
+ 
+-	dwc_wr(DCTL, dwc_rd(DCTL) | DCTL_RUN_STOP);
++	uint32_t dctl = dwc_rd(DCTL);
++	if (ud.gs101) {
++		dctl &= ~DCTL_ULSTCHNGREQ;      /* shim/usbgadget.c: never write back a link state change request */
++	}
++	dwc_wr(DCTL, dctl | DCTL_RUN_STOP);
+ 	for (i = 0; i < 500 && (dwc_rd(DSTS) & DSTS_DEVCTRLHLT); i++) {
+ 		delay(1000);
+ 	}

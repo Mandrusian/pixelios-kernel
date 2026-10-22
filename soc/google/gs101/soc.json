@@ -1,0 +1,155 @@
+{
+  "name": "gs101",
+  "marketing": "Google Tensor (G1)",
+  "gicd_base": "0x10400000",
+  "gicd_size": "0x10000",
+  "gicr_base": "0x10440000",
+  "gicr_size": "0x100000",
+  "gicr_stride": "0x20000",
+  "timer_freq": 24576000,
+  "vtimer_intid": 27,
+  "ufs_base": "0x14700000",
+  "ufs_size": "0x200",
+  "ufs_prdt_byte_gran": 1,
+  "pmu_base": "0x17460000",
+  "pmu_mode_off": "0x810",
+  "pmu_swreset_off": "0x3a00",
+  "usb_base": "0x11110000",
+  "usb_size": "0x10000",
+  "uart_base": "0x10a00000",
+  "wlan": {
+    "pmu_pcie1_iso": "0x17463EC4",
+    "pd_hsi2_a": "0x17462180",
+    "pd_hsi2_b": "0x17462080",
+    "gpp14": "0x108401C0",
+    "gph2": "0x14440000",
+    "gpa7": "0x174E0020",
+    "sysreg": "0x14420000",
+    "elbi": "0x14520000",
+    "pma": "0x14550000",
+    "pcs": "0x14540000",
+    "dbi": "0x14800000"
+  },
+  "gpu": {
+    "pmu_g3d_cfg": "0x17461E00",
+    "pmu_g3d_stat": "0x17461E04",
+    "pmu_emb_cfg": "0x17462000",
+    "pmu_emb_stat": "0x17462004",
+    "cmu_g3d": "0x1C400000",
+    "mali": "0x1C500000"
+  },
+  "watchdog_bases": [
+    "0x10060000",
+    "0x10070000"
+  ],
+  "cpu_mpidrs": [
+    "0x0",
+    "0x100",
+    "0x200",
+    "0x300",
+    "0x400",
+    "0x500",
+    "0x600",
+    "0x700"
+  ],
+  "cpu_compatibles": [
+    "arm,cortex-a55",
+    "arm,cortex-a55",
+    "arm,cortex-a55",
+    "arm,cortex-a55",
+    "arm,cortex-a76",
+    "arm,cortex-a76",
+    "arm,cortex-x1",
+    "arm,cortex-x1"
+  ],
+  "psci_system_reset": "0x84000009",
+  "boot_header_version": 4,
+  "decon_base": "0x1c300000",
+  "gpio_alive_dat_off": "0x4",
+  "usi11_spi_base": "0x10D40000",
+  "usi11_spi_size": "0x1000",
+  "usi11_mode_reg": "0x10C2100C",
+  "usi_mode_spi": "0x2",
+  "usi_mode_mask": "0x7",
+  "usi_regs_offset": "0xc0",
+  "gpp23_bank": "0x10C40060",
+  "gpp26_bank": "0x10C400C0",
+  "gpa9_bank": "0x174D00C0",
+  "cmu_peric1": {
+    "base": "0x10C00000",
+    "size": "0x10000",
+    "offsets": {
+      "option": "0x800",
+      "mux_usi": "0x640",
+      "mux_bus": "0x600",
+      "mux_bus_auto": "0x604",
+      "mux_usi_auto": "0x644",
+      "div": "0x180C",
+      "gate_ipclk": "0x202C",
+      "gate_pclk": "0x204C",
+      "gate_rstn": "0x2068",
+      "qch": "0x302C"
+    },
+    "bits": {
+      "mux_sel": 4,
+      "mux_busy": 16,
+      "gate_manual": 20,
+      "gate_val": 21,
+      "gate_auto": 28,
+      "qch_enable": 0,
+      "qch_req": 1
+    },
+    "top": {
+      "base": "0x1E080000",
+      "size": "0x10000",
+      "mux": "0x10E8",
+      "div": "0x18E0",
+      "gate": "0x2104",
+      "gate_bit": 21
+    },
+    "source": {
+      "base": "read from source: Linux gs101.dtsi:1267-1269, clk-gs101.c:4356; GK cmucal-sfr.c:38 (docs/research/19 section 1)",
+      "offsets": "read from source: docs/research/19 section 2 table (Linux clk-gs101.c:4357-4424, GK cmucal-sfr.c:449,1787-1805,2776,3463-3468,12009)",
+      "bits": "read from source: docs/research/19 sections 2-3 (GK cmucal-sfr.c:7919-7921,11626-11629; Linux clk-exynos-arm64.c:24-25). Gate: MANUAL bit 20, CG_VAL bit 21, ENABLE_AUTOMATIC_CLKGATING bit 28. Not read back on hardware; whether the forced sequence opens the SCK is a guess."
+    }
+  },
+  "acpm": {
+    "mbox_base": "0x17610000",
+    "sram_base": "0x02039000",
+    "sram_size": "0x40000",
+    "initdata_off": "0xA000",
+    "ch_id": 2,
+    "speedy_ch": 0,
+    "pmic_addr": 1,
+    "intgr1": "0x40",
+    "intcr0": "0x24",
+    "intsr0": "0x2c",
+    "desc_stride": "0x48",
+    "layout_verified": 1,
+    "elem_unit": 1,
+    "elem_unit_verified": 1,
+    "dvfs": {
+      "ch_id": 1,
+      "domains": [
+        {"name": "CPUCL0", "idx": 2, "ceiling_khz": 1803000, "rates_khz": [2196000, 2098000, 2024000, 1950000, 1803000, 1704000, 1598000, 1401000, 1328000, 1197000, 1098000, 930000, 738000, 574000, 300000]},
+        {"name": "CPUCL1", "idx": 3, "ceiling_khz": 1836000, "rates_khz": [2466000, 2393000, 2348000, 2253000, 2130000, 1999000, 1836000, 1663000, 1491000, 1328000, 1197000, 1024000, 910000, 799000, 696000, 553000, 400000]},
+        {"name": "CPUCL2", "idx": 4, "ceiling_khz": 1826000, "rates_khz": [3195000, 3097000, 2950000, 2850000, 2802000, 2704000, 2630000, 2507000, 2401000, 2252000, 2188000, 2048000, 1826000, 1745000, 1582000, 1426000, 1277000, 1106000, 984000, 851000, 500000]}
+      ]
+    },
+    "rails": [
+      {"name": "LDO25M TSP_DVDD", "reg": "0x5C", "group_min_uv": 700000, "step_uv": 25000, "dt_min_uv": 1600000, "dt_max_uv": 1950000, "vsel_min": 36, "vsel_max": 50},
+      {"name": "LDO26M TS_AVDD", "reg": "0x5D", "group_min_uv": 1800000, "step_uv": 25000, "dt_min_uv": 2500000, "dt_max_uv": 3300000, "vsel_min": 28, "vsel_max": 60}
+    ]
+  },
+  "notes": {
+    "gpio_alive_dat_off": "Samsung ALIVE/FAR_ALIVE pin-bank type exynos850_bank_type_alive: CON +0x00 (4 bit/pin), DAT +0x04 (1 bit/pin), PUD +0x08, DRV +0x0c (drivers/pinctrl/samsung/pinctrl-exynos-arm64.c:56-59 at Linux v6.12; used for gs101_pin_alive/gs101_pin_far_alive by EXYNOS850_PIN_BANK_EINTW, pinctrl-exynos.h:134-142). DAT read = readl(bank_base + pctl_offset + 0x04) >> pin & 1 (pinctrl-samsung.c:592-611). Read from source, not yet observed on hardware.",
+    "usb": "DWC_usb31 (GSNPSID 0x3331) core at 0x11110000: read from source (gs101 DTS usbdrd31_dwc3, docs/02-gs101-peripherals.md section 9) and observed by shim/usbprobe.c on bluejay. Feeds the /sweet-usb ADT node (tools/mkadt.py, xnu patch 0082).",
+    "wlan": "BCM4389 Wi-Fi path (PMU/pinctrl/HSI2 PCIe1 wrapper) addresses: read from source, docs/research/12-wifi-bluejay.md section 1.2; used only by the read-only shim/wlanprobe.c (--wlan-probe).",
+    "gpu": "Mali-G78 MP20 power/clock/register addresses: read from source, docs/research/17-gpu-kernel-gs101.md section 2; used only by the read-only shim/gpuprobe.c (--gpu-probe). mali = gs101-gpu.dtsi reg 0x1C500000 size 0x5000; PMU words = soc-gs flexpmu_cal_local_gs101.h; not yet read on hardware.",
+    "acpm": "ACPM (APM firmware) client constants for shim/acpm.c: read from source, docs/research/23-acpm-regulator-client.md (GK gs101.dtsi:491-507, acpm_ipc.c, acpm_mfd.c, framework.h). mbox/sram/initdata/ch_id/speedy_ch/pmic_addr/intgr1/intcr0/intsr0 are [src] and pinned by tools/boards.py (_ACPM_PINS); desc_stride 0x48 and the u32 field offsets inside shim/acpm.c are hand-derived (guess) until layout_verified is set to 1 after comparing the shim's descriptor dump (--touch-probe=railsr) with a real read; elem_unit = bytes per q_elem_size unit: 1 = q_elem_size is in BYTES, read from source (acpm_ipc.c:762 passes tx_ch.size to memcpy_align_4 as a byte count; the MFD callers pass unsigned int command[4]; Google acpm.c:257-271), the shim requires q_elem_size * elem_unit == 16 and elem_unit_verified stays 0 until the --touch-probe=railsr buffer dump shows 16-byte slots (docs/research/23 erratum). rails: S2MPG10 enable registers 0x5C/0x5D bit 7 (doc 23 section 1); vsel_min/vsel_max = accepted voltage code range (reg bits 5:0) before the rail is enabled, derived by tools/boards.py check from the regulator group (gk_s2mpg10-register.h:319-323: group 4 = 700 mV + 25 mV * code, group 5 = 1800 mV + 25 mV * code; s2mpg10-regulator.c:275-278, vsel_mask = 63) and the device-tree limits (gs101-pmic.dtsi:535-553: L25M 1.60-1.95 V = codes 0x24-0x32, L26M 2.5-3.3 V = codes 0x1C-0x3C); null = unknown, and then the shim refuses to write. Flags flipped 2026-10-22 after run acpm3 (observed on bluejay: descriptor fields at the derived offsets, q_len=5, q_elem_size=0x10 with 5x16 B slots, both queues empty 3/3); the rails themselves are still unread. dvfs: ACPM DVFS channel 1 (gs101.dtsi:720 exynos_dm acpm-ipc-channel), domain indexes CPUCL0/1/2 = 2/3/4 (dt-bindings/clock/gs101.h:305-307, GET_IDX = id & 0xFFFF); rates_khz = the firmware fvmap rows OBSERVED on the phone (run fvmap1, 2026-10-22, docs/research/25); ceiling_khz is ours (no thermal management exists), a request must be a row at or below it.",
+    "psci": "conduit SMC; SYSTEM_RESET 0x84000009",
+    "watchdogs": "two cluster watchdogs armed by ABL; the shim disables them",
+    "framebuffer": "pixel format a8r8g8b8",
+    "touch": "SPI11 / USI11_USI_PERIC1 engine, its USI mode register and the three pad banks the Pixel 6a touchscreen uses (feeds the /sweet-touch ADT node, tools/mkadt.py, xnu patch 0088). read from source: engine 0x10D40000 and sysreg_peric1 0x10C21000 + usi-offset 0x0c = 0x10C2100C: Google gs101-usi.dtsi:603-621,66 (docs/research/05-fact-check.md section 1); USI mode SPI = BIT(1), mask = UART|SPI|I2C = 0x7: Linux drivers/soc/samsung/exynos-usi.c:19-25; USI_CON/USI_OPTION live at engine + 0xc0 (exynos-usi.c:28-34; the +0xc0 position is from the mainline usi1.. nodes, gs101.dtsi:378, and applied to USI11 by analogy = guess); pad banks: PERIC1 pinctrl 0x10C40000 (Linux gs101.dtsi:916-918) + gpp23 0x60, gpp26 0xc0 (pinctrl-exynos-arm64.c gs101_pin_peric1), ALIVE pinctrl 0x174D0000 (gs101.dtsi:1414-1416) + gpa9 0xc0 (gs101_pin_alive). Flags flipped 2026-10-22 after run acpm3 (observed on bluejay: descriptor fields at the derived offsets, q_len=5, q_elem_size=0x10 with 5x16 B slots, both queues empty 3/3); the rails themselves are still unread."
+  }
+}

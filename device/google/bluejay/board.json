@@ -1,0 +1,47 @@
+{
+  "name": "Pixel 6a",
+  "codename": "bluejay",
+  "soc": "google/gs101",
+  "status": "bring-up (see docs/STATUS.md)",
+  "dram_banks": [
+    ["0x80000000", "0x80000000"],
+    ["0x880000000", "0x100000000"]
+  ],
+  "xnu_ram": ["0x880000000", "0x100000000"],
+  "fb_base": "0xfac00000",
+  "fb_size": "0x9e3400",
+  "fb_width": 1080,
+  "fb_height": 2400,
+  "fb_stride": 4320,
+  "key_pins": [
+    [0, "0x174D0000", "0xE0", 1],
+    [1, "0x174E0000", "0x40", 1],
+    [2, "0x174E0000", "0x20", 3]
+  ],
+  "key_active_low": 1,
+  "userdata_mib": 112914,
+  "usb_dma_range": ["0xf8800000", "0x1000000"],
+  "touch_chip_id": ["0x36", "0x48"],
+  "touch_usi": 11,
+  "touch_max_hz": 10000000,
+  "touch_max_coords": [1079, 2399],
+  "touch_spi_pin_func": 2,
+  "touch_pin_clk": ["gpp23", 0],
+  "touch_pin_mosi": ["gpp23", 1],
+  "touch_pin_miso": ["gpp23", 2],
+  "touch_pin_cs": ["gpp23", 3],
+  "touch_pin_irq": ["gpa9", 0],
+  "touch_pin_reset": ["gpp26", 0],
+  "touch_pin_mux": ["gpp26", 1],
+  "notes": {
+    "usb_dma_range": "OBSERVED in the live FDT of bootloader bluejay-16.3-13642543: reserved-memory abl@f8800000, no-map, 16 MiB (hardware/probe-log-2026-10-21-run1.txt). ABL's DWC3 event buffer (GEVNTADR, moves between boots: 0xF8B92000, 0xF8D12000) lies inside it; XNU takes its USB DMA page from there (xnu patch 0082, like shim/usbpool.c) and refuses if GEVNTADR is outside this range. Re-measure after a bootloader update.",
+    "userdata_mib": "OBSERVED on the phone: GPT entry userdata first=0x22F1E6 last=0x1DC03FA on LUN 0 (hardware/ufs-gpt-read-2026-10-21.txt) = 28906005 x 4 KiB = 112914.08 MiB (the XNU log prints 112914 MiB). tools/check-ios-root.py refuses an iOS root image bigger than this.",
+    "dram_banks": "MEASURED on the phone (hardware/probe-log-2026-10-21-run1.txt): /memory banks 0x80000000 (2 GiB, many no-map carve-outs), 0x880000000 and 0x900000000 (2 GiB each, contiguous, no reserved range inside). The high pair is merged here.",
+    "xnu_ram": "RAM handed to XNU: the whole hole-free high range. XNU maps [kernel .. physBase+memSize) cacheable, so it must contain no carve-out; base and size are multiples of 32 MiB (16K-granule L2 block).",
+    "fb_base": "Framebuffer set up by ABL, a8r8g8b8; no framebuffer node in the FDT.",
+    "volume_keys": "SUPERSEDED by key_pins (the old text put all three pins in 0x174E0000; docs/research/05-fact-check.md section 2 corrects it).",
+    "key_pins": "[xnu sweet_hid_key index (0 power, 1 vol+, 2 vol-), pin-controller base PA, bank pctl_offset, pin]. power = gpa10-1 in pinctrl_gpio_alive 0x174D0000, gpa10 pctl_offset 0xE0 (pinctrl-exynos-arm64.c:941-950, Linux v6.12); vol+ = gpa8-1 and vol- = gpa7-3 in pinctrl_far_alive 0x174E0000, gpa8 0x40 / gpa7 0x20 (pinctrl-exynos-arm64.c:953-958); pins and banks from gs101-pixel-common.dtsi:40-65 and :798-853 (Linux master), Google DS gs101-common.dtsi:46-68 (docs/research/05-fact-check.md section 2). Read from source; not yet observed on bluejay (docs/research/16-keys-gs101.md). Feeds the /sweet-keys ADT node (tools/mkadt.py, xnu patch 0087).",
+    "key_active_low": "all three GPIO_ACTIVE_LOW (gpio flags 0xf downstream), gs101-pixel-common.dtsi:48,55,62. Read from source.",
+    "touch": "STMicro FTM5 (chip ID 0x36 0x48) over SPI (spi_11 / USI11_USI_PERIC1 at 0x10D40000), USI mode reg 0x10C2100C, max 10 MHz; pins gpp23-0..2 (func 2), CS gpp23-3, IRQ gpa9-0 (XEINT_20), reset gpp26-0; rails S2MPG10 LDO25M/LDO26M. Structured keys touch_* feed the /sweet-touch ADT node (tools/mkadt.py, xnu patch 0088). read from source (docs/research/05-fact-check.md section 1, Google DS-bj gs101-bluejay-touch.dtsi:6-16, DS-gs gs101-common-touch.dtsi:8-100 and gs101-fts-touch.dtsi:11-39): chip id st,dchip_id <0x36 0x48>, st,max-coords <1079 2399>, spi-max-frequency 10 MHz, pins as listed, TS_SPI_SEL = gpp26-1 (low = AP). SPI function 2 for gpp23-0..2: gs101-pinctrl.dtsi:1024-1029. The CS pin gpp23-3 is a GPIO (function output)."
+  }
+}

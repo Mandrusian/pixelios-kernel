@@ -1,0 +1,34 @@
+--- a/bsd/dev/sweet_qr.c
++++ b/bsd/dev/sweet_qr.c
+@@ -11,6 +11,7 @@
+ #include <stdint.h>
+ #include "sweet_qrcodegen.h"
+ 
++extern void sweet_restart_poll(void);
+ extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
+ extern void thread_deallocate(thread_t);
+ extern int hz;
+@@ -168,6 +169,7 @@
+ 	printf("SWEET QR: taking over the screen (chunk %u bytes, %u ms/frame, last %u bytes)\n", chunk, ms, tail);
+ 	sweet_console_muted = 1;
+ 	for (;;) {
++		sweet_restart_poll();
+ 		uint32_t len = sweet_log_snapshot(sweet_qr_snap, tail);
+ 		uint32_t n = qrlog_nframes(len, chunk);
+ 		for (uint32_t i = 0; i < n; i++) {
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -51,4 +51,5 @@
+ static void sweet_log_start(void);
+ extern void sweet_qr_start(void);
+ extern void sweet_sample_start(void);
++extern void sweet_restart_poll(void);   /* bsd/dev/sweet_restart.c */
+ extern void sweet_usb_probe(void);
+@@ -844,6 +845,7 @@
+ 	    SWEET_LOG_BLOCKS * UFS_BLOCK >> 10, base);
+ 	for (;;) {
+ 		(void)tsleep(&sweet_log_chan, PZERO, "sweetlog", hz * (int)sweet_log_secs);
++		sweet_restart_poll();
+ 		uint64_t total = os_atomic_load(&sweet_log_total, relaxed);
+ 		if (total == flushed) {
+ 			continue;

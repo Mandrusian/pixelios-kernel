@@ -1,0 +1,91 @@
+#!/bin/bash
+# After a probe/XNU run the phone legitimately leaves USB for seconds to a minute while it reboots. Wait for it, never guess "hang".
+#   tools/hang-recover [--wait S] [--expect fastboot|recovery] | --self-test        (also: tools/pix recover)
+# Loops until a deadline (default 90 s, cap 300), calling tools/phone-state every HR_POLL (3) s; never a bare adb/fastboot call.
+# recovery/android seen while --expect fastboot: runs tools/phone goto fastboot (bounded 45 s), then keeps checking.
+# Prints one line per state change ("+12s recovery"). Last line: RESULT: PASS state=fastboot after Ns | FAIL still absent after Ns
+# (FAIL adds the button instruction). Exit 0 PASS / 1 FAIL / 2 ERROR (bad args, non-bluejay device). Software only: no relay/reset.
+here=$(dirname "$(readlink -f "$0")")
+POLL=${HR_POLL:-3}
+
+main() {
+	local wait=90 expect=fastboot ps st last="" tried=0 out
+	while [ $# -gt 0 ]; do case "$1" in
+		--wait) wait=${2:-}; shift 2 ;; --expect) expect=${2:-}; shift 2 ;;
+		*) echo "usage: $0 [--wait S] [--expect fastboot|recovery] | --self-test" >&2; exit 2 ;; esac; done
+	[[ "$wait" =~ ^[0-9]+$ ]] || { echo "bad --wait" >&2; exit 2; }
+	case "$expect" in fastboot|recovery) ;; *) echo "bad --expect" >&2; exit 2 ;; esac
+	[ "$wait" -le 300 ] || wait=300
+	SECONDS=0
+	while :; do
+		ps=$("$here/phone-state" 2>&1)
+		st=$(echo "$ps" | sed -n 's/^RESULT: ERROR.*/error/p; s/^RESULT: [A-Z]* state=\([a-z]*\).*/\1/p' | tail -1)
+		[ -n "$st" ] || st=error
+		[ "$st" = "$last" ] || { echo "+${SECONDS}s $st"; last=$st; }
+		case "$st" in
+			"$expect") echo "RESULT: PASS state=$st after ${SECONDS}s"; exit 0 ;;
+			other) echo "RESULT: ERROR state=other (not a bluejay; not touched)"; exit 2 ;;
+			recovery|android) # the software-reset landing; "android" = adb up
+				if [ "$expect" = fastboot ] && [ $tried = 0 ]; then
+					tried=1; echo "+${SECONDS}s to-fastboot.sh"
+					out=$(timeout -k 2 60 "$here/phone" goto fastboot --timeout 45 2>&1) || echo "$out" | tail -2
+				fi ;;
+		esac
+		[ "$SECONDS" -lt "$wait" ] || break
+		sleep "$POLL"
+	done
+	echo "RESULT: FAIL still $last after ${SECONDS}s"
+	echo "Hold Power+VolDown ~10 s until the bootloader screen / fastboot shows, then rerun tools/hang-recover"
+	echo "(if the screen shows a bootloader menu but USB is absent, replug the cable)"
+	exit 1
+}
+
+selftest() {
+	local d self fail=0; d=$(mktemp -d); self=$(readlink -f "$0"); trap 'rm -rf "$d"' RETURN
+	# stub phone: state = next word of $HS_SEQ per lsusb call (last repeats); `adb reboot bootloader` forces fastboot
+	cat >"$d/lsusb" <<'S'
+#!/bin/bash
+n=$(cat "$HS_DIR/n" 2>/dev/null || echo 0); n=$((n+1)); echo $n >"$HS_DIR/n"
+read -ra a <<<"$HS_SEQ"; s=${a[$((n-1))]:-${a[-1]}}
+[ -e "$HS_DIR/fb" ] && s=fastboot
+echo "$s" >"$HS_DIR/cur"
+case $s in fastboot) echo "Bus 1 Device 5: ID 18d1:4ee0 Google" ;; recovery) echo "Bus 1 Device 5: ID 18d1:d001 Google" ;; esac
+S
+	cat >"$d/adb" <<'S'
+#!/bin/bash
+cur=$(cat "$HS_DIR/cur" 2>/dev/null)
+case "$*" in
+	devices) echo "List of devices attached"; [ "$cur" != recovery ] || printf 'SECRET\trecovery\n' ;;
+	get-state) [ "$cur" != recovery ] || echo recovery ;;
+	*boot_completed*) echo bluejay; echo 0 ;;
+	*getprop*) echo bluejay ;;
+	"reboot bootloader") touch "$HS_DIR/fb"; echo fastboot >"$HS_DIR/cur" ;;
+esac
+S
+	cat >"$d/fastboot" <<'S'
+#!/bin/bash
+[ "$(cat "$HS_DIR/cur" 2>/dev/null)" = fastboot ] || exit 0
+case "$1" in devices) printf 'SECRET\tfastboot\n' ;; getvar) echo "product: bluejay" >&2 ;; esac
+S
+	cat >"$d/ping" <<'S'
+#!/bin/bash
+exit 1
+S
+	chmod +x "$d"/lsusb "$d"/adb "$d"/fastboot "$d"/ping
+	chk() { # name rc grep-pattern seq args...
+		local n=$1 erc=$2 pat=$3 seq=$4 out rc; shift 4; rm -f "$d/n" "$d/cur" "$d/fb"
+		out=$(env PATH="$d:$PATH" HS_DIR="$d" HS_SEQ="$seq" HR_POLL=0.2 PS_TMO=2 "$self" "$@" 2>&1); rc=$?
+		if [ $rc = "$erc" ] && echo "$out" | grep -q -- "$pat" && ! echo "$out" | grep -q SECRET; then echo "ok   $n"
+		else echo "FAIL $n (rc=$rc): $out"; fail=1; fi
+	}
+	chk already-fastboot 0 'RESULT: PASS state=fastboot after [01]s' "fastboot" --wait 5
+	chk recovery-then-fb 0 'RESULT: PASS state=fastboot' "recovery" --wait 30
+	chk absent-then-back 0 'RESULT: PASS state=fastboot after' "absent absent absent absent absent fastboot" --wait 30
+	chk expect-recovery  0 'RESULT: PASS state=recovery' "absent recovery" --wait 30 --expect recovery
+	chk never-returns    1 'Hold Power+VolDown ~10 s' "absent" --wait 2
+	chk bad-arg          2 usage "absent" --bogus
+	[ $fail = 0 ] && echo "self-test PASS" || echo "self-test FAIL"; return $fail
+}
+
+[ "${1:-}" = --self-test ] && { selftest; exit $?; }
+main "$@"

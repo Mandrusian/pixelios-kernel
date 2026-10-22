@@ -1,0 +1,370 @@
+diff --git a/bsd/dev/sweet_touch_gs101.c b/bsd/dev/sweet_touch_gs101.c
+index 443109a..d008586 100644
+--- a/bsd/dev/sweet_touch_gs101.c
++++ b/bsd/dev/sweet_touch_gs101.c
+@@ -15,6 +15,18 @@
+  *                        then gates ipclk_4, pclk_4, rstnsync); 2 additionally QCH |= ENABLE|CLOCK_REQ (step 6).
+  *                        3 additionally sets CG_VAL of the CMU_TOP PERIC1_IP gate (the cmu_top line is printed in every run).
+  *                        The OPTION register (step 7) and the dividers are never written.
++ *   sweettouchpoke=SCRIPT  runtime MMIO pokes (patch 0093). Run after tg_cmu_enable() and right before the SPI setup; skipped
++ *                        (one line) when the mux check decided to leave the bus alone. SCRIPT is ';'-TERMINATED hex ops without
++ *                        spaces: r:ADDR; | w:ADDR=VAL; | m:ADDR=MASK=VAL; | d:US; (grammar and error codes in sweet_touch_poke.h;
++ *                        a script cut short by the boot-args limit is a syntax error). ADDR = physical, 4-aligned, inside the
++ *                        SPI11 block, the USI11 sysreg page (0x1000 size = GUESS), CMU_PERIC1, CMU_TOP or a pin bank the driver
++ *                        maps (PMU/alive banks are not in the node, so not allowed). CMU_PERIC1 and CMU_TOP are read-only
++ *                        except the words the ADT names: usi mux, bus mux, both auto regs, ipclk/pclk/rstnsync gates, QCH, DIV
++ *                        (PERIC1; OPTION is never writable) and mux/div/gate (TOP). Max 32 ops, 240 characters (the whole
++ *                        boot-args line is 607 characters; tools/mkpayload.py now refuses longer ones; put this arg last).
++ *                        A bad script prints one "SWEET TOUCH: poke: rejected ..." line and runs nothing. `w` does not read
++ *                        before writing and, inside SPI11, does not read back either (RX_DATA pops on read).
++ *                        Example: --args "sweettouchclk=3 sweettouchpoke=r:10c00000;m:1e080000=1=1;d:1000;r:1e080000;"
+  *   sweettouchvar=0|1    1: if the first identify times out, try up to 5 SPI/USI variants (A..E below) and stop at the
+  *                        first whose burst completes, then identify again (default 0: only the register dump runs)
+  *
+@@ -66,6 +78,7 @@
+ #include <libkern/libkern.h>
+ #include <stdint.h>
+ #include "sweet_ftm5.h"
++#include "sweet_touch_poke.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
+@@ -145,6 +158,7 @@ static struct {
+ 		vm_offset_t va;
+ 	} top;
+ 	int clk_mode, var;
++	char poke[POKE_MAX_LEN + 16];   /* sweettouchpoke boot-arg (empty = none) */
+ 	uint32_t last_st, last_ch;   /* STATUS / CH_CFG at the last burst timeout */
+ 	int mode, mux_force;
+ 	uint32_t delay_s;
+@@ -570,6 +584,93 @@ tg_cmu_enable(void)
+ 	return true;
+ }
+ 
++/* ---- runtime pokes (patch 0093; grammar and limits in sweet_touch_poke.h) ---- */
++
++static void
++tg_poke_run(void)
++{
++	static const char *const why[] = { "", "script too long", "syntax error or missing final ';'", "too many ops (max 32)",
++		"address not 4-aligned", "address outside the allow-list", "delay above 1000000 us",
++		"write to a read-only CMU range outside the driver's own registers" };
++	struct poke_hw hw = {
++		.spi_pa = tg.spi_pa, .spi_size = tg.spi_size, .usi_mode_pa = tg.usi_mode_pa,
++		.cmu_ok = tg.cmu.ok, .top_ok = tg.top.ok, .cmu_base = tg.cmu.base, .cmu_size = tg.cmu.size,
++		.top_base = tg.top.base, .top_size = tg.top.size,
++		.cmu_mux_usi = tg.cmu.mux_usi, .cmu_mux_bus = tg.cmu.mux_bus, .cmu_mux_bus_auto = tg.cmu.mux_bus_auto,
++		.cmu_mux_usi_auto = tg.cmu.mux_usi_auto, .cmu_gate_ipclk = tg.cmu.gate_ipclk,
++		.cmu_gate_pclk = tg.cmu.gate_pclk, .cmu_gate_rstn = tg.cmu.gate_rstn, .cmu_qch = tg.cmu.qch, .cmu_div = tg.cmu.div,
++		.top_mux = tg.top.mux, .top_div = tg.top.div, .top_gate = tg.top.gate,
++		.pin_bank = { tg.clk.bank_pa, tg.mosi.bank_pa, tg.miso.bank_pa, tg.cs.bank_pa, tg.irq.bank_pa,
++			tg.reset.bank_pa, tg.mux.bank_pa },
++	};
++	struct poke_range rg[POKE_MAX_RANGES];
++	uint64_t wins[POKE_MAX_WINDOWS];
++	vm_offset_t va[POKE_MAX_RANGES] = { 0 };
++	struct poke_op ops[POKE_MAX_OPS];
++	unsigned bad, nrg, nwin;
++	int n;
++
++	if (!tg.poke[0]) {
++		return;
++	}
++	nrg = poke_build(&hw, rg, wins, &nwin);
++	n = poke_parse(tg.poke, ops, rg, nrg, wins, nwin, &bad);
++	if (n < 0) {
++		printf("SWEET TOUCH: poke: rejected (%s, op %u), nothing run\n", why[-n], bad);
++		return;
++	}
++	printf("SWEET TOUCH: poke: %d ops\n", n);
++	for (int i = 0; i < n; i++) {
++		const struct poke_op *o = &ops[i];
++		int k;
++		vm_offset_t p;
++		uint32_t before, nv;
++		bool in_spi;
++
++		if (o->kind == 'd') {
++			printf("SWEET TOUCH: poke %d d: %u us\n", i, o->val);
++			if (o->val >= 2000u) {
++				tg_sleep_ms(o->val / 1000u);
++			} else {
++				delay(o->val);
++			}
++			continue;
++		}
++		k = poke_find(rg, nrg, o->addr);   /* poke_parse guarantees a match */
++		in_spi = k == 0;
++		if (!va[k] && !(va[k] = tg_map(rg[k].base, rg[k].size))) {
++			printf("SWEET TOUCH: poke %d: mapping %#llx failed, op skipped\n", i, (unsigned long long)rg[k].base);
++			continue;
++		}
++		p = va[k] + (vm_offset_t)(o->addr - rg[k].base);
++		if (o->kind == 'r') {
++			printf("SWEET TOUCH: poke %d r %#llx = %#x\n", i, (unsigned long long)o->addr, tg_rd(p, 0));
++			continue;
++		}
++		if (o->kind == 'w') {   /* no read before the write: SPI RX_DATA and friends pop on read */
++			tg_wr(p, 0, o->val);
++			if (in_spi) {
++				printf("SWEET TOUCH: poke %d w %#llx: wrote %#x (SPI11: no read-back, reads can have side effects)\n", i,
++				    (unsigned long long)o->addr, o->val);
++			} else {
++				printf("SWEET TOUCH: poke %d w %#llx: wrote %#x -> read back %#x\n", i, (unsigned long long)o->addr,
++				    o->val, tg_rd(p, 0));
++			}
++			continue;
++		}
++		before = tg_rd(p, 0);   /* m needs the old value */
++		nv = (before & ~o->mask) | (o->val & o->mask);
++		tg_wr(p, 0, nv);
++		if (in_spi) {
++			printf("SWEET TOUCH: poke %d m %#llx mask %#x: %#x -> wrote %#x (SPI11: no read-back)\n", i,
++			    (unsigned long long)o->addr, o->mask, before, nv);
++		} else {
++			printf("SWEET TOUCH: poke %d m %#llx mask %#x: %#x -> wrote %#x -> read back %#x\n", i,
++			    (unsigned long long)o->addr, o->mask, before, nv, tg_rd(p, 0));
++		}
++	}
++}
++
+ /* ---- bring-up ---- */
+ 
+ static bool
+@@ -917,9 +1018,13 @@ tg_run(void)
+ 	}
+ 	tg_cmu_dump();    /* reads only, before any write below */
+ 	if (!tg_report_and_check_mux()) {
++		if (tg.poke[0]) {
++			printf("SWEET TOUCH: poke: skipped, the bus was left alone (see above)\n");
++		}
+ 		return;
+ 	}
+ 	(void)tg_cmu_enable();    /* an aborted sequence is reported; the identify below shows whether it mattered */
++	tg_poke_run();            /* sweettouchpoke, if given: after the driver's own clock writes, before the SPI setup */
+ 	if (!tg_spi_setup()) {
+ 		return;
+ 	}
+@@ -1007,6 +1112,7 @@ sweet_touch_gs101_init(void)
+ 	(void)PE_parse_boot_argn("sweettouchmux", &mux, sizeof(mux));
+ 	(void)PE_parse_boot_argn("sweettouchclk", &clk, sizeof(clk));
+ 	(void)PE_parse_boot_argn("sweettouchvar", &var, sizeof(var));
++	(void)PE_parse_boot_argn("sweettouchpoke", tg.poke, sizeof(tg.poke));   /* longer values are cut: poke_parse then sees > 240 chars */
+ 	if (delay_s < 0 || delay_s > 3600) {
+ 		delay_s = 45;
+ 	}
+diff --git a/bsd/dev/sweet_touch_poke.h b/bsd/dev/sweet_touch_poke.h
+new file mode 100644
+index 0000000..e1dd63d
+--- /dev/null
++++ b/bsd/dev/sweet_touch_poke.h
+@@ -0,0 +1,209 @@
++/*
++ * Pure parser and allow-list for the touch driver's runtime MMIO poke script (boot-arg sweettouchpoke=, xnu patch 0093).
++ * No kernel dependencies, so shim/touchpoke_host_test.c compiles the very same bytes on the host.
++ *
++ * Script = ';'-terminated ops (EVERY op ends with ';', so a script cut short by the boot-args limit is a syntax error),
++ * all hex (optional 0x prefix), no spaces (a space ends a boot-arg):
++ *   r:ADDR;            read 32 bits
++ *   w:ADDR=VAL;        write
++ *   m:ADDR=MASK=VAL;   read-modify-write: new = (old & ~MASK) | (VAL & MASK)
++ *   d:US;              delay, 0..1000000 microseconds
++ * ADDR is a physical address, 4-aligned, and [ADDR, ADDR+4) must lie inside one allow-list range. Ranges flagged ro
++ * (CMU_PERIC1, CMU_TOP) accept w/m only on the 4-byte windows the ADT names (the registers the driver itself writes).
++ */
++#ifndef SWEET_TOUCH_POKE_H
++#define SWEET_TOUCH_POKE_H
++#include <stdint.h>
++
++#define POKE_MAX_OPS      32u
++#define POKE_MAX_LEN      240u       /* script characters; boot-args total is 607 (BOOT_LINE_LENGTH 608) */
++#define POKE_MAX_DELAY_US 1000000u
++#define POKE_MAX_RANGES   16u
++#define POKE_MAX_WINDOWS  16u
++
++struct poke_op {
++	char kind;           /* 'r' 'w' 'm' 'd' */
++	uint64_t addr;       /* unused for 'd' */
++	uint32_t mask, val;  /* 'd': val = microseconds */
++};
++
++struct poke_range {
++	uint64_t base, size;   /* size 0 = absent, never matches */
++	int ro;                /* 1: reads only, except the words listed in the window table */
++};
++
++/* Index of the range holding [addr, addr+4), or -1. */
++static inline int
++poke_find(const struct poke_range *rg, unsigned nrg, uint64_t addr)
++{
++	for (unsigned i = 0; i < nrg; i++) {
++		if (rg[i].size >= 4 && addr >= rg[i].base && addr - rg[i].base <= rg[i].size - 4u) {
++			return (int)i;
++		}
++	}
++	return -1;
++}
++
++/* Input for poke_build: what the driver learned from the ADT (the cmu_* / top_* offsets are the DT properties). */
++struct poke_hw {
++	uint64_t spi_pa, spi_size, usi_mode_pa;
++	int cmu_ok, top_ok;
++	uint64_t cmu_base, cmu_size, top_base, top_size;
++	uint32_t cmu_mux_usi, cmu_mux_bus, cmu_mux_bus_auto, cmu_mux_usi_auto, cmu_gate_ipclk, cmu_gate_pclk, cmu_gate_rstn,
++	    cmu_qch, cmu_div;                 /* CMU_PERIC1 offsets writable by poke (docs/research/21 writes DIV; never OPTION) */
++	uint32_t top_mux, top_div, top_gate;  /* CMU_TOP offsets */
++	uint64_t pin_bank[7];                 /* clk mosi miso cs irq reset mux */
++};
++
++/* Range table: 0 SPI11 (rw; the real size is 0x1000, soc.json usi11_spi_size), 1 USI11 sysreg page (rw; the page size
++ * 0x1000 is a GUESS: only the mode register at usi_mode_pa is in the ADT), 2 CMU_PERIC1 (ro), 3 CMU_TOP (ro), 4..10 the
++ * pin banks (0x20 each, rw). wins[] = absolute addresses of the writable words in the ro ranges. */
++static inline unsigned
++poke_build(const struct poke_hw *h, struct poke_range *rg, uint64_t *wins, unsigned *nwin)
++{
++	uint32_t c[9] = { h->cmu_mux_usi, h->cmu_mux_bus, h->cmu_mux_bus_auto, h->cmu_mux_usi_auto, h->cmu_gate_ipclk,
++		h->cmu_gate_pclk, h->cmu_gate_rstn, h->cmu_qch, h->cmu_div };
++	uint32_t t[3] = { h->top_mux, h->top_div, h->top_gate };
++
++	*nwin = 0;
++	rg[0].base = h->spi_pa;
++	rg[0].size = h->spi_size;
++	rg[0].ro = 0;
++	rg[1].base = h->usi_mode_pa & ~(uint64_t)0xfff;
++	rg[1].size = 0x1000;   /* GUESS: page size of the sysreg block */
++	rg[1].ro = 0;
++	rg[2].base = h->cmu_base;
++	rg[2].size = h->cmu_ok ? h->cmu_size : 0;
++	rg[2].ro = 1;
++	rg[3].base = h->top_base;
++	rg[3].size = h->top_ok ? h->top_size : 0;
++	rg[3].ro = 1;
++	for (unsigned i = 0; i < 7; i++) {
++		rg[4 + i].base = h->pin_bank[i];
++		rg[4 + i].size = 0x20;
++		rg[4 + i].ro = 0;
++	}
++	for (unsigned i = 0; rg[2].size && i < 9; i++) {
++		if (!(c[i] & 3u) && c[i] <= rg[2].size - 4u) {
++			wins[(*nwin)++] = rg[2].base + c[i];
++		}
++	}
++	for (unsigned i = 0; rg[3].size && i < 3; i++) {
++		if (!(t[i] & 3u) && t[i] <= rg[3].size - 4u) {
++			wins[(*nwin)++] = rg[3].base + t[i];
++		}
++	}
++	return 11;
++}
++
++/* Returns the number of ops (>= 0), or a negative error:
++ * -1 too long, -2 syntax (incl. missing final ';'), -3 too many ops, -4 address unaligned, -5 address outside the
++ * allow-list, -6 delay too big, -7 write to a read-only range outside the windows.
++ * *bad = index of the offending op (0-based) for the caller's single message. */
++static inline int
++poke_parse(const char *s, struct poke_op *ops, const struct poke_range *rg, unsigned nrg,
++    const uint64_t *wins, unsigned nwin, unsigned *bad)
++{
++	unsigned n = 0, len = 0;
++
++	*bad = 0;
++	while (s[len]) {
++		if (++len > POKE_MAX_LEN) {
++			return -1;
++		}
++	}
++	while (*s) {
++		struct poke_op *o;
++		uint64_t v[3];
++		unsigned nv = 0, want;
++
++		*bad = n;
++		if (n == POKE_MAX_OPS) {
++			return -3;
++		}
++		o = &ops[n];
++		o->kind = *s;
++		want = *s == 'r' ? 1 : *s == 'w' ? 2 : *s == 'm' ? 3 : *s == 'd' ? 1 : 0;
++		if (!want || s[1] != ':') {
++			return -2;
++		}
++		s += 2;
++		for (;;) {   /* hex fields separated by '=' */
++			uint64_t x = 0;
++			unsigned digits = 0;
++
++			if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
++				s += 2;
++			}
++			for (;; s++, digits++) {
++				int c = *s, d;
++				if (c >= '0' && c <= '9') {
++					d = c - '0';
++				} else if (c >= 'a' && c <= 'f') {
++					d = c - 'a' + 10;
++				} else if (c >= 'A' && c <= 'F') {
++					d = c - 'A' + 10;
++				} else {
++					break;
++				}
++				if (digits >= 16) {
++					return -2;
++				}
++				x = x << 4 | (uint64_t)d;
++			}
++			if (!digits || nv == 3) {
++				return -2;
++			}
++			v[nv++] = x;
++			if (*s != '=') {
++				break;
++			}
++			s++;
++		}
++		if (nv != want || *s != ';') {
++			return -2;
++		}
++		s++;
++		o->addr = 0;
++		o->mask = 0xffffffffu;
++		o->val = 0;
++		if (o->kind == 'd') {
++			if (v[0] > POKE_MAX_DELAY_US) {
++				return -6;
++			}
++			o->val = (uint32_t)v[0];
++		} else {
++			int k;
++
++			o->addr = v[0];
++			if (want > 1 && (v[1] > 0xffffffffu || (want == 3 && v[2] > 0xffffffffu))) {
++				return -2;
++			}
++			if (o->kind == 'w') {
++				o->val = (uint32_t)v[1];
++			} else if (o->kind == 'm') {
++				o->mask = (uint32_t)v[1];
++				o->val = (uint32_t)v[2];
++			}
++			if (o->addr & 3u) {
++				return -4;
++			}
++			k = poke_find(rg, nrg, o->addr);
++			if (k < 0) {
++				return -5;
++			}
++			if (o->kind != 'r' && rg[k].ro) {
++				unsigned j;
++				for (j = 0; j < nwin && wins[j] != o->addr; j++) {
++				}
++				if (j == nwin) {
++					return -7;
++				}
++			}
++		}
++		n++;
++	}
++	return (int)n;
++}
++
++#endif

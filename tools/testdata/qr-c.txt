@@ -1,0 +1,70 @@
+SMP SpringBoard t20 pc 0x21053a718 lr 0x0 sp 0x16bd17000 bt
+SMP SpringBoard t21 pc 0x200fb1030 lr 0x200fc2b18 sp 0x16bda1c80 bt 0x200fc2db8 0x200fb1524 0x1c57fc148 0x1c57fd2e0 0x1c5801d20 0x
+SMP SpringBoard t22 pc 0x200fb14f0 lr 0x21053ac1c sp 0x16be2eb30 bt 0x21053a720
+SMP SpringBoard t23 pc 0x200fb14f0 lr 0x21053ac1c sp 0x16bebab30 bt 0x21053a720
+SMP SpringBoard t24 pc 0x200fb14f0 lr 0x21053ac1c sp 0x16bfd2b30 bt 0x21053a720
+SMP SpringBoard t25 pc 0x200fb1030 lr 0x200fc2b18 sp 0x16c05dc60 bt 0x200fc2db8 0x200fb1524 0x1c57fc148 0x1c57fd2e0 0x1c5801d20 0x
+SMP SpringBoard t26 pc 0x21053a718 lr 0x0 sp 0x16c0eab10 bt
+SMP SpringBoard t27 pc 0x200fb14f0 lr 0x21053ac1c sp 0x16c176ad0 bt 0x21053a720
+SMP SpringBoard t28 pc 0x1c5806bd8 lr 0x1c5806bc4 sp 0x16c2021b0 bt 0x1c57949bc 0x232d39b1c 0x1cc538780 0x1cc50fd48 0x1cc521780 0x
+SMP SpringBoard t29 pc 0x200fb14f0 lr 0x21053ac1c sp 0x16c28eb30 bt 0x21053a720
+SMP SpringBoard t30 pc 0x200fb14f0 lr 0x21053ac1c sp 0x16c432b30 bt 0x21053a720
+SMP SpringBoard t31 pc 0x200fb0fac lr 0x1cc507d24 sp 0x16c4becf0 bt 0x1cc508360 0x1c7b5dd9c 0x1bfb68a5c 0x21053c0ec 0x21053a72c
+SMP SpringBoard t32 pc 0x200fb1030 lr 0x200fc2b18 sp 0x16b8b5c80 bt 0x200fc2db8 0x200fb1524 0x1c57fc148 0x1c57fd2e0 0x1c5801d20 0x
+SMP SpringBoard t33 pc 0x200fb1030 lr 0x200fc2b18 sp 0x16c549c60 bt 0x200fc2db8 0x200fb1524 0x1c57fc148 0x1c57fd2e0 0x1c5801d20 0x
+SMP SpringBoard t34 pc 0x200fb14f0 lr 0x21053ac1c sp 0x16c5d6b30 bt 0x21053a720
+SMP SpringBoard t36 pc 0x200fb14f0 lr 0x21053ac1c sp 0x16c6eeb30 bt 0x21053a720
+SMP SpringBoard t37 pc 0x200fb14f0 lr 0x21053ac1c sp 0x16c77ab30 bt 0x21053a720
+SMP SpringBoard t39 pc 0x200fb14f0 lr 0x21053ac1c sp 0x16c892fc0 bt 0x21053a720
+SMP SpringBoard t41 pc 0x0 lr 0x0 sp 0x0 bt
+SWEET AKS: duetexpertd sel 17 arg0 0 in 1/0 out 0/4096 -> 0x0
+SWEET AKS: com.apple.siri.embeddedspeech sel 0 arg0 0 in 0/0 out 0/0 -> 0x0
+exec webbookmarksd
+exec xpcproxy
+exec IMDMessageServicesAgent
+SWEET AKS: searchpartyd sel 17 arg0 0 in 1/0 out 0/4096 -> 0x0
+exec UsageTrackingAgent
+SWEET AKS: peopled sel 17 arg0 0 in 1/0 out 0/4096 -> 0x0
+exec OTACrashCopier
+SWEET AKS: suggestd sel 17 arg0 0 in 1/0 out 0/4096 -> 0x0
+exec linkd
+SWEET AKS: searchd sel 35 arg0 0 in 1/0 out 0/4096 -> 0x0
+SWEET AKS: coreduetd sel 17 arg0 0 in 1/0 out 0/4096 -> 0x0
+SWEET AKS: nanoregistryd sel 35 arg0 0 in 1/0 out 0/4096 -> 0x0
+SWEET AKS: siriinferenced sel 0 arg0 0 in 0/0 out 0/0 -> 0x0
+SWEET AKS: mediaanalysisd sel 0 arg0 0 in 0/0 out 0/0 -> 0x0
+SWEET AKS: contextstored sel 17 arg0 0 in 1/0 out 0/4096 -> 0x0
+exec bluetoothd
+exec HeuristicInterpreter
+SWEET TOUCH: mapping SPI 0x10d40000, USI mode 0x10c2100c and the pad banks
+SWEET TOUCH: sysreg USI11 mode (0x10c2100c) = 0 (SPI = 0x2, so not SPI yet)
+SWEET TOUCH: pin clk   bank 0x10c40060[0] func=0 dat=0 pud=0x1
+SWEET TOUCH: pin mosi  bank 0x10c40060[1] func=0 dat=0 pud=0x1
+SWEET TOUCH: pin miso  bank 0x10c40060[2] func=0 dat=0 pud=0x1
+SWEET TOUCH: pin cs    bank 0x10c40060[3] func=0 dat=0 pud=0x1
+SWEET TOUCH: pin irq   bank 0x174d00c0[0] func=0 dat=0 pud=0
+SWEET TOUCH: pin reset bank 0x10c400c0[0] func=0 dat=0 pud=0x1
+SWEET TOUCH: pin mux   bank 0x10c400c0[1] func=0 dat=0 pud=0x1
+SWEET TOUCH: AP/AOC mux: AP is NOT driving it low, the bus may belong to the AOC
+SWEET TOUCH: leaving the bus alone; boot-arg sweettouchmux=1 drives the mux low
+SWEET AKS: lsd sel 0 arg0 0 in 0/0 out 0/0 -> 0x0
+SWEET AKS: maild sel 17 arg0 0 in 1/0 out 0/4096 -> 0x0
+SWEET AKS: UsageTrackingAgent sel 0 arg0 0 in 0/0 out 0/0 -> 0x0
+SWEET AKS: duetexpertd sel 17 arg0 0 in 1/0 out 0/4096 -> 0x0
+exec SiriTTSSynthesizerAU
+SWEET AKS: pasted sel 17 arg0 0 in 1/0 out 0/4096 -> 0x0
+exec KonaSynthesizer
+exec MacinTalkAUSP
+exec xpcproxy
+exec extensionkitservice
+exec com.apple.SiriTTSService.TrialPr
+exec CalendarFocusConfigurationExtens
+exec SafariLinkExtension
+exec MailShortcutsExtension
+exec MessagesActionExtension
+SWEET AKS: SpringBoard sel 26 arg0 2 in 3/0 out 0/0 -> 0x0
+SWEET AKS: SpringBoard sel 8 arg0 0 in 1/0 out 0/0 -> 0xe00002c7
+exec MobileCal
+SWEET Sandbox: dasd privilege 1005 denied
+SWEET AKS: dasd sel 17 arg0 0 in 1/0 out 0/4096 -> 0x0
+SWEET AKS: coreduetd sel 17 arg0 0 in 1/0 out 0/4096 -> 0x0

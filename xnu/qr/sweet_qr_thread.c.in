@@ -1,0 +1,72 @@
+
+/* ---- kernel side: take over the screen with the console log as looping QR codes ---- */
+
+extern struct vc_info vinfo;		/* osfmk/console/video_console.c */
+extern int sweet_console_muted;		/* osfmk/console/serial_console.c: stop drawing console text */
+extern uint32_t sweet_log_snapshot(char *out, uint32_t max);	/* bsd/dev/sweet_ufs.c */
+
+static char sweet_qr_snap[16384];
+static char sweet_qr_frame[1024];
+static int sweet_qr_chan;
+
+static void
+sweet_qr_thread(__unused void *arg, __unused wait_result_t wr)
+{
+	uint32_t delay = 0, chunk = 200, ms = 800, tail = 12000;
+
+	PE_parse_boot_argn("sweetqr", &delay, sizeof(delay));
+	PE_parse_boot_argn("sweetqr_chunk", &chunk, sizeof(chunk));
+	PE_parse_boot_argn("sweetqr_ms", &ms, sizeof(ms));
+	PE_parse_boot_argn("sweetqr_tail", &tail, sizeof(tail));
+	if (chunk < 40 || chunk > 600) {
+		chunk = 200;
+	}
+	if (tail < chunk || tail > sizeof(sweet_qr_snap)) {
+		tail = 12000;
+	}
+	if (ms < 100) {
+		ms = 100;
+	}
+	/* Let the boot make progress first; the log keeps filling meanwhile. */
+	(void)tsleep(&sweet_qr_chan, PZERO, "sweetqr", (int)(hz * delay));
+	printf("SWEET QR: taking over the screen (chunk %u bytes, %u ms/frame, last %u bytes)\n", chunk, ms, tail);
+	sweet_console_muted = 1;
+	for (;;) {
+		uint32_t len = sweet_log_snapshot(sweet_qr_snap, tail);
+		uint32_t n = qrlog_nframes(len, chunk);
+		for (uint32_t i = 0; i < n; i++) {
+			/* vinfo (video_console.c), not PE_state.video: that one holds the PHYSICAL base */
+			struct vc_info *v = &vinfo;
+			if (!v->v_baseaddr || v->v_depth < 32) {
+				(void)tsleep(&sweet_qr_chan, PZERO, "sweetqr", hz);
+				continue;
+			}
+			qrlog_make_frame(sweet_qr_snap, len, chunk, i, sweet_qr_frame);
+			(void)qrlog_draw((volatile uint32_t *)v->v_baseaddr, v->v_width, v->v_height,
+			    v->v_rowbytes, sweet_qr_frame);
+			(void)tsleep(&sweet_qr_chan, PZERO, "sweetqr", (int)MAX(1, (hz * ms) / 1000));
+		}
+	}
+}
+
+void sweet_qr_start(void);
+
+/* boot-arg sweetqr=<seconds to wait before taking over the screen>; absent/0 = off. */
+void
+sweet_qr_start(void)
+{
+	static int started;
+	uint32_t delay = 0;
+	thread_t thread;
+
+	if (started) {
+		return;
+	}
+	started = 1;
+	if (!PE_parse_boot_argn("sweetqr", &delay, sizeof(delay)) || delay == 0) {
+		return;
+	}
+	if (kernel_thread_start(sweet_qr_thread, NULL, &thread) == KERN_SUCCESS) {
+		thread_deallocate(thread);
+	}
+}

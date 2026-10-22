@@ -1,0 +1,1443 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -108,6 +108,8 @@
+ bsd/dev/sweet_qr.c			standard
+ bsd/dev/sweet_restart.c			standard
+ bsd/dev/sweet_qrcodegen.c		standard
++bsd/dev/sweet_qrstream.c		standard
++bsd/dev/sweet_qrz.c		standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+--- a/bsd/dev/sweet_qr.c
++++ b/bsd/dev/sweet_qr.c
+@@ -9,7 +9,10 @@
+ #include <console/video_console.h>
+ #include <libkern/libkern.h>
+ #include <stdint.h>
++#include <kern/clock.h>
++#include <mach/mach_time.h>
+ #include "sweet_qrcodegen.h"
++#include "sweet_qrstream.h"
+ 
+ extern void sweet_restart_poll(void);
+ extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
+@@ -137,21 +140,32 @@
+ }
+ 
+ /* ---- kernel side: take over the screen with the console log as looping QR codes ---- */
++#pragma clang diagnostic ignored "-Weverything"
+ 
+ extern struct vc_info vinfo;		/* osfmk/console/video_console.c */
+ extern int sweet_console_muted;		/* osfmk/console/serial_console.c: stop drawing console text */
+-extern uint32_t sweet_log_snapshot(char *out, uint32_t max);	/* bsd/dev/sweet_ufs.c */
++extern uint32_t sweet_log_snapshot(char *out, uint32_t max);	/* bsd/dev/sweet_ufs.c (QL1) */
++extern uint32_t sweet_log_copy(uint64_t *pos, char *out, uint32_t max);	/* bsd/dev/sweet_ufs.c: console bytes [*pos, total) */
++
++/* While set, AppleCLCD (iokit/Kernel/arm/SweetFramebuffer.cpp) neither presents iOS frames nor fades the panel: the code stays on screen. */
++int sweet_qr_hold;
+ 
+ static char sweet_qr_snap[16384];
+ static char sweet_qr_frame[1024];
+ static int sweet_qr_chan;
+ 
+ static void
+-sweet_qr_thread(__unused void *arg, __unused wait_result_t wr)
++sweet_qr_nap(uint32_t ms)
+ {
+-	uint32_t delay = 0, chunk = 200, ms = 800, tail = 12000;
++	(void)tsleep(&sweet_qr_chan, PZERO, "sweetqr", (int)MAX(1, (hz * ms) / 1000));
++}
++
++/* QL1 (boot-arg sweetqr_fmt=1): the deduplicated 12 kB tail of the log as a looping series of text QR codes. */
++static void
++sweet_qr1_loop(void)
++{
++	uint32_t chunk = 200, ms = 800, tail = 12000;
+ 
+-	PE_parse_boot_argn("sweetqr", &delay, sizeof(delay));
+ 	PE_parse_boot_argn("sweetqr_chunk", &chunk, sizeof(chunk));
+ 	PE_parse_boot_argn("sweetqr_ms", &ms, sizeof(ms));
+ 	PE_parse_boot_argn("sweetqr_tail", &tail, sizeof(tail));
+@@ -164,9 +178,7 @@
+ 	if (ms < 100) {
+ 		ms = 100;
+ 	}
+-	/* Let the boot make progress first; the log keeps filling meanwhile. */
+-	(void)tsleep(&sweet_qr_chan, PZERO, "sweetqr", (int)(hz * delay));
+-	printf("SWEET QR: taking over the screen (chunk %u bytes, %u ms/frame, last %u bytes)\n", chunk, ms, tail);
++	printf("SWEET QR: taking over the screen (QL1, chunk %u bytes, %u ms/frame, last %u bytes)\n", chunk, ms, tail);
+ 	sweet_console_muted = 1;
+ 	for (;;) {
+ 		sweet_restart_poll();
+@@ -182,8 +194,139 @@
+ 			qrlog_make_frame(sweet_qr_snap, len, chunk, i, sweet_qr_frame);
+ 			(void)qrlog_draw((volatile uint32_t *)v->v_baseaddr, v->v_width, v->v_height,
+ 			    v->v_rowbytes, sweet_qr_frame);
+-			(void)tsleep(&sweet_qr_chan, PZERO, "sweetqr", (int)MAX(1, (hz * ms) / 1000));
++			sweet_qr_nap(ms);
++		}
++	}
++}
++
++/* QL2 (default; qrlog/qrstream.h, host tools/qrl2.py): compressed append-only stream, repair frames, tiles. */
++static qs_t sweet_qs;
++static char sweet_qr_text[QS_TILES_MAX][QS_TEXT_MAX + 1];
++
++/* Feed the console bytes written since the last call into the stream (at most `budget` per call). */
++static void
++sweet_qr2_pump(uint64_t *pos, uint32_t budget, uint32_t *fed)
++{
++	static char copy[1024];
++
++	while (budget) {
++		uint32_t n = sweet_log_copy(pos, copy, (uint32_t)MIN((uint32_t)sizeof(copy), budget));
++		if (n == 0) {
++			break;
+ 		}
++		qs_feed(&sweet_qs, *pos - n, copy, n);
++		*fed += n;
++		budget -= n;
++	}
++}
++
++static void
++sweet_qr2_loop(uint32_t delay)
++{
++	uint32_t ver = 10, ecc = 0, tiles = 2, unit = 8192, k = 64, red = 0, ms = 800, flush_ms = 3000, hold = 1, fec = 1;
++	uint64_t t0 = mach_absolute_time(), pos = 0, last_new = t0, last_stat = t0;
++	uint32_t klog = 2, fed_total = 0;
++
++	PE_parse_boot_argn("sweetqr_ver", &ver, sizeof(ver));
++	PE_parse_boot_argn("sweetqr_ecc", &ecc, sizeof(ecc));
++	PE_parse_boot_argn("sweetqr_tiles", &tiles, sizeof(tiles));
++	PE_parse_boot_argn("sweetqr_unit", &unit, sizeof(unit));
++	PE_parse_boot_argn("sweetqr_k", &k, sizeof(k));
++	PE_parse_boot_argn("sweetqr_ms", &ms, sizeof(ms));
++	PE_parse_boot_argn("sweetqr_flush", &flush_ms, sizeof(flush_ms));
++	PE_parse_boot_argn("sweetqr_hold", &hold, sizeof(hold));
++	PE_parse_boot_argn("sweetqr_fec", &fec, sizeof(fec));
++	PE_parse_boot_argn("sweetqr_red", &red, sizeof(red));
++	while ((1u << klog) < k && klog < 9) {
++		klog++;
++	}
++	if (ms < 100) {
++		ms = 100;
++	}
++	uint32_t sid = (uint32_t)((t0 >> 3) ^ (t0 >> 19) ^ (t0 >> 35));
++	uint32_t B = qs_init(&sweet_qs, ver, ecc, tiles, unit, klog, sid);
++	if (B == 0) {
++		printf("SWEET QR: QL2 config rejected (ver %u ecc %u tiles %u unit %u k %u), falling back to QL1\n", ver, ecc, tiles, unit, k);
++		sweet_qr1_loop();
++		return;
++	}
++	qs_set_fec(&sweet_qs, fec);
++	qs_set_red(&sweet_qs, red);
++	uint64_t ticks_per_ms = 0;
++	{
++		uint64_t one = 0;
++		nanoseconds_to_absolutetime(1000000ULL, &one);
++		ticks_per_ms = one ? one : 1;
++	}
++	/* Feed the log from its first byte while the boot runs, so nothing early is lost; take over the screen after `delay` s. */
++	uint64_t deadline = t0 + (uint64_t)delay * 1000 * ticks_per_ms;
++	while (mach_absolute_time() < deadline) {
++		sweet_restart_poll();
++		uint32_t fed = 0;
++		sweet_qr2_pump(&pos, 256 * 1024, &fed);
++		if (fed) {
++			last_new = mach_absolute_time();
++		} else if (qs_pending(&sweet_qs) && mach_absolute_time() - last_new > (uint64_t)flush_ms * ticks_per_ms) {
++			(void)qs_flush(&sweet_qs);
++		}
++		sweet_qr_nap(fed ? 100 : 1000);
++	}
++	printf("SWEET QR: taking over the screen (QL2 sid %04x, QR v%u ecc %u, %u tile(s), %u B/frame, K %u, unit %u, %u ms/tick)\n",
++	    sid & 0xffff, sweet_qs.ver, ecc, tiles, B, 1u << klog, unit, ms);
++	sweet_console_muted = 1;
++	sweet_qr_hold = (int)hold;
++	for (;;) {
++		sweet_restart_poll();
++		uint32_t fed = 0;
++		sweet_qr2_pump(&pos, 64 * 1024, &fed);
++		uint64_t now = mach_absolute_time();
++		if (fed) {
++			last_new = now;
++		} else if (qs_pending(&sweet_qs) && now - last_new > (uint64_t)flush_ms * ticks_per_ms) {
++			(void)qs_flush(&sweet_qs);
++		}
++		fed_total += fed;
++		if (now - last_stat > 30000ULL * ticks_per_ms) {
++			last_stat = now;
++			printf("SWEET QR2: console %llu B -> stream %llu B (%llu blocks of %u B), %u B fed in the last 30 s\n",
++			    pos, sweet_qs.tx_len, qs_hi(&sweet_qs), sweet_qs.D, fed_total);
++			fed_total = 0;
++		}
++		struct vc_info *v = &vinfo;
++		if (!v->v_baseaddr || v->v_depth < 32) {
++			sweet_qr_nap(1000);
++			continue;
++		}
++		const char *tp[QS_TILES_MAX];
++		uint32_t nt = 0;
++		for (uint32_t t = 0; t < tiles; t++) {
++			if (qs_next_frame(&sweet_qs, sweet_qr_text[t]) == 0) {
++				break;
++			}
++			tp[nt++] = sweet_qr_text[t];
++		}
++		if (nt == 0) {
++			sweet_qr_nap(250);	/* first block not complete yet */
++			continue;
++		}
++		(void)qs_draw(&sweet_qs, (volatile uint32_t *)v->v_baseaddr, v->v_width, v->v_height, v->v_rowbytes, tp, nt);
++		sweet_qr_nap(ms);
++	}
++}
++
++static void
++sweet_qr_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	uint32_t delay = 0, fmt = 2;
++
++	PE_parse_boot_argn("sweetqr", &delay, sizeof(delay));
++	PE_parse_boot_argn("sweetqr_fmt", &fmt, sizeof(fmt));
++	if (fmt == 1) {
++		/* Let the boot make progress first; the log keeps filling meanwhile. */
++		(void)tsleep(&sweet_qr_chan, PZERO, "sweetqr", (int)(hz * delay));
++		sweet_qr1_loop();
++	} else {
++		sweet_qr2_loop(delay);
+ 	}
+ }
+ 
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -37,6 +37,7 @@
+ #include "SweetSurface.h"
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
++extern "C" int sweet_qr_hold;          /* bsd/dev/sweet_qr.c: the QR log is on screen */
+ 
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+@@ -243,6 +244,12 @@
+ 		    (IOMobileFramebufferUserClient *)fb->fClients->getObject(i);
+ 		client->notify(SWEET_FB_NOTIFY_VSYNC, values, 6);
+ 	}
++	if (sweet_qr_hold) {
++		/* the QR log owns the panel: no present(), no fade (vsync notifications keep flowing) */
++		IOLockUnlock(fb->fLock);
++		sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++		return;
++	}
+ 	if (fb->fPowerOff) {
+ 		/* Blank: one write-only pass (WC reads are slow), then idle. */
+ 		uint32_t step = fb->fFadeStep;
+--- /dev/null
++++ b/bsd/dev/sweet_qrlog.h
+@@ -0,0 +1,26 @@
++#pragma once
++/* generated by tools/make-qr2-patch.py from qrlog/qrlog.h */
++#include <stdint.h>
++
++/*
++ * QR log channel: the text log is cut into chunks, each shown as one QR code.
++ * Frame text (ASCII only, so any QR reader returns it unchanged):
++ *   "QL1 <sid:8hex> <idx>/<n> <chunk crc32:8hex>\n" + chunk bytes
++ * sid = crc32 of the whole text, so the host can tell loops of the same
++ * snapshot from a new one. tools/qr-log.py reassembles and verifies.
++ */
++#define QRLOG_HDR_MAX	48u
++#define QRLOG_VER_MAX	25
++#define QRLOG_MARGIN	48u	/* px kept clear on every screen edge */
++
++uint32_t qrlog_crc32(const void *p, unsigned len);
++unsigned qrlog_nframes(unsigned len, unsigned chunk);
++
++/* Build frame idx into out (>= chunk + QRLOG_HDR_MAX + 1 bytes, NUL-terminated).
++ * Non-printable bytes in the chunk become '.', bytes >= 0x7f '?' (newline kept).
++ * Returns the frame length. */
++unsigned qrlog_make_frame(const char *text, unsigned len, unsigned chunk, unsigned idx, char *out);
++
++/* Encode frame text and paint it black on white, centred, integer-scaled, on a
++ * 32-bit framebuffer (stride in bytes). Returns the QR size in modules, 0 on failure. */
++unsigned qrlog_draw(volatile uint32_t *fb, unsigned w, unsigned h, unsigned stride, const char *frame);
+--- /dev/null
++++ b/bsd/dev/sweet_qrstream.c
+@@ -0,0 +1,489 @@
++/* sweet_qrstream.c: generated by tools/make-qr2-patch.py from qrlog/qrstream.c */
++#pragma clang diagnostic ignored "-Weverything"
++#pragma clang optimize off	/* the kernel clang emits SHA3 vector ops (eor3) that gs101 lacks: no vectorising */
++#include "sweet_qrlog.h"
++#include "sweet_qrstream.h"
++#include "sweet_qrz.h"
++#include "sweet_qrcodegen.h"
++
++#define NONE16	0xFFFFu
++
++/* ---- small helpers ---- */
++
++static unsigned put_varint(uint8_t *o, uint64_t v)
++{
++	unsigned n = 0;
++	while (v >= 128) {
++		o[n++] = (uint8_t)(v | 128);
++		v >>= 7;
++	}
++	o[n++] = (uint8_t)v;
++	return n;
++}
++
++static const char b45[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ $%*+-./:";
++
++static unsigned base45(const uint8_t *in, unsigned n, char *out)
++{
++	unsigned o = 0;
++	for (unsigned i = 0; i + 1 < n; i += 2) {
++		unsigned v = in[i] * 256u + in[i + 1];
++		out[o++] = b45[v % 45];
++		out[o++] = b45[v / 45 % 45];
++		out[o++] = b45[v / 2025];
++	}
++	if (n & 1) {
++		unsigned v = in[n - 1];
++		out[o++] = b45[v % 45];
++		out[o++] = b45[v / 45];
++	}
++	out[o] = 0;
++	return o;
++}
++
++/* ---- QR geometry ---- */
++
++static uint8_t qr_tmp[qrcodegen_BUFFER_LEN_FOR_VERSION(QS_VER_MAX)];
++static uint8_t qr_img[QS_TILES_MAX][qrcodegen_BUFFER_LEN_FOR_VERSION(QS_VER_MAX)];
++static char probe[QS_TEXT_MAX + 1];
++
++static int fits(const qs_t *q, unsigned chars)
++{
++	for (unsigned i = 0; i < chars; i++)
++		probe[i] = 'A';
++	probe[chars] = 0;
++	return qrcodegen_encodeText(probe, qr_tmp, qr_img[0], (enum qrcodegen_Ecc)q->ecc, (int)q->ver, (int)q->ver,
++				    qrcodegen_Mask_AUTO, 0);
++}
++
++unsigned qs_sizeof(void)
++{
++	return sizeof(qs_t);
++}
++
++void qs_set_fec(qs_t *q, unsigned on)
++{
++	q->nofec = !on;
++}
++
++void qs_set_red(qs_t *q, unsigned percent)
++{
++	q->repair_pct = percent > 100 ? 100 : percent;
++}
++
++unsigned qs_init(qs_t *q, unsigned ver, unsigned ecc, unsigned tiles, unsigned unit, unsigned klog, unsigned sid)
++{
++	if (ver == 21)		/* OpenCV's QR decoder (the host side) fails on version 21 even on a clean image (tools/qrsim.py): use 22 */
++		ver = 22;
++	if (ver < 1 || ver > QS_VER_MAX || ecc > 3 || !tiles || tiles > QS_TILES_MAX || !unit || unit > QS_UNIT_MAX ||
++	    klog < 2 || klog > 9)
++		return 0;
++	uint8_t *p = (uint8_t *)q;
++	for (unsigned i = 0; i < sizeof *q; i++)
++		p[i] = 0;
++	q->ver = ver; q->ecc = ecc; q->tiles = tiles; q->unit = unit; q->klog = klog; q->sid = sid & 0xffff;
++	unsigned lo = 1, hi = QS_TEXT_MAX;
++	if (!fits(q, lo))
++		return 0;
++	while (lo < hi) {		/* largest alphanumeric text that fits this version/ecc */
++		unsigned mid = (lo + hi + 1) / 2;
++		if (fits(q, mid))
++			lo = mid;
++		else
++			hi = mid - 1;
++	}
++	q->cap_chars = lo;
++	unsigned n = lo / 3 * 2 + (lo % 3 >= 2);		/* body bytes whose base45 fits */
++	if (n < QS_HDR_MAX + 4 + 2 + 32 || n - QS_HDR_MAX - 4 > QS_B_MAX)
++		return 0;
++	q->B = n - QS_HDR_MAX - 4;
++	q->D = q->B - 2;
++	q->bfirst[0] = NONE16;
++	return q->B;
++}
++
++/* ---- transport stream ---- */
++
++static void tx_put(qs_t *q, uint8_t c)
++{
++	q->tx[q->tx_len % QS_TX_SIZE] = c;
++	q->tx_len++;
++	if (q->tx_len % q->D == 0)
++		q->bfirst[(q->tx_len / q->D) % QS_MAXBLK] = NONE16;
++}
++
++static void tx_varint(qs_t *q, uint64_t v)
++{
++	uint8_t t[10];
++	unsigned n = put_varint(t, v);
++	for (unsigned i = 0; i < n; i++)
++		tx_put(q, t[i]);
++}
++
++uint64_t qs_hi(const qs_t *q)
++{
++	return q->tx_len / q->D;
++}
++
++uint64_t qs_lo(const qs_t *q)
++{
++	uint64_t K = 1u << q->klog, lo = 0;
++	if (q->tx_len > QS_TX_SIZE)
++		lo = (q->tx_len - QS_TX_SIZE + q->D - 1) / q->D;
++	if (qs_hi(q) > QS_MAXBLK && lo < qs_hi(q) - QS_MAXBLK)
++		lo = qs_hi(q) - QS_MAXBLK;
++	return (lo + K - 1) / K * K;
++}
++
++uint64_t qs_reduced(const qs_t *q)
++{
++	return q->red_base;
++}
++
++uint64_t qs_stream_len(const qs_t *q)
++{
++	return q->tx_len;
++}
++
++static uint8_t cbuf[QS_UNIT_MAX + 64];
++
++/* compress red[0, commit) into one record and shift the rest down */
++static void compress_unit(qs_t *q, unsigned commit)
++{
++	if (!commit)
++		return;
++	unsigned clen = qrz_deflate(q->red, commit, cbuf, commit - 1 < sizeof cbuf ? commit - 1 : sizeof cbuf);
++	const uint8_t *body = clen ? cbuf : q->red;
++	if (!clen)
++		clen = commit;
++	unsigned blk = q->tx_len / q->D;
++	if (q->bfirst[blk % QS_MAXBLK] == NONE16)
++		q->bfirst[blk % QS_MAXBLK] = (uint16_t)(q->tx_len % q->D);
++	tx_varint(q, (uint64_t)commit << 1 | (body == q->red));
++	tx_varint(q, clen);
++	tx_varint(q, q->red_base);
++	tx_varint(q, q->red0_raw);
++	uint32_t crc = qrlog_crc32(q->red, commit);
++	for (int i = 0; i < 4; i++)
++		tx_put(q, crc >> (8 * i) & 255);
++	for (unsigned i = 0; i < clen; i++)
++		tx_put(q, body[i]);
++	q->red_base += commit;
++	for (unsigned i = commit; i < q->red_len; i++)
++		q->red[i - commit] = q->red[i];
++	q->red_len -= commit;
++	q->lstart -= q->in_line ? commit : 0;
++	if (!q->in_line)
++		q->lstart = q->red_len;
++	else
++		q->red0_raw = q->line_raw0;
++}
++
++int qs_pending(const qs_t *q)
++{
++	return q->red_len || q->tx_len % q->D;
++}
++
++int qs_flush(qs_t *q)
++{
++	int did = q->red_len || q->tx_len % q->D;
++	compress_unit(q, q->in_line ? q->lstart : q->red_len);
++	while (q->tx_len % q->D)
++		tx_put(q, 0);
++	return did;
++}
++
++/* ---- reducer ---- */
++
++static int has(const uint8_t *s, unsigned n, const char *w)
++{
++	unsigned m = 0;
++	while (w[m])
++		m++;
++	for (unsigned i = 0; i + m <= n; i++) {
++		unsigned k = 0;
++		while (k < m && s[i + k] == (uint8_t)w[k])
++			k++;
++		if (k == m)
++			return 1;
++	}
++	return 0;
++}
++
++/* lines that must survive shape-dedupe (only exact repeats are dropped): panics, crashes, our own SWEET* diagnostics */
++static int is_protected(const uint8_t *s, unsigned n)
++{
++	static const char *const kw[] = { "SWEET", "panic", "PANIC", "Panic", "CRASH", "Assertion", "esr", "Kernel trap" };
++	for (unsigned i = 0; i < sizeof kw / sizeof kw[0]; i++)
++		if (i ? has(s, n, kw[i]) : (n >= 5 && has(s, 5, kw[0])))
++			return 1;
++	return 0;
++}
++
++static void red_put(qs_t *q, uint8_t c)
++{
++	q->red[q->red_len++] = c;
++}
++
++static unsigned put_dec_r(uint8_t *o, unsigned v)
++{
++	uint8_t t[10];
++	unsigned n = 0, k = 0;
++	do
++		t[n++] = '0' + v % 10;
++	while (v /= 10);
++	while (n)
++		o[k++] = t[--n];
++	return k;
++}
++
++static void line_done(qs_t *q)
++{
++	unsigned len = q->red_len - q->lstart;
++	const uint8_t *ln = q->red + q->lstart;
++	q->in_line = 0;
++	if (len <= 1) {			/* empty line: no information */
++		q->red_len = q->lstart;
++		return;
++	}
++	int prot = is_protected(ln, len), dup = 0;
++	for (unsigned i = 0; i < 32 && i < q->nrec; i++)
++		dup |= prot ? q->recF[i] == q->hf : q->recS[i] == q->hs;
++	if (dup) {			/* roll back: the line never reached the stream */
++		q->red_len = q->lstart;
++		q->ndrop++;
++		return;
++	}
++	if (q->ndrop) {			/* say how much was dropped, in front of the line that ends the run */
++		uint8_t m[48];
++		unsigned ml = 0;
++		const char *a = "[~", *b = " similar lines dropped]\n";
++		while (*a)
++			m[ml++] = *a++;
++		ml += put_dec_r(m + ml, q->ndrop);
++		while (*b)
++			m[ml++] = *b++;
++		for (unsigned i = len; i-- > 0;)
++			q->red[q->lstart + ml + i] = q->red[q->lstart + i];
++		for (unsigned i = 0; i < ml; i++)
++			q->red[q->lstart + i] = m[i];
++		q->red_len += ml;
++		q->ndrop = 0;
++	}
++	q->recS[q->nrec % 32] = q->hs;
++	q->recF[q->nrec % 32] = q->hf;
++	q->nrec++;
++	q->lstart = q->red_len;
++	if (q->red_len >= q->unit)
++		compress_unit(q, q->red_len);
++}
++
++void qs_feed(qs_t *q, uint64_t raw_off, const char *p, unsigned n)
++{
++	if (!q->raw_next && !q->red_len && !q->tx_len && !q->in_line)
++		q->raw_next = raw_off;
++	if (raw_off != q->raw_next && n) {		/* the console ring overran the reader */
++		uint64_t lost = raw_off - q->raw_next;
++		if (q->in_line) {
++			red_put(q, '\n');
++			line_done(q);
++		}
++		uint8_t m[48];
++		unsigned ml = 0;
++		const char *a = "[log overrun: ", *b = " bytes lost]\n";
++		while (*a)
++			m[ml++] = *a++;
++		ml += put_dec_r(m + ml, (unsigned)(lost > 0xffffffffu ? 0xffffffffu : lost));
++		while (*b)
++			m[ml++] = *b++;
++		if (!q->red_len)
++			q->red0_raw = q->raw_next;
++		for (unsigned i = 0; i < ml; i++)
++			red_put(q, m[i]);
++		q->lstart = q->red_len;
++		q->raw_next = raw_off;
++		if (q->red_len >= q->unit)
++			compress_unit(q, q->red_len);
++	}
++	for (unsigned i = 0; i < n; i++, q->raw_next++) {
++		uint8_t c = (uint8_t)p[i];
++		if (c == '\r')
++			continue;
++		if (!q->in_line) {
++			q->in_line = 1;
++			q->lstart = q->red_len;
++			q->line_raw0 = q->raw_next;
++			if (!q->red_len)
++				q->red0_raw = q->raw_next;
++			q->hs = q->hf = 2166136261u;
++		}
++		if (c == 0)
++			c = '.';
++		red_put(q, c);
++		q->hf = (q->hf ^ c) * 16777619u;
++		if (c < '0' || c > '9')
++			q->hs = (q->hs ^ c) * 16777619u;
++		if (c == '\n')
++			line_done(q);
++		else if (q->red_len - q->lstart >= QS_LINE_MAX) {
++			red_put(q, '\n');
++			line_done(q);
++		}
++	}
++}
++
++/* ---- frames ---- */
++
++static uint8_t blkbuf[QS_B_MAX], acc[QS_B_MAX], body[QS_HDR_MAX + QS_B_MAX + 4];
++
++static void get_block(const qs_t *q, uint64_t k, uint8_t *out)
++{
++	uint16_t f = q->bfirst[k % QS_MAXBLK];
++	out[0] = f & 255;
++	out[1] = f >> 8;
++	uint64_t at = k * q->D;
++	for (unsigned i = 0; i < q->D; i++)
++		out[2 + i] = q->tx[(at + i) % QS_TX_SIZE];
++}
++
++/* which blocks of generation g a repair symbol covers: block i is in iff a murmur3-finalised hash of (g, seed, i) has bit 16 set.
++ * Same on the host (tools/qrl2.py rep_mask). Must be nonlinear: a GF(2)-linear generator (xorshift) spans <= 32 dimensions, which cannot
++ * rebuild a generation of more than 32 blocks. */
++static uint32_t mix32(uint32_t h)
++{
++	h ^= h >> 16;
++	h *= 0x85EBCA6Bu;
++	h ^= h >> 13;
++	h *= 0xC2B2AE35u;
++	h ^= h >> 16;
++	return h;
++}
++
++static uint32_t rep_seed(uint64_t g, unsigned seed)
++{
++	return mix32((uint32_t)g * 0x9E3779B1u ^ seed * 0x85EBCA77u ^ 0xC2B2AE3Du);
++}
++
++static int rep_bit(uint32_t base, unsigned i)
++{
++	return mix32(base + i * 0x9E3779B9u) >> 16 & 1;
++}
++
++static unsigned frame_text(qs_t *q, int rep, uint64_t a, unsigned seed, char *text)
++{
++	unsigned hl = 0, K = 1u << q->klog;
++	uint64_t hi = qs_hi(q);
++	body[hl++] = 0x20 | rep << 3 | (q->klog - 2);
++	body[hl++] = q->sid & 255;
++	body[hl++] = q->sid >> 8;
++	hl += put_varint(body + hl, hi);
++	hl += put_varint(body + hl, qs_lo(q));
++	hl += put_varint(body + hl, a);
++	if (rep)
++		hl += put_varint(body + hl, seed);
++	if (!rep) {
++		get_block(q, a, body + hl);
++	} else {
++		uint32_t x = rep_seed(a, seed);
++		unsigned any = 0, kk = (a + 1) * K > hi ? (unsigned)(hi - a * K) : K;	/* the open generation: only the blocks it has so far */
++		for (unsigned i = 0; i < q->B; i++)
++			acc[i] = 0;
++		for (unsigned i = 0; i < kk; i++) {
++			if (!rep_bit(x, i))
++				continue;
++			any = 1;
++			get_block(q, a * K + i, blkbuf);
++			for (unsigned j = 0; j < q->B; j++)
++				acc[j] ^= blkbuf[j];
++		}
++		if (!any) {
++			get_block(q, a * K + seed % kk, acc);
++		}
++		for (unsigned i = 0; i < q->B; i++)
++			body[hl + i] = acc[i];
++	}
++	unsigned bl = hl + q->B;
++	uint32_t crc = qrlog_crc32(body, bl);
++	for (int i = 0; i < 4; i++)
++		body[bl++] = crc >> (8 * i) & 255;
++	return base45(body, bl, text);
++}
++
++unsigned qs_next_frame(qs_t *q, char *text)
++{
++	uint64_t hi = qs_hi(q), lo = qs_lo(q), K = 1u << q->klog, R = q->nofec ? 0 : (K * q->repair_pct + 99) / 100;
++	if (hi <= lo)
++		return 0;
++	q->tick++;
++	if (hi != q->hi_seen) {
++		q->hi_seen = hi;
++		q->grow_tick = q->tick;
++	}
++	/* 2 slots of 3: the first pass, generation after generation: K plain blocks, then R repair frames */
++	if (q->next_new < lo / K * (K + R))
++		q->next_new = lo / K * (K + R);
++	if (q->tick % 3 != 0) {
++		uint64_t g = q->next_new / (K + R), pos = q->next_new % (K + R);
++		if (pos < K && g * K + pos < hi) {
++			q->next_new++;
++			return frame_text(q, 0, g * K + pos, 0, text);
++		}
++		if (pos >= K && (g + 1) * K <= hi) {
++			q->next_new++;
++			return frame_text(q, 1, g, q->seed++ & 0xffff, text);
++		}
++	}
++	/* the rest: repair frames rotating over all generations, the open one (blocks so far) included */
++	uint64_t g0 = lo / K, g1 = (hi + K - 1) / K, bg = q->bg++;
++	if (q->nofec)
++		return frame_text(q, 0, lo + bg % (hi - lo), 0, text);
++	int growing = q->tick - q->grow_tick < 64;
++	uint64_t g = growing && (bg & 1) ? g1 - 1 : g0 + (growing ? bg >> 1 : bg) % (g1 - g0);
++	return frame_text(q, 1, g, q->seed++ & 0xffff, text);
++}
++
++/* ---- drawing ---- */
++
++unsigned qs_draw(const qs_t *q, volatile uint32_t *fb, unsigned w, unsigned h, unsigned stride, const char *const *texts,
++		 unsigned nt)
++{
++	if (!nt || nt > QS_TILES_MAX)
++		return 0;
++	unsigned size = 0;
++	for (unsigned t = 0; t < nt; t++) {
++		if (!qrcodegen_encodeText(texts[t], qr_tmp, qr_img[t], (enum qrcodegen_Ecc)q->ecc, (int)q->ver, (int)q->ver,
++					  qrcodegen_Mask_AUTO, 0))
++			return 0;
++		size = qrcodegen_getSize(qr_img[t]);
++	}
++	unsigned aw = w - 2 * QRLOG_MARGIN, ah = (h - 2 * QRLOG_MARGIN) / nt;
++	unsigned scale = (aw < ah ? aw : ah) / (size + 8);
++	if (!scale)
++		return 0;
++	unsigned side = (size + 8) * scale, spx = stride / 4;
++	unsigned x0 = (w - side) / 2, y0 = (h - side * nt) / 2;
++	static uint32_t line[2560];
++	if (w > sizeof line / sizeof line[0])
++		return 0;
++	for (unsigned x = 0; x < w; x++)
++		line[x] = 0xffffffffu;
++	for (unsigned y = 0; y < h; y++)
++		for (unsigned x = 0; x < w; x++)
++			fb[y * spx + x] = line[x];
++	for (unsigned t = 0; t < nt; t++) {
++		for (unsigned my = 0; my < size; my++) {
++			for (unsigned x = 0; x < w; x++)
++				line[x] = 0xffffffffu;
++			for (unsigned mx = 0; mx < size; mx++)
++				if (qrcodegen_getModule(qr_img[t], mx, my))
++					for (unsigned k = 0; k < scale; k++)
++						line[x0 + (mx + 4) * scale + k] = 0xff000000u;
++			for (unsigned k = 0; k < scale; k++) {
++				unsigned y = y0 + t * side + (my + 4) * scale + k;
++				for (unsigned x = x0 + 4 * scale; x < x0 + side - 4 * scale; x++)
++					fb[y * spx + x] = line[x];
++			}
++		}
++	}
++	return size;
++}
+--- /dev/null
++++ b/bsd/dev/sweet_qrstream.h
+@@ -0,0 +1,75 @@
++#pragma once
++/* generated by tools/make-qr2-patch.py from qrlog/qrstream.h */
++#include <stdint.h>
++
++/*
++ * QL2: append-only, compressed, loss-tolerant log stream over QR codes.
++ *
++ *   console bytes --reduce--> reduced stream --unit (qrz)--> records --> transport stream (ring)
++ *     --blocks of D bytes--> generations of K blocks --> frames (SRC = a block, REP = XOR of a random subset of a generation)
++ *     --base45--> QR (alphanumeric mode, fixed version) --> up to `tiles` QR codes stacked on the screen.
++ *
++ * Frame text = base45(body); body = hdr + B payload bytes + crc32(le) of everything before:
++ *   hdr: u8 0x20|kind<<3|(klog-2)   kind 0 SRC, 1 REP;  u16le sid;  varint hi (complete blocks);  varint lo (first retained block);
++ *        SRC: varint block;  REP: varint gen, varint seed
++ *   block (B bytes) = u16le (offset of the first record that starts in this block, 0xFFFF none) + D bytes of the transport stream
++ *   record = varint rlen<<1|stored, varint clen, varint reduced offset, varint raw log offset of the first line, u32le crc32(reduced bytes), clen bytes
++ *   a 0x00 byte where a record should start is padding.
++ * The frame schedule needs no feedback: 2 of 3 slots walk the stream once, each generation as its K plain blocks followed by
++ * K*red/100 repair frames; the other slots rotate over the repair symbols of all complete generations (any K+~2 of them
++ * rebuild a generation; the newest one gets every other slot while the log is still growing) and re-send the blocks of the
++ * open generation (a repair frame there covers the blocks it has so far).
++ * Host side: tools/qrl2.py. All state is static in a qs_t: no allocation.
++ */
++#ifndef QS_TX_SIZE
++#define QS_TX_SIZE	(2u << 20)	/* transport ring: ~8-12 MB of reduced log */
++#endif
++#define QS_UNIT_MAX	8192u
++#define QS_LINE_MAX	1024u
++#define QS_RED_MAX	(QS_UNIT_MAX + QS_LINE_MAX + 96u)
++#define QS_HDR_MAX	16u
++#define QS_B_MAX	2048u
++#define QS_MAXBLK	(QS_TX_SIZE / 64u)
++#define QS_TEXT_MAX	4200u
++#define QS_TILES_MAX	4u
++#define QS_VER_MAX	30
++
++typedef struct qs {
++	unsigned ver, ecc, tiles, unit, klog, sid;
++	unsigned B, D, cap_chars;
++	/* reducer */
++	uint64_t raw_next, line_raw0, red0_raw, red_base;
++	unsigned red_len, lstart, ndrop, in_line;
++	uint32_t hs, hf;
++	uint32_t recS[32], recF[32];
++	unsigned nrec;
++	/* transport stream */
++	uint64_t tx_len;
++	/* frame scheduler */
++	uint64_t next_new, bg, hi_seen;
++	uint32_t tick, seed, grow_tick;
++	unsigned repair_pct;	/* repair frames sent right behind each generation, percent of K */
++	unsigned nofec;		/* 1: no repair frames, plain blocks in rotation (A/B switch, boot-arg sweetqr_fec=0) */
++	uint8_t red[QS_RED_MAX];
++	uint16_t bfirst[QS_MAXBLK];
++	uint8_t tx[QS_TX_SIZE];
++} qs_t;
++
++/* Fix the QR geometry; ecc = qrcodegen_Ecc (0 LOW .. 3 HIGH). Returns B (payload bytes per frame, 0 = unusable config). */
++unsigned qs_init(qs_t *q, unsigned ver, unsigned ecc, unsigned tiles, unsigned unit, unsigned klog, unsigned sid);
++/* Console bytes [raw_off, raw_off+n): reduced, appended, compressed into the stream as units fill. */
++void qs_feed(qs_t *q, uint64_t raw_off, const char *p, unsigned n);
++/* Compress what is pending and pad the open block, so everything fed so far is deliverable. 1 = something changed. */
++int qs_flush(qs_t *q);
++int qs_pending(const qs_t *q);
++/* Next frame text (NUL-terminated, <= QS_TEXT_MAX). Returns its length, 0 when no block is complete yet. */
++unsigned qs_next_frame(qs_t *q, char *text);
++uint64_t qs_hi(const qs_t *q);		/* complete blocks */
++uint64_t qs_lo(const qs_t *q);		/* first retained block */
++uint64_t qs_reduced(const qs_t *q);	/* reduced-stream bytes consumed into units so far */
++uint64_t qs_stream_len(const qs_t *q);	/* transport-stream bytes produced so far */
++/* Paint tile frames black on white on a 32-bit framebuffer (stride in bytes), stacked and centred. Returns the QR size in modules, 0 on failure. */
++unsigned qs_draw(const qs_t *q, volatile uint32_t *fb, unsigned w, unsigned h, unsigned stride, const char *const *texts, unsigned ntiles);
++unsigned qs_sizeof(void);
++void qs_set_fec(qs_t *q, unsigned on);	/* 0: plain blocks only (no repair frames) */
++void qs_set_red(qs_t *q, unsigned percent);	/* repair frames per generation sent inline with the first pass (default 0) */
+--- /dev/null
++++ b/bsd/dev/sweet_qrz.c
+@@ -0,0 +1,179 @@
++/* sweet_qrz.c: generated by tools/make-qr2-patch.py from qrlog/qrz.c */
++#pragma clang diagnostic ignored "-Weverything"
++#pragma clang optimize off	/* the kernel clang emits SHA3 vector ops (eor3) that gs101 lacks: no vectorising */
++#include "sweet_qrz.h"
++#include "sweet_qrz_tables.h"
++
++#define WIN_MAX		(QRZ_DICT_LEN + QRZ_IN_MAX)
++#define HASH_BITS	12
++#define MAX_CHAIN	24
++#define NICE_LEN	96
++
++static const uint16_t len_base[29] = { 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258 };
++static const uint8_t len_extra[29] = { 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0 };
++static const uint16_t dist_base[30] = { 1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577 };
++static const uint8_t dist_extra[30] = { 0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13 };
++
++/* canonical codes (RFC 1951), stored bit-reversed: deflate packs Huffman codes MSB first into an LSB-first stream */
++static uint16_t lit_code[286], dist_code[30];
++static int tables_ready;
++
++static void make_codes(const uint8_t *lens, unsigned n, uint16_t *code)
++{
++	unsigned count[16] = { 0 }, next[16];
++	unsigned c = 0;
++	for (unsigned i = 0; i < n; i++)
++		count[lens[i]]++;
++	count[0] = 0;
++	for (unsigned b = 1; b < 16; b++) {
++		c = (c + count[b - 1]) << 1;
++		next[b] = c;
++	}
++	for (unsigned i = 0; i < n; i++) {
++		unsigned l = lens[i], v = lens[i] ? next[l]++ : 0, r = 0;
++		for (unsigned k = 0; k < l; k++, v >>= 1)
++			r = r << 1 | (v & 1);
++		code[i] = r;
++	}
++}
++
++struct bw {
++	uint8_t *o, *end;
++	uint32_t acc;
++	unsigned nb;
++	int over;
++};
++
++static void put(struct bw *w, uint32_t v, unsigned n)
++{
++	w->acc |= v << w->nb;
++	w->nb += n;
++	while (w->nb >= 8) {
++		if (w->o < w->end)
++			*w->o++ = w->acc & 255;
++		else
++			w->over = 1;
++		w->acc >>= 8;
++		w->nb -= 8;
++	}
++}
++
++#ifdef QRZ_STATS
++uint32_t qrz_hist_lit[286], qrz_hist_dist[30];
++#define STAT(a, i) (a[i]++)
++#else
++#define STAT(a, i) ((void)0)
++#endif
++
++static void emit_lit(struct bw *w, unsigned c)
++{
++	STAT(qrz_hist_lit, c);
++	put(w, lit_code[c], qrz_litlen_len[c]);
++}
++
++static void emit_match(struct bw *w, unsigned len, unsigned dist)
++{
++	unsigned s = 28, d = 29;
++	while (len_base[s] > len)
++		s--;
++	while (dist_base[d] > dist)
++		d--;
++	STAT(qrz_hist_lit, 257 + s);
++	STAT(qrz_hist_dist, d);
++	put(w, lit_code[257 + s], qrz_litlen_len[257 + s]);
++	put(w, len - len_base[s], len_extra[s]);
++	put(w, dist_code[d], qrz_dist_len[d]);
++	put(w, dist - dist_base[d], dist_extra[d]);
++}
++
++static uint8_t win[WIN_MAX];
++static uint16_t head[1u << HASH_BITS], prv[WIN_MAX];	/* position + 1, 0 = none */
++
++static unsigned hash3(const uint8_t *p)
++{
++	return ((p[0] << 8 ^ p[1] << 4 ^ p[2]) * 2654435761u) >> (32 - HASH_BITS);
++}
++
++static void insert(unsigned p, unsigned end)
++{
++	if (p + 3 > end)
++		return;
++	unsigned h = hash3(win + p);
++	prv[p] = head[h];
++	head[h] = p + 1;
++}
++
++/* longest match at p (window end = end); returns the length (0 = none) and sets *dist */
++static unsigned find(unsigned p, unsigned end, unsigned *dist)
++{
++	if (p + 3 > end)
++		return 0;
++	unsigned best = 0, maxl = end - p < 258 ? end - p : 258;
++	unsigned c = head[hash3(win + p)];
++	for (unsigned chain = 0; c && chain < MAX_CHAIN; chain++, c = prv[c - 1]) {
++		unsigned q = c - 1;
++		if (p - q > 32768)
++			break;
++		unsigned l = 0;
++		while (l < maxl && win[q + l] == win[p + l])
++			l++;
++		if (l > best && !(l == 3 && p - q > 4096)) {
++			best = l;
++			*dist = p - q;
++			if (l >= NICE_LEN || l == maxl)
++				break;
++		}
++	}
++	return best >= 3 ? best : 0;
++}
++
++unsigned qrz_deflate(const uint8_t *src, unsigned n, uint8_t *dst, unsigned dmax)
++{
++	if (n > QRZ_IN_MAX)
++		return 0;
++	if (!tables_ready) {
++		make_codes(qrz_litlen_len, 286, lit_code);
++		make_codes(qrz_dist_len, 30, dist_code);
++		tables_ready = 1;
++	}
++	for (unsigned i = 0; i < QRZ_DICT_LEN; i++)
++		win[i] = qrz_dict[i];
++	for (unsigned i = 0; i < n; i++)
++		win[QRZ_DICT_LEN + i] = src[i];
++	for (unsigned i = 0; i < (1u << HASH_BITS); i++)
++		head[i] = 0;
++	unsigned end = QRZ_DICT_LEN + n;
++	for (unsigned i = 0; i < QRZ_DICT_LEN; i++)
++		insert(i, end);
++	struct bw w = { dst, dst + dmax, 0, 0, 0 };
++	unsigned p = QRZ_DICT_LEN;
++	while (p < end) {
++		unsigned d = 0, l = find(p, end, &d);
++		if (l && l < NICE_LEN && p + 1 < end) {	/* lazy: a clearly longer match one byte later wins */
++			unsigned d2 = 0;
++			insert(p, end);
++			if (find(p + 1, end, &d2) > l + 1) {
++				emit_lit(&w, win[p]);
++				p++;
++				continue;
++			}
++			emit_match(&w, l, d);
++			for (unsigned k = 1; k < l; k++)
++				insert(p + k, end);
++			p += l;
++		} else if (l) {
++			emit_match(&w, l, d);
++			for (unsigned k = 0; k < l; k++)
++				insert(p + k, end);
++			p += l;
++		} else {
++			insert(p, end);
++			emit_lit(&w, win[p]);
++			p++;
++		}
++	}
++	put(&w, lit_code[256], qrz_litlen_len[256]);
++	if (w.nb)
++		put(&w, 0, 8 - w.nb);
++	return w.over ? 0 : (unsigned)(w.o - dst);
++}
+--- /dev/null
++++ b/bsd/dev/sweet_qrz.h
+@@ -0,0 +1,17 @@
++#pragma once
++/* generated by tools/make-qr2-patch.py from qrlog/qrz.h */
++#include <stdint.h>
++
++/*
++ * qrz: tiny freestanding raw-DEFLATE compressor for the QL2 log channel.
++ * LZ77 (hash chains, one-step lazy) over [preset dictionary + data] and a
++ * fixed Huffman table (qrz_tables.h, trained by tools/qrz-train.py). The
++ * block header is NOT sent: the host (tools/qrl2.py) prepends the same
++ * dynamic-block header (built from the same table) and inflates with python's
++ * zlib using the same dictionary. Output = the block body bits + end-of-block,
++ * padded to a byte.
++ */
++#define QRZ_IN_MAX	12288u
++
++/* Compress n (<= QRZ_IN_MAX) bytes. Returns the output size, or 0 when it does not fit in dmax. */
++unsigned qrz_deflate(const uint8_t *src, unsigned n, uint8_t *dst, unsigned dmax);
+--- /dev/null
++++ b/bsd/dev/sweet_qrz_tables.h
+@@ -0,0 +1,403 @@
++/* generated by tools/make-qr2-patch.py from qrlog/qrz_tables.h */
++/* GENERATED by tools/qrz-train.py - do not edit. */
++#define QRZ_DICT_LEN 12286u
++static const uint8_t qrz_dict[12286] = {
++	101, 120, 101, 99, 32, 112, 101, 111, 112, 108, 101, 100, 10, 101, 120, 101, 99, 32, 67, 111, 108, 108, 101, 99, 116, 105, 111, 110, 115, 80, 111, 115,
++	116, 101, 114, 10, 101, 120, 101, 99, 32, 67, 97, 116, 101, 103, 111, 114, 105, 101, 115, 83, 101, 114, 118, 105, 99, 101, 10, 83, 87, 69, 69, 84,
++	32, 84, 79, 85, 67, 72, 58, 32, 99, 109, 117, 58, 32, 99, 108, 111, 99, 107, 32, 115, 101, 113, 117, 101, 110, 99, 101, 32, 100, 111, 110, 101,
++	10, 124, 83, 112, 114, 105, 110, 103, 66, 111, 97, 114, 100, 124, 32, 111, 98, 106, 99, 91, 10, 101, 120, 101, 99, 32, 102, 105, 110, 97, 110, 99,
++	101, 100, 10, 101, 120, 101, 99, 32, 97, 120, 97, 115, 115, 101, 116, 115, 100, 10, 83, 77, 80, 32, 83, 112, 114, 105, 110, 103, 66, 111, 97, 114,
++	100, 32, 116, 49, 52, 32, 112, 99, 32, 48, 120, 48, 32, 108, 114, 32, 48, 120, 48, 32, 115, 112, 32, 48, 120, 48, 32, 98, 116, 10, 67, 82,
++	65, 83, 72, 32, 77, 117, 115, 105, 99, 87, 105, 100, 103, 101, 116, 115, 32, 98, 116, 32, 10, 101, 120, 101, 99, 32, 110, 97, 110, 111, 112, 114,
++	101, 102, 115, 121, 110, 99, 100, 10, 83, 87, 69, 69, 84, 32, 83, 85, 82, 70, 58, 32, 83, 112, 114, 105, 110, 103, 66, 111, 97, 114, 100, 32,
++	115, 101, 108, 32, 51, 53, 10, 83, 87, 69, 69, 84, 32, 83, 85, 82, 70, 58, 32, 83, 112, 114, 105, 110, 103, 66, 111, 97, 114, 100, 32, 116,
++	114, 97, 112, 32, 48, 10, 67, 82, 65, 83, 72, 32, 77, 117, 115, 105, 99, 87, 105, 100, 103, 101, 116, 115, 91, 10, 83, 77, 80, 32, 45, 45,
++	45, 32, 115, 97, 109, 112, 108, 101, 32, 50, 10, 101, 120, 101, 99, 32, 97, 115, 115, 101, 116, 115, 100, 10, 83, 87, 69, 69, 84, 32, 65, 75,
++	83, 58, 32, 119, 99, 100, 32, 115, 101, 108, 32, 48, 32, 97, 114, 103, 48, 32, 48, 32, 105, 110, 32, 48, 47, 48, 32, 111, 117, 116, 32, 48,
++	47, 48, 32, 45, 62, 32, 48, 120, 48, 10, 101, 120, 101, 99, 32, 115, 111, 102, 116, 119, 97, 114, 101, 117, 112, 100, 97, 116, 101, 100, 10, 83,
++	87, 69, 69, 84, 32, 70, 66, 58, 32, 98, 97, 99, 107, 98, 111, 97, 114, 100, 100, 32, 115, 101, 108, 32, 55, 57, 32, 105, 110, 32, 50, 47,
++	48, 32, 111, 117, 116, 32, 48, 47, 52, 48, 32, 45, 62, 32, 48, 120, 48, 10, 101, 120, 101, 99, 32, 114, 116, 99, 114, 101, 112, 111, 114, 116,
++	105, 110, 103, 100, 10, 101, 120, 101, 99, 32, 109, 109, 97, 105, 110, 116, 101, 110, 97, 110, 99, 101, 100, 10, 67, 82, 65, 83, 72, 32, 77, 117,
++	115, 105, 99, 87, 105, 100, 103, 101, 116, 115, 32, 112, 99, 32, 10, 83, 77, 80, 32, 45, 45, 45, 32, 115, 97, 109, 112, 108, 101, 32, 49, 10,
++	83, 77, 80, 32, 45, 45, 45, 32, 115, 97, 109, 112, 108, 101, 32, 48, 10, 83, 87, 69, 69, 84, 32, 65, 75, 83, 58, 32, 115, 108, 101, 101,
++	112, 100, 32, 115, 101, 108, 32, 49, 55, 32, 97, 114, 103, 48, 32, 48, 32, 105, 110, 32, 49, 47, 48, 32, 111, 117, 116, 32, 48, 47, 52, 48,
++	57, 54, 32, 45, 62, 32, 48, 120, 48, 10, 83, 87, 69, 69, 84, 32, 65, 75, 83, 58, 32, 98, 105, 111, 109, 101, 100, 32, 115, 101, 108, 32,
++	49, 55, 32, 97, 114, 103, 48, 32, 48, 32, 105, 110, 32, 49, 47, 48, 32, 111, 117, 116, 32, 48, 47, 52, 48, 57, 54, 32, 45, 62, 32, 48,
++	120, 48, 10, 67, 82, 65, 83, 72, 32, 97, 115, 115, 101, 116, 115, 100, 91, 10, 101, 120, 101, 99, 32, 109, 101, 100, 105, 97, 97, 110, 97, 108,
++	121, 115, 105, 115, 100, 10, 83, 87, 69, 69, 84, 32, 65, 75, 83, 58, 32, 112, 101, 111, 112, 108, 101, 100, 32, 115, 101, 108, 32, 49, 55, 32,
++	97, 114, 103, 48, 32, 48, 32, 105, 110, 32, 49, 47, 48, 32, 111, 117, 116, 32, 48, 47, 52, 48, 57, 54, 32, 45, 62, 32, 48, 120, 48, 10,
++	83, 87, 69, 69, 84, 32, 65, 75, 83, 58, 32, 115, 105, 114, 105, 97, 99, 116, 105, 111, 110, 115, 100, 32, 115, 101, 108, 32, 48, 32, 97, 114,
++	103, 48, 32, 48, 32, 105, 110, 32, 48, 47, 48, 32, 111, 117, 116, 32, 48, 47, 48, 32, 45, 62, 32, 48, 120, 48, 10, 83, 87, 69, 69, 84,
++	32, 65, 75, 83, 58, 32, 109, 111, 98, 105, 108, 101, 116, 105, 109, 101, 114, 100, 32, 115, 101, 108, 32, 48, 32, 97, 114, 103, 48, 32, 48, 32,
++	105, 110, 32, 48, 47, 48, 32, 111, 117, 116, 32, 48, 47, 48, 32, 45, 62, 32, 48, 120, 48, 10, 101, 120, 101, 99, 32, 110, 100, 111, 97, 103,
++	101, 110, 116, 10, 101, 120, 101, 99, 32, 67, 77, 70, 83, 121, 110, 99, 65, 103, 101, 110, 116, 10, 83, 87, 69, 69, 84, 32, 65, 75, 83, 58,
++	32, 112, 114, 111, 109, 111, 116, 101, 100, 99, 111, 110, 116, 101, 110, 116, 100, 32, 115, 101, 108, 32, 55, 32, 97, 114, 103, 48, 32, 48, 32, 105,
++	110, 32, 49, 47, 48, 32, 111, 117, 116, 32, 49, 47, 48, 32, 45, 62, 32, 48, 120, 48, 10, 101, 120, 101, 99, 32, 77, 97, 110, 97, 103, 101,
++	100, 83, 101, 116, 116, 105, 110, 103, 115, 65, 103, 101, 110, 116, 10, 83, 77, 80, 32, 98, 97, 99, 107, 98, 111, 97, 114, 100, 100, 32, 116, 49,
++	52, 32, 112, 99, 32, 48, 120, 48, 32, 108, 114, 32, 48, 120, 48, 32, 115, 112, 32, 48, 120, 48, 32, 98, 116, 10, 101, 120, 101, 99, 32, 102,
++	105, 116, 110, 101, 115, 115, 99, 111, 97, 99, 104, 105, 110, 103, 100, 10, 101, 120, 101, 99, 32, 119, 101, 98, 98, 111, 111, 107, 109, 97, 114, 107,
++	115, 100, 10, 73, 79, 75, 32, 83, 112, 114, 105, 110, 103, 66, 111, 97, 114, 100, 58, 32, 112, 97, 116, 104, 32, 73, 79, 68, 101, 118, 105, 99,
++	101, 84, 114, 101, 101, 58, 47, 98, 117, 116, 116, 111, 110, 115, 32, 45, 62, 32, 73, 79, 80, 108, 97, 116, 102, 111, 114, 109, 68, 101, 118, 105,
++	99, 101, 10, 73, 79, 75, 32, 83, 112, 114, 105, 110, 103, 66, 111, 97, 114, 100, 58, 32, 112, 97, 116, 104, 32, 73, 79, 68, 101, 118, 105, 99,
++	101, 84, 114, 101, 101, 58, 47, 112, 114, 111, 100, 117, 99, 116, 32, 45, 62, 32, 73, 79, 80, 108, 97, 116, 102, 111, 114, 109, 68, 101, 118, 105,
++	99, 101, 10, 101, 120, 101, 99, 32, 65, 101, 103, 105, 114, 80, 111, 115, 116, 101, 114, 10, 83, 77, 80, 32, 83, 112, 114, 105, 110, 103, 66, 111,
++	97, 114, 100, 32, 116, 49, 50, 32, 112, 99, 32, 48, 120, 48, 32, 108, 114, 32, 48, 120, 48, 32, 115, 112, 32, 48, 120, 48, 32, 98, 116, 10,
++	83, 77, 80, 32, 83, 112, 114, 105, 110, 103, 66, 111, 97, 114, 100, 32, 116, 49, 49, 32, 112, 99, 32, 48, 120, 48, 32, 108, 114, 32, 48, 120,
++	48, 32, 115, 112, 32, 48, 120, 48, 32, 98, 116, 10, 124, 83, 112, 114, 105, 110, 103, 66, 111, 97, 114, 100, 124, 32, 65, 67, 77, 58, 32, 76,
++	105, 98, 67, 97, 108, 108, 95, 65, 67, 77, 67, 111, 110, 116, 101, 120, 116, 67, 114, 101, 97, 116, 101, 58, 32, 114, 101, 116, 117, 114, 110, 105,
++	110, 103, 44, 32, 101, 114, 114, 32, 61, 32, 45, 53, 46, 10, 101, 120, 101, 99, 32, 65, 99, 99, 101, 115, 115, 105, 98, 105, 108, 105, 116, 121,
++	85, 73, 83, 101, 114, 118, 101, 114, 10, 101, 120, 101, 99, 32, 79, 84, 65, 67, 114, 97, 115, 104, 67, 111, 112, 105, 101, 114, 10, 83, 77, 80,
++	32, 98, 97, 99, 107, 98, 111, 97, 114, 100, 100, 91, 10, 83, 77, 80, 32, 45, 45, 45, 32, 115, 97, 109, 112, 108, 101, 32, 10, 67, 82, 65,
++	83, 72, 32, 97, 115, 115, 101, 116, 115, 100, 32, 98, 116, 32, 10, 67, 82, 65, 83, 72, 32, 97, 115, 115, 101, 116, 115, 100, 32, 112, 99, 32,
++	10, 70, 97, 105, 108, 101, 100, 32, 116, 111, 32, 115, 101, 110, 100, 32, 101, 120, 99, 101, 112, 116, 105, 111, 110, 32, 69, 88, 67, 95, 67, 79,
++	82, 80, 83, 69, 95, 78, 79, 84, 73, 70, 89, 46, 32, 101, 114, 114, 111, 114, 32, 99, 111, 100, 101, 58, 32, 53, 32, 102, 111, 114, 32, 112,
++	105, 100, 32, 51, 53, 52, 10, 83, 87, 69, 69, 84, 32, 84, 79, 85, 67, 72, 58, 32, 99, 109, 117, 32, 81, 67, 72, 32, 91, 48, 120, 51,
++	48, 50, 99, 93, 58, 32, 48, 120, 51, 102, 48, 48, 48, 50, 32, 45, 62, 32, 119, 114, 111, 116, 101, 32, 48, 120, 51, 102, 48, 48, 48, 51,
++	32, 45, 62, 32, 48, 120, 51, 102, 48, 48, 48, 51, 10, 70, 97, 105, 108, 101, 100, 32, 116, 111, 32, 115, 101, 110, 100, 32, 101, 120, 99, 101,
++	112, 116, 105, 111, 110, 32, 69, 88, 67, 95, 67, 79, 82, 80, 83, 69, 95, 78, 79, 84, 73, 70, 89, 46, 32, 101, 114, 114, 111, 114, 32, 99,
++	111, 100, 101, 58, 32, 53, 32, 102, 111, 114, 32, 112, 105, 100, 32, 50, 55, 48, 10, 101, 120, 101, 99, 32, 112, 114, 105, 118, 97, 99, 121, 97,
++	99, 99, 111, 117, 110, 116, 105, 110, 103, 100, 10, 101, 120, 101, 99, 32, 77, 111, 98, 105, 108, 101, 67, 97, 108, 10, 83, 87, 69, 69, 84, 32,
++	83, 97, 110, 100, 98, 111, 120, 58, 32, 115, 121, 109, 112, 116, 111, 109, 115, 100, 32, 112, 114, 105, 118, 105, 108, 101, 103, 101, 32, 49, 48, 48,
++	48, 51, 32, 100, 101, 110, 105, 101, 100, 10, 67, 82, 65, 83, 72, 32, 65, 101, 103, 105, 114, 80, 111, 115, 116, 101, 114, 91, 10, 101, 120, 101,
++	99, 32, 109, 101, 100, 105, 97, 108, 105, 98, 114, 97, 114, 121, 100, 10, 83, 77, 80, 32, 83, 112, 114, 105, 110, 103, 66, 111, 97, 114, 100, 91,
++	10, 101, 120, 101, 99, 32, 110, 97, 110, 111, 114, 101, 103, 105, 115, 116, 114, 121, 108, 97, 117, 110, 99, 104, 100, 10, 101, 120, 101, 99, 32, 102,
++	97, 109, 105, 108, 121, 110, 111, 116, 105, 102, 105, 99, 97, 116, 105, 111, 110, 100, 10, 83, 87, 69, 69, 84, 32, 65, 75, 83, 58, 32, 98, 105,
++	114, 100, 32, 115, 101, 108, 32, 48, 32, 97, 114, 103, 48, 32, 48, 32, 105, 110, 32, 48, 47, 48, 32, 111, 117, 116, 32, 48, 47, 48, 32, 45,
++	62, 32, 48, 120, 48, 10, 101, 120, 101, 99, 32, 98, 108, 117, 101, 116, 111, 111, 116, 104, 100, 10, 101, 120, 101, 99, 32, 65, 99, 99, 111, 117,
++	110, 116, 83, 117, 98, 115, 99, 114, 105, 98, 101, 114, 10, 101, 120, 101, 99, 32, 114, 101, 109, 111, 116, 101, 109, 97, 110, 97, 103, 101, 109, 101,
++	110, 116, 100, 10, 101, 120, 101, 99, 32, 120, 112, 99, 112, 114, 111, 120, 121, 10, 83, 87, 69, 69, 84, 32, 84, 79, 85, 67, 72, 58, 32, 99,
++	109, 117, 32, 114, 115, 116, 110, 115, 121, 110, 99, 32, 103, 97, 116, 101, 32, 91, 48, 120, 50, 48, 54, 56, 93, 58, 32, 48, 120, 50, 48, 48,
++	48, 48, 48, 32, 45, 62, 32, 119, 114, 111, 116, 101, 32, 48, 120, 51, 48, 48, 48, 48, 48, 32, 45, 62, 32, 48, 120, 51, 48, 48, 48, 48,
++	48, 10, 124, 83, 112, 114, 105, 110, 103, 66, 111, 97, 114, 100, 124, 32, 35, 99, 111, 110, 102, 105, 103, 117, 114, 97, 116, 105, 111, 110, 85, 112,
++	100, 97, 116, 101, 77, 97, 110, 97, 103, 101, 114, 32, 108, 111, 110, 103, 80, 114, 101, 115, 115, 66, 101, 104, 97, 118, 105, 111, 114, 58, 32, 48,
++	32, 112, 114, 101, 118, 105, 111, 117, 115, 86, 97, 108, 117, 101, 58, 32, 48, 10, 101, 120, 101, 99, 32, 85, 115, 97, 103, 101, 84, 114, 97, 99,
++	107, 105, 110, 103, 65, 103, 101, 110, 116, 10, 101, 120, 101, 99, 32, 99, 111, 109, 46, 97, 112, 112, 108, 101, 46, 100, 97, 116, 97, 109, 105, 103,
++	114, 97, 116, 111, 114, 10, 101, 120, 101, 99, 32, 77, 97, 99, 105, 110, 84, 97, 108, 107, 65, 85, 83, 80, 10, 83, 87, 69, 69, 84, 32, 83,
++	97, 110, 100, 98, 111, 120, 58, 32, 100, 97, 115, 100, 32, 112, 114, 105, 118, 105, 108, 101, 103, 101, 32, 49, 48, 48, 50, 32, 100, 101, 110, 105,
++	101, 100, 10, 83, 87, 69, 69, 84, 32, 83, 97, 110, 100, 98, 111, 120, 58, 32, 100, 97, 115, 100, 32, 112, 114, 105, 118, 105, 108, 101, 103, 101,
++	32, 49, 48, 48, 48, 49, 32, 100, 101, 110, 105, 101, 100, 10, 67, 82, 65, 83, 72, 32, 65, 101, 103, 105, 114, 80, 111, 115, 116, 101, 114, 32,
++	98, 116, 32, 10, 67, 82, 65, 83, 72, 32, 65, 101, 103, 105, 114, 80, 111, 115, 116, 101, 114, 32, 112, 99, 32, 10, 83, 77, 80, 32, 83, 112,
++	114, 105, 110, 103, 66, 111, 97, 114, 100, 32, 116, 10, 101, 120, 101, 99, 32, 75, 111, 110, 97, 83, 121, 110, 116, 104, 101, 115, 105, 122, 101, 114,
++	10, 124, 83, 112, 114, 105, 110, 103, 66, 111, 97, 114, 100, 124, 32, 35, 35, 35, 32, 70, 97, 105, 108, 101, 100, 32, 116, 111, 32, 83, 111, 102,
++	116, 32, 76, 105, 110, 107, 101, 100, 58, 32, 47, 83, 121, 115, 116, 101, 109, 47, 76, 105, 98, 114, 97, 114, 121, 47, 70, 114, 97, 109, 101, 119,
++	111, 114, 107, 115, 47, 67, 97, 114, 75, 105, 116, 46, 102, 114, 97, 109, 101, 119, 111, 114, 107, 47, 67, 97, 114, 75, 105, 116, 10, 101, 120, 101,
++	99, 32, 65, 112, 112, 80, 114, 101, 100, 105, 99, 116, 105, 111, 110, 73, 110, 116, 101, 110, 116, 115, 72, 101, 108, 112, 101, 114, 83, 101, 114, 118,
++	105, 99, 10, 83, 87, 69, 69, 84, 32, 84, 79, 85, 67, 72, 58, 32, 99, 109, 117, 95, 116, 111, 112, 32, 48, 120, 49, 101, 48, 56, 48, 48,
++	48, 48, 58, 32, 80, 69, 82, 73, 67, 49, 95, 73, 80, 32, 109, 117, 120, 91, 48, 120, 49, 48, 101, 56, 93, 61, 48, 120, 49, 32, 100, 105,
++	118, 91, 48, 120, 49, 56, 101, 48, 93, 61, 48, 32, 103, 97, 116, 101, 91, 48, 120, 50, 49, 48, 52, 93, 61, 48, 120, 50, 48, 48, 48, 48,
++	48, 10, 83, 87, 69, 69, 84, 32, 84, 79, 85, 67, 72, 58, 32, 112, 105, 110, 32, 99, 115, 40, 69, 41, 32, 98, 97, 110, 107, 32, 48, 120,
++	49, 48, 99, 52, 48, 48, 54, 48, 91, 51, 93, 32, 102, 117, 110, 99, 61, 48, 120, 50, 32, 100, 97, 116, 61, 49, 32, 112, 117, 100, 61, 48,
++	120, 49, 10, 83, 87, 69, 69, 84, 32, 84, 79, 85, 67, 72, 58, 32, 112, 105, 110, 32, 99, 115, 32, 32, 32, 32, 98, 97, 110, 107, 32, 48,
++	120, 49, 48, 99, 52, 48, 48, 54, 48, 91, 51, 93, 32, 102, 117, 110, 99, 61, 48, 120, 49, 32, 100, 97, 116, 61, 49, 32, 112, 117, 100, 61,
++	48, 120, 49, 10, 83, 87, 69, 69, 84, 32, 84, 79, 85, 67, 72, 58, 32, 112, 105, 110, 32, 109, 105, 115, 111, 32, 32, 98, 97, 110, 107, 32,
++	48, 120, 49, 48, 99, 52, 48, 48, 54, 48, 91, 50, 93, 32, 102, 117, 110, 99, 61, 48, 120, 50, 32, 100, 97, 116, 61, 48, 32, 112, 117, 100,
++	61, 48, 120, 49, 10, 83, 87, 69, 69, 84, 32, 84, 79, 85, 67, 72, 58, 32, 112, 105, 110, 32, 109, 111, 115, 105, 32, 32, 98, 97, 110, 107,
++	32, 48, 120, 49, 48, 99, 52, 48, 48, 54, 48, 91, 49, 93, 32, 102, 117, 110, 99, 61, 48, 120, 50, 32, 100, 97, 116, 61, 49, 32, 112, 117,
++	100, 61, 48, 120, 49, 10, 83, 87, 69, 69, 84, 32, 84, 79, 85, 67, 72, 58, 32, 112, 105, 110, 32, 99, 108, 107, 32, 32, 32, 98, 97, 110,
++	107, 32, 48, 120, 49, 48, 99, 52, 48, 48, 54, 48, 91, 48, 93, 32, 102, 117, 110, 99, 61, 48, 120, 50, 32, 100, 97, 116, 61, 48, 32, 112,
++	117, 100, 61, 48, 120, 49, 10, 124, 83, 112, 114, 105, 110, 103, 66, 111, 97, 114, 100, 124, 32, 60, 67, 65, 84, 114, 97, 110, 115, 102, 111, 114,
++	109, 76, 97, 121, 101, 114, 58, 32, 10, 83, 87, 69, 69, 84, 32, 70, 66, 58, 32, 115, 119, 97, 112, 32, 56, 32, 108, 97, 121, 101, 114, 32,
++	48, 32, 115, 117, 114, 102, 97, 99, 101, 32, 50, 32, 49, 49, 50, 53, 120, 50, 52, 51, 54, 32, 102, 109, 116, 32, 48, 120, 52, 50, 52, 55,
++	53, 50, 52, 49, 32, 98, 112, 114, 32, 52, 54, 48, 56, 32, 97, 32, 48, 44, 48, 32, 49, 49, 50, 53, 120, 50, 52, 51, 54, 32, 98, 32,
++	48, 44, 48, 32, 49, 49, 50, 53, 120, 50, 52, 51, 54, 10, 101, 120, 101, 99, 32, 72, 101, 117, 114, 105, 115, 116, 105, 99, 73, 110, 116, 101,
++	114, 112, 114, 101, 116, 101, 114, 10, 83, 87, 69, 69, 84, 32, 70, 66, 58, 32, 115, 119, 97, 112, 32, 55, 32, 108, 97, 121, 101, 114, 32, 48,
++	32, 115, 117, 114, 102, 97, 99, 101, 32, 50, 32, 49, 49, 50, 53, 120, 50, 52, 51, 54, 32, 102, 109, 116, 32, 48, 120, 52, 50, 52, 55, 53,
++	50, 52, 49, 32, 98, 112, 114, 32, 52, 54, 48, 56, 32, 97, 32, 48, 44, 48, 32, 49, 49, 50, 53, 120, 50, 52, 51, 54, 32, 98, 32, 48,
++	44, 48, 32, 49, 49, 50, 53, 120, 50, 52, 51, 54, 10, 83, 87, 69, 69, 84, 32, 70, 66, 58, 32, 115, 119, 97, 112, 32, 50, 49, 32, 108,
++	97, 121, 101, 114, 32, 48, 32, 115, 117, 114, 102, 97, 99, 101, 32, 50, 32, 49, 49, 50, 53, 120, 50, 52, 51, 54, 32, 102, 109, 116, 32, 48,
++	120, 52, 50, 52, 55, 53, 50, 52, 49, 32, 98, 112, 114, 32, 52, 54, 48, 56, 32, 97, 32, 48, 44, 48, 32, 49, 49, 50, 53, 120, 50, 52,
++	51, 54, 32, 98, 32, 48, 44, 48, 32, 49, 49, 50, 53, 120, 50, 52, 51, 54, 10, 83, 87, 69, 69, 84, 32, 70, 66, 58, 32, 115, 119, 97,
++	112, 32, 49, 57, 32, 108, 97, 121, 101, 114, 32, 48, 32, 115, 117, 114, 102, 97, 99, 101, 32, 51, 32, 49, 49, 50, 53, 120, 50, 52, 51, 54,
++	32, 102, 109, 116, 32, 48, 120, 52, 50, 52, 55, 53, 50, 52, 49, 32, 98, 112, 114, 32, 52, 54, 48, 56, 32, 97, 32, 48, 44, 48, 32, 49,
++	49, 50, 53, 120, 50, 52, 51, 54, 32, 98, 32, 48, 44, 48, 32, 49, 49, 50, 53, 120, 50, 52, 51, 54, 10, 83, 87, 69, 69, 84, 32, 70,
++	66, 58, 32, 115, 119, 97, 112, 32, 49, 55, 32, 108, 97, 121, 101, 114, 32, 48, 32, 115, 117, 114, 102, 97, 99, 101, 32, 51, 32, 49, 49, 50,
++	53, 120, 50, 52, 51, 54, 32, 102, 109, 116, 32, 48, 120, 52, 50, 52, 55, 53, 50, 52, 49, 32, 98, 112, 114, 32, 52, 54, 48, 56, 32, 97,
++	32, 48, 44, 48, 32, 49, 49, 50, 53, 120, 50, 52, 51, 54, 32, 98, 32, 48, 44, 48, 32, 49, 49, 50, 53, 120, 50, 52, 51, 54, 10, 101,
++	120, 101, 99, 32, 77, 97, 110, 97, 103, 101, 109, 101, 110, 116, 84, 101, 115, 116, 83, 117, 98, 115, 99, 114, 105, 98, 101, 114, 10, 101, 120, 101,
++	99, 32, 76, 101, 103, 97, 99, 121, 80, 114, 111, 102, 105, 108, 101, 115, 83, 117, 98, 115, 99, 114, 105, 98, 101, 114, 10, 83, 87, 69, 69, 84,
++	32, 83, 85, 82, 70, 58, 32, 98, 97, 99, 107, 98, 111, 97, 114, 100, 100, 32, 116, 114, 97, 112, 32, 52, 10, 83, 87, 69, 69, 84, 32, 84,
++	79, 85, 67, 72, 58, 32, 100, 105, 97, 103, 32, 97, 102, 116, 101, 114, 32, 115, 101, 116, 117, 112, 58, 32, 85, 83, 73, 95, 67, 79, 78, 61,
++	48, 32, 85, 83, 73, 95, 79, 80, 84, 73, 79, 78, 61, 48, 120, 49, 32, 85, 83, 73, 32, 109, 111, 100, 101, 61, 48, 120, 50, 10, 83, 77,
++	80, 32, 98, 97, 99, 107, 98, 111, 97, 114, 100, 100, 32, 116, 49, 51, 32, 112, 99, 32, 48, 120, 48, 32, 108, 114, 32, 48, 120, 48, 32, 115,
++	112, 32, 48, 120, 48, 32, 98, 116, 10, 83, 87, 69, 69, 84, 32, 83, 85, 82, 70, 58, 32, 83, 112, 114, 105, 110, 103, 66, 111, 97, 114, 100,
++	32, 116, 114, 97, 112, 32, 49, 10, 101, 120, 101, 99, 32, 80, 97, 115, 115, 99, 111, 100, 101, 83, 101, 116, 116, 105, 110, 103, 115, 83, 117, 98,
++	115, 99, 114, 105, 98, 101, 114, 10, 83, 87, 69, 69, 84, 32, 83, 85, 82, 70, 58, 32, 109, 101, 100, 105, 97, 115, 101, 114, 118, 101, 114, 100,
++	32, 99, 114, 101, 97, 116, 101, 32, 105, 100, 32, 52, 57, 32, 49, 57, 50, 120, 49, 52, 52, 32, 102, 109, 116, 32, 48, 120, 52, 99, 51, 48,
++	51, 48, 51, 56, 32, 98, 112, 101, 32, 49, 32, 98, 112, 114, 32, 51, 56, 52, 32, 112, 108, 97, 110, 101, 115, 32, 48, 32, 115, 105, 122, 101,
++	32, 49, 49, 52, 54, 56, 56, 32, 107, 101, 121, 115, 32, 49, 55, 32, 45, 62, 32, 48, 120, 48, 10, 83, 87, 69, 69, 84, 32, 83, 85, 82,
++	70, 58, 32, 87, 101, 97, 116, 104, 101, 114, 80, 111, 115, 116, 101, 114, 32, 99, 114, 101, 97, 116, 101, 32, 105, 100, 32, 50, 52, 32, 55, 54,
++	56, 120, 49, 57, 50, 32, 102, 109, 116, 32, 48, 120, 51, 52, 51, 50, 51, 48, 54, 54, 32, 98, 112, 101, 32, 52, 32, 98, 112, 114, 32, 51,
++	48, 55, 50, 32, 112, 108, 97, 110, 101, 115, 32, 50, 32, 115, 105, 122, 101, 32, 53, 56, 57, 56, 50, 52, 32, 107, 101, 121, 115, 32, 57, 32,
++	45, 62, 32, 48, 120, 48, 10, 83, 87, 69, 69, 84, 32, 83, 85, 82, 70, 58, 32, 87, 101, 97, 116, 104, 101, 114, 80, 111, 115, 116, 101, 114,
++	32, 99, 114, 101, 97, 116, 101, 32, 105, 100, 32, 50, 53, 32, 55, 54, 56, 120, 49, 57, 50, 32, 102, 109, 116, 32, 48, 120, 51, 52, 51, 50,
++	51, 48, 54, 54, 32, 98, 112, 101, 32, 52, 32, 98, 112, 114, 32, 51, 48, 55, 50, 32, 112, 108, 97, 110, 101, 115, 32, 50, 32, 115, 105, 122,
++	101, 32, 53, 56, 57, 56, 50, 52, 32, 107, 101, 121, 115, 32, 57, 32, 45, 62, 32, 48, 120, 48, 10, 83, 87, 69, 69, 84, 32, 83, 85, 82,
++	70, 58, 32, 87, 101, 97, 116, 104, 101, 114, 80, 111, 115, 116, 101, 114, 32, 99, 114, 101, 97, 116, 101, 32, 105, 100, 32, 50, 51, 32, 55, 54,
++	56, 120, 49, 57, 50, 32, 102, 109, 116, 32, 48, 120, 51, 52, 51, 50, 51, 48, 54, 54, 32, 98, 112, 101, 32, 52, 32, 98, 112, 114, 32, 51,
++	48, 55, 50, 32, 112, 108, 97, 110, 101, 115, 32, 50, 32, 115, 105, 122, 101, 32, 53, 56, 57, 56, 50, 52, 32, 107, 101, 121, 115, 32, 57, 32,
++	45, 62, 32, 48, 120, 48, 10, 101, 120, 101, 99, 32, 99, 111, 109, 46, 97, 112, 112, 108, 101, 46, 77, 111, 98, 105, 108, 101, 83, 111, 102, 116,
++	119, 97, 114, 101, 85, 112, 100, 97, 116, 101, 46, 67, 10, 83, 87, 69, 69, 84, 32, 83, 85, 82, 70, 58, 32, 87, 101, 97, 116, 104, 101, 114,
++	80, 111, 115, 116, 101, 114, 32, 115, 101, 108, 32, 50, 49, 10, 101, 120, 101, 99, 32, 83, 105, 114, 105, 84, 84, 83, 83, 121, 110, 116, 104, 101,
++	115, 105, 122, 101, 114, 65, 85, 10, 83, 87, 69, 69, 84, 32, 84, 79, 85, 67, 72, 58, 32, 105, 100, 101, 110, 116, 105, 102, 121, 32, 116, 105,
++	109, 101, 111, 117, 116, 58, 32, 83, 80, 73, 32, 115, 116, 97, 116, 117, 115, 61, 48, 120, 49, 52, 48, 32, 99, 104, 61, 48, 32, 99, 108, 107,
++	61, 48, 10, 83, 87, 69, 69, 84, 32, 83, 85, 82, 70, 58, 32, 83, 112, 114, 105, 110, 103, 66, 111, 97, 114, 100, 32, 116, 114, 97, 112, 32,
++	10, 101, 120, 101, 99, 32, 100, 105, 97, 103, 110, 111, 115, 116, 105, 99, 101, 120, 116, 101, 110, 115, 105, 111, 110, 115, 100, 10, 67, 82, 65, 83,
++	72, 32, 77, 117, 115, 105, 99, 87, 105, 100, 103, 101, 116, 115, 32, 114, 101, 97, 115, 111, 110, 32, 110, 115, 32, 50, 32, 99, 111, 100, 101, 32,
++	48, 120, 98, 58, 32, 40, 110, 111, 110, 101, 41, 10, 101, 120, 101, 99, 32, 83, 97, 102, 97, 114, 105, 76, 105, 110, 107, 69, 120, 116, 101, 110,
++	115, 105, 111, 110, 10, 101, 120, 101, 99, 32, 101, 120, 116, 101, 110, 115, 105, 111, 110, 107, 105, 116, 115, 101, 114, 118, 105, 99, 101, 10, 83, 87,
++	69, 69, 84, 32, 84, 79, 85, 67, 72, 58, 32, 100, 105, 97, 103, 32, 97, 102, 116, 101, 114, 32, 115, 101, 116, 117, 112, 58, 32, 99, 104, 61,
++	48, 32, 99, 108, 107, 61, 48, 32, 109, 111, 100, 101, 61, 48, 120, 49, 102, 102, 56, 48, 48, 48, 48, 32, 99, 115, 61, 48, 120, 49, 32, 105,
++	110, 116, 101, 110, 61, 48, 32, 115, 116, 97, 116, 117, 115, 61, 48, 10, 83, 87, 69, 69, 84, 32, 84, 79, 85, 67, 72, 58, 32, 100, 105, 97,
++	103, 32, 97, 102, 116, 101, 114, 32, 115, 101, 116, 117, 112, 58, 32, 112, 107, 116, 99, 110, 116, 61, 48, 32, 112, 101, 110, 100, 61, 48, 32, 115,
++	119, 97, 112, 61, 48, 32, 102, 98, 61, 48, 120, 49, 32, 40, 84, 88, 47, 82, 88, 32, 100, 97, 116, 97, 32, 110, 111, 116, 32, 114, 101, 97,
++	100, 41, 10, 73, 79, 75, 32, 83, 112, 114, 105, 110, 103, 66, 111, 97, 114, 100, 58, 32, 112, 97, 116, 104, 32, 73, 79, 68, 101, 118, 105, 99,
++	101, 84, 114, 101, 101, 58, 47, 32, 45, 62, 32, 73, 79, 80, 108, 97, 116, 102, 111, 114, 109, 69, 120, 112, 101, 114, 116, 68, 101, 118, 105, 99,
++	101, 10, 83, 87, 69, 69, 84, 32, 65, 75, 83, 58, 32, 103, 97, 109, 101, 100, 32, 115, 101, 108, 32, 48, 32, 97, 114, 103, 48, 32, 48, 32,
++	105, 110, 32, 48, 47, 48, 32, 111, 117, 116, 32, 48, 47, 48, 32, 45, 62, 32, 48, 120, 48, 10, 83, 87, 69, 69, 84, 32, 84, 79, 85, 67,
++	72, 58, 32, 115, 119, 101, 101, 116, 116, 111, 117, 99, 104, 109, 117, 120, 61, 49, 58, 32, 109, 117, 120, 32, 100, 114, 105, 118, 101, 110, 32, 108,
++	111, 119, 44, 32, 110, 111, 119, 32, 102, 117, 110, 99, 61, 48, 120, 49, 32, 100, 97, 116, 61, 48, 10, 101, 120, 101, 99, 32, 73, 110, 116, 101,
++	114, 97, 99, 116, 105, 118, 101, 76, 101, 103, 97, 99, 121, 80, 114, 111, 102, 105, 108, 101, 115, 83, 117, 98, 115, 99, 114, 105, 10, 83, 87, 69,
++	69, 84, 32, 84, 79, 85, 67, 72, 58, 32, 86, 65, 82, 73, 65, 78, 84, 32, 69, 58, 32, 116, 105, 109, 101, 111, 117, 116, 44, 32, 115, 116,
++	97, 116, 117, 115, 61, 48, 120, 49, 48, 48, 32, 99, 104, 61, 48, 32, 40, 97, 116, 32, 116, 105, 109, 101, 111, 117, 116, 58, 32, 115, 116, 97,
++	116, 117, 115, 61, 48, 120, 49, 48, 48, 32, 99, 104, 61, 48, 120, 51, 41, 32, 99, 108, 107, 61, 48, 10, 83, 87, 69, 69, 84, 32, 84, 79,
++	85, 67, 72, 58, 32, 86, 65, 82, 73, 65, 78, 84, 32, 68, 58, 32, 116, 105, 109, 101, 111, 117, 116, 44, 32, 115, 116, 97, 116, 117, 115, 61,
++	48, 120, 49, 52, 48, 32, 99, 104, 61, 48, 32, 40, 97, 116, 32, 116, 105, 109, 101, 111, 117, 116, 58, 32, 115, 116, 97, 116, 117, 115, 61, 48,
++	120, 49, 52, 48, 32, 99, 104, 61, 48, 120, 51, 41, 32, 99, 108, 107, 61, 48, 10, 83, 87, 69, 69, 84, 32, 84, 79, 85, 67, 72, 58, 32,
++	86, 65, 82, 73, 65, 78, 84, 32, 67, 58, 32, 116, 105, 109, 101, 111, 117, 116, 44, 32, 115, 116, 97, 116, 117, 115, 61, 48, 120, 49, 52, 48,
++	32, 99, 104, 61, 48, 32, 40, 97, 116, 32, 116, 105, 109, 101, 111, 117, 116, 58, 32, 115, 116, 97, 116, 117, 115, 61, 48, 120, 49, 52, 48, 32,
++	99, 104, 61, 48, 120, 51, 41, 32, 99, 108, 107, 61, 48, 10, 83, 87, 69, 69, 84, 32, 84, 79, 85, 67, 72, 58, 32, 86, 65, 82, 73, 65,
++	78, 84, 32, 66, 58, 32, 116, 105, 109, 101, 111, 117, 116, 44, 32, 115, 116, 97, 116, 117, 115, 61, 48, 120, 49, 52, 48, 32, 99, 104, 61, 48,
++	32, 40, 97, 116, 32, 116, 105, 109, 101, 111, 117, 116, 58, 32, 115, 116, 97, 116, 117, 115, 61, 48, 120, 49, 52, 48, 32, 99, 104, 61, 48, 120,
++	51, 41, 32, 99, 108, 107, 61, 48, 10, 83, 87, 69, 69, 84, 32, 84, 79, 85, 67, 72, 58, 32, 86, 65, 82, 73, 65, 78, 84, 32, 65, 58,
++	32, 116, 105, 109, 101, 111, 117, 116, 44, 32, 115, 116, 97, 116, 117, 115, 61, 48, 120, 49, 52, 48, 32, 99, 104, 61, 48, 32, 40, 97, 116, 32,
++	116, 105, 109, 101, 111, 117, 116, 58, 32, 115, 116, 97, 116, 117, 115, 61, 48, 120, 49, 52, 48, 32, 99, 104, 61, 48, 120, 51, 41, 32, 99, 108,
++	107, 61, 48, 10, 101, 120, 101, 99, 32, 77, 97, 105, 108, 83, 104, 111, 114, 116, 99, 117, 116, 115, 69, 120, 116, 101, 110, 115, 105, 111, 110, 10,
++	83, 87, 69, 69, 84, 32, 65, 75, 83, 58, 32, 115, 101, 99, 117, 114, 105, 116, 121, 100, 32, 115, 101, 108, 32, 55, 32, 97, 114, 103, 48, 32,
++	48, 32, 105, 110, 32, 49, 47, 48, 32, 111, 117, 116, 32, 49, 47, 48, 32, 45, 62, 32, 48, 120, 48, 10, 101, 120, 101, 99, 32, 77, 101, 115,
++	115, 97, 103, 101, 115, 65, 99, 116, 105, 111, 110, 69, 120, 116, 101, 110, 115, 105, 111, 110, 10, 101, 120, 101, 99, 32, 73, 77, 68, 77, 101, 115,
++	115, 97, 103, 101, 83, 101, 114, 118, 105, 99, 101, 115, 65, 103, 101, 110, 116, 10, 83, 87, 69, 69, 84, 32, 84, 79, 85, 67, 72, 58, 32, 85,
++	83, 73, 95, 67, 79, 78, 61, 48, 120, 49, 32, 40, 98, 105, 116, 48, 32, 61, 32, 114, 101, 115, 101, 116, 41, 44, 32, 85, 83, 73, 32, 109,
++	111, 100, 101, 32, 110, 111, 119, 32, 48, 120, 50, 10, 83, 87, 69, 69, 84, 32, 65, 75, 83, 58, 32, 99, 104, 114, 111, 110, 111, 100, 32, 115,
++	101, 108, 32, 49, 55, 32, 97, 114, 103, 48, 32, 48, 32, 105, 110, 32, 49, 47, 48, 32, 111, 117, 116, 32, 48, 47, 52, 48, 57, 54, 32, 45,
++	62, 32, 48, 120, 48, 10, 83, 87, 69, 69, 84, 32, 84, 79, 85, 67, 72, 58, 32, 97, 99, 116, 117, 97, 108, 32, 83, 67, 75, 32, 61, 32,
++	67, 77, 85, 32, 105, 112, 99, 108, 107, 32, 47, 32, 52, 32, 97, 110, 100, 32, 105, 115, 32, 117, 110, 118, 101, 114, 105, 102, 105, 101, 100, 41,
++	10, 83, 87, 69, 69, 84, 32, 75, 69, 89, 83, 58, 32, 115, 116, 97, 114, 116, 32, 107, 101, 121, 61, 50, 32, 112, 97, 61, 48, 120, 49, 55,
++	52, 101, 48, 48, 50, 52, 32, 112, 105, 110, 61, 51, 32, 100, 97, 116, 61, 48, 120, 99, 32, 100, 111, 119, 110, 61, 48, 10, 83, 87, 69, 69,
++	84, 32, 75, 69, 89, 83, 58, 32, 115, 116, 97, 114, 116, 32, 107, 101, 121, 61, 49, 32, 112, 97, 61, 48, 120, 49, 55, 52, 101, 48, 48, 52,
++	52, 32, 112, 105, 110, 61, 49, 32, 100, 97, 116, 61, 48, 120, 55, 32, 100, 111, 119, 110, 61, 48, 10, 83, 87, 69, 69, 84, 32, 75, 69, 89,
++	83, 58, 32, 115, 116, 97, 114, 116, 32, 107, 101, 121, 61, 48, 32, 112, 97, 61, 48, 120, 49, 55, 52, 100, 48, 48, 101, 52, 32, 112, 105, 110,
++	61, 49, 32, 100, 97, 116, 61, 48, 120, 50, 32, 100, 111, 119, 110, 61, 48, 10, 83, 87, 69, 69, 84, 32, 65, 75, 83, 58, 32, 97, 116, 99,
++	32, 115, 101, 108, 32, 48, 32, 97, 114, 103, 48, 32, 48, 32, 105, 110, 32, 48, 47, 48, 32, 111, 117, 116, 32, 48, 47, 48, 32, 45, 62, 32,
++	48, 120, 48, 10, 83, 87, 69, 69, 84, 32, 70, 66, 58, 32, 115, 119, 97, 112, 32, 50, 49, 32, 108, 97, 121, 101, 114, 32, 48, 32, 115, 117,
++	114, 102, 97, 99, 101, 32, 51, 32, 49, 49, 50, 53, 120, 50, 52, 51, 54, 32, 102, 109, 116, 32, 48, 120, 52, 50, 52, 55, 53, 50, 52, 49,
++	32, 98, 112, 114, 32, 52, 54, 48, 56, 32, 97, 32, 48, 44, 48, 32, 49, 49, 50, 53, 120, 50, 52, 51, 54, 32, 98, 32, 48, 44, 48, 32,
++	49, 49, 50, 53, 120, 50, 52, 51, 54, 10, 83, 87, 69, 69, 84, 32, 84, 79, 85, 67, 72, 58, 32, 108, 101, 97, 118, 105, 110, 103, 32, 116,
++	104, 101, 32, 98, 117, 115, 32, 97, 108, 111, 110, 101, 59, 32, 98, 111, 111, 116, 45, 97, 114, 103, 32, 115, 119, 101, 101, 116, 116, 111, 117, 99,
++	104, 109, 117, 120, 61, 49, 32, 100, 114, 105, 118, 101, 115, 32, 116, 104, 101, 32, 109, 117, 120, 32, 108, 111, 119, 10, 73, 79, 75, 32, 83, 112,
++	114, 105, 110, 103, 66, 111, 97, 114, 100, 58, 32, 73, 79, 83, 101, 114, 118, 105, 99, 101, 70, 105, 114, 115, 116, 77, 97, 116, 99, 104, 32, 60,
++	100, 105, 99, 116, 32, 73, 68, 61, 34, 48, 34, 62, 60, 107, 101, 121, 62, 73, 79, 80, 114, 111, 118, 105, 100, 101, 114, 67, 108, 97, 115, 115,
++	60, 47, 107, 101, 121, 62, 60, 115, 116, 114, 105, 110, 103, 32, 73, 68, 61, 34, 49, 34, 62, 73, 79, 72, 73, 68, 68, 101, 118, 105, 99, 101,
++	60, 47, 115, 116, 114, 105, 110, 103, 62, 60, 107, 101, 121, 62, 68, 101, 118, 105, 99, 101, 85, 115, 97, 103, 101, 80, 97, 103, 101, 60, 47, 107,
++	101, 121, 62, 60, 105, 110, 116, 101, 103, 101, 114, 32, 115, 105, 122, 101, 61, 34, 51, 50, 34, 32, 73, 68, 61, 10, 73, 79, 75, 32, 83, 112,
++	114, 105, 110, 103, 66, 111, 97, 114, 100, 58, 32, 109, 97, 116, 99, 104, 105, 110, 103, 49, 32, 60, 100, 105, 99, 116, 32, 73, 68, 61, 34, 48,
++	34, 62, 60, 107, 101, 121, 62, 73, 79, 80, 114, 111, 118, 105, 100, 101, 114, 67, 108, 97, 115, 115, 60, 47, 107, 101, 121, 62, 60, 115, 116, 114,
++	105, 110, 103, 32, 73, 68, 61, 34, 49, 34, 62, 65, 112, 112, 108, 101, 75, 101, 121, 83, 116, 111, 114, 101, 60, 47, 115, 116, 114, 105, 110, 103,
++	62, 60, 107, 101, 121, 62, 73, 79, 83, 101, 114, 118, 105, 99, 101, 78, 111, 116, 105, 102, 105, 99, 97, 116, 105, 111, 110, 85, 115, 101, 114, 60,
++	47, 107, 101, 121, 62, 60, 116, 114, 117, 101, 47, 62, 60, 47, 100, 105, 99, 116, 62, 32, 45, 62, 32, 65, 112, 10, 83, 87, 69, 69, 84, 32,
++	65, 75, 83, 58, 32, 112, 101, 111, 112, 108, 101, 100, 32, 115, 101, 108, 32, 48, 32, 97, 114, 103, 48, 32, 48, 32, 105, 110, 32, 48, 47, 48,
++	32, 111, 117, 116, 32, 48, 47, 48, 32, 45, 62, 32, 48, 120, 48, 10, 83, 87, 69, 69, 84, 32, 83, 85, 82, 70, 58, 32, 83, 112, 114, 105,
++	110, 103, 66, 111, 97, 114, 100, 32, 99, 114, 101, 97, 116, 101, 32, 105, 100, 32, 53, 32, 51, 49, 50, 120, 50, 48, 50, 32, 102, 109, 116, 32,
++	48, 120, 52, 99, 52, 49, 51, 48, 51, 56, 32, 98, 112, 101, 32, 50, 32, 98, 112, 114, 32, 54, 52, 48, 32, 112, 108, 97, 110, 101, 115, 32,
++	48, 32, 115, 105, 122, 101, 32, 49, 51, 49, 48, 55, 50, 32, 107, 101, 121, 115, 32, 54, 32, 45, 62, 32, 48, 120, 48, 10, 83, 87, 69, 69,
++	84, 32, 83, 85, 82, 70, 58, 32, 83, 112, 114, 105, 110, 103, 66, 111, 97, 114, 100, 32, 99, 114, 101, 97, 116, 101, 32, 105, 100, 32, 52, 32,
++	50, 55, 50, 120, 49, 56, 52, 32, 102, 109, 116, 32, 48, 120, 52, 50, 52, 55, 53, 50, 52, 49, 32, 98, 112, 101, 32, 52, 32, 98, 112, 114,
++	32, 49, 48, 56, 56, 32, 112, 108, 97, 110, 101, 115, 32, 48, 32, 115, 105, 122, 101, 32, 50, 49, 50, 57, 57, 50, 32, 107, 101, 121, 115, 32,
++	54, 32, 45, 62, 32, 48, 120, 48, 10, 83, 87, 69, 69, 84, 32, 83, 97, 110, 100, 98, 111, 120, 58, 32, 100, 97, 115, 100, 32, 112, 114, 105,
++	118, 105, 108, 101, 103, 101, 32, 49, 48, 48, 53, 32, 100, 101, 110, 105, 101, 100, 10, 83, 87, 69, 69, 84, 32, 84, 79, 85, 67, 72, 58, 32,
++	83, 80, 73, 32, 114, 101, 103, 115, 32, 98, 101, 102, 111, 114, 101, 32, 105, 110, 105, 116, 58, 32, 99, 104, 61, 48, 32, 99, 108, 107, 61, 48,
++	32, 109, 111, 100, 101, 61, 48, 32, 115, 116, 97, 116, 117, 115, 61, 48, 32, 102, 98, 61, 48, 10, 83, 87, 69, 69, 84, 32, 83, 85, 82, 70,
++	58, 32, 87, 101, 97, 116, 104, 101, 114, 80, 111, 115, 116, 101, 114, 32, 99, 114, 101, 97, 116, 101, 32, 105, 100, 32, 50, 50, 32, 55, 54, 56,
++	120, 49, 57, 50, 32, 102, 109, 116, 32, 48, 120, 52, 99, 51, 48, 51, 48, 51, 56, 32, 98, 112, 101, 32, 49, 32, 98, 112, 114, 32, 55, 54,
++	56, 32, 112, 108, 97, 110, 101, 115, 32, 49, 32, 115, 105, 122, 101, 32, 49, 52, 55, 52, 53, 54, 32, 107, 101, 121, 115, 32, 49, 49, 32, 45,
++	62, 32, 48, 120, 48, 10, 101, 120, 101, 99, 32, 99, 111, 109, 46, 97, 112, 112, 108, 101, 46, 83, 105, 114, 105, 84, 84, 83, 83, 101, 114, 118,
++	105, 99, 101, 46, 84, 114, 105, 97, 108, 80, 114, 10, 124, 83, 112, 114, 105, 110, 103, 66, 111, 97, 114, 100, 124, 32, 84, 104, 101, 32, 98, 101,
++	104, 97, 118, 105, 111, 114, 32, 111, 102, 32, 116, 104, 101, 32, 85, 73, 67, 111, 108, 108, 101, 99, 116, 105, 111, 110, 86, 105, 101, 119, 70, 108,
++	111, 119, 76, 97, 121, 111, 117, 116, 32, 105, 115, 32, 110, 111, 116, 32, 100, 101, 102, 105, 110, 101, 100, 32, 98, 101, 99, 97, 117, 115, 101, 58,
++	10, 67, 82, 65, 83, 72, 32, 97, 115, 115, 101, 116, 115, 100, 32, 114, 101, 97, 115, 111, 110, 32, 110, 115, 32, 50, 32, 99, 111, 100, 101, 32,
++	48, 120, 54, 58, 32, 40, 110, 111, 110, 101, 41, 10, 83, 87, 69, 69, 84, 32, 65, 75, 83, 58, 32, 98, 97, 99, 107, 117, 112, 100, 32, 115,
++	101, 108, 32, 49, 55, 32, 97, 114, 103, 48, 32, 48, 32, 105, 110, 32, 49, 47, 48, 32, 111, 117, 116, 32, 48, 47, 52, 48, 57, 54, 32, 45,
++	62, 32, 48, 120, 48, 10, 83, 87, 69, 69, 84, 32, 65, 75, 83, 58, 32, 112, 114, 111, 102, 105, 108, 101, 100, 32, 115, 101, 108, 32, 49, 55,
++	32, 97, 114, 103, 48, 32, 48, 32, 105, 110, 32, 49, 47, 48, 32, 111, 117, 116, 32, 48, 47, 52, 48, 57, 54, 32, 45, 62, 32, 48, 120, 48,
++	10, 83, 87, 69, 69, 84, 32, 65, 75, 83, 58, 32, 83, 112, 114, 105, 110, 103, 66, 111, 97, 114, 100, 32, 115, 101, 108, 32, 50, 55, 32, 97,
++	114, 103, 48, 32, 50, 32, 105, 110, 32, 50, 47, 48, 32, 111, 117, 116, 32, 48, 47, 48, 32, 45, 62, 32, 48, 120, 48, 10, 83, 87, 69, 69,
++	84, 32, 65, 75, 83, 58, 32, 115, 121, 109, 112, 116, 111, 109, 115, 100, 32, 115, 101, 108, 32, 51, 53, 32, 97, 114, 103, 48, 32, 48, 32, 105,
++	110, 32, 49, 47, 48, 32, 111, 117, 116, 32, 48, 47, 52, 48, 57, 54, 32, 45, 62, 32, 48, 120, 48, 10, 83, 87, 69, 69, 84, 32, 65, 75,
++	83, 58, 32, 87, 105, 114, 101, 108, 101, 115, 115, 82, 97, 100, 105, 111, 77, 97, 110, 97, 103, 101, 114, 100, 32, 115, 101, 108, 32, 49, 55, 32,
++	97, 114, 103, 48, 32, 48, 32, 105, 110, 32, 49, 47, 48, 32, 111, 117, 116, 32, 48, 47, 52, 48, 57, 54, 32, 45, 62, 32, 48, 120, 48, 10,
++	83, 87, 69, 69, 84, 32, 65, 75, 83, 58, 32, 109, 97, 105, 108, 100, 32, 115, 101, 108, 32, 48, 32, 97, 114, 103, 48, 32, 48, 32, 105, 110,
++	32, 48, 47, 48, 32, 111, 117, 116, 32, 48, 47, 48, 32, 45, 62, 32, 48, 120, 48, 10, 83, 87, 69, 69, 84, 32, 84, 79, 85, 67, 72, 58,
++	32, 112, 104, 97, 115, 101, 32, 49, 32, 114, 101, 115, 117, 108, 116, 58, 32, 99, 104, 105, 112, 32, 100, 105, 100, 32, 110, 111, 116, 32, 97, 110,
++	115, 119, 101, 114, 59, 32, 110, 111, 116, 104, 105, 110, 103, 32, 101, 108, 115, 101, 32, 105, 115, 32, 116, 111, 117, 99, 104, 101, 100, 10, 67, 82,
++	65, 83, 72, 32, 65, 101, 103, 105, 114, 80, 111, 115, 116, 101, 114, 32, 114, 101, 97, 115, 111, 110, 32, 110, 115, 32, 50, 32, 99, 111, 100, 101,
++	32, 48, 120, 54, 58, 32, 40, 110, 111, 110, 101, 41, 10, 101, 120, 101, 99, 32, 67, 97, 108, 101, 110, 100, 97, 114, 70, 111, 99, 117, 115, 67,
++	111, 110, 102, 105, 103, 117, 114, 97, 116, 105, 111, 110, 69, 120, 116, 101, 110, 115, 10, 124, 83, 112, 114, 105, 110, 103, 66, 111, 97, 114, 100, 124,
++	32, 116, 114, 121, 105, 110, 103, 32, 116, 111, 32, 115, 101, 116, 32, 115, 116, 97, 116, 101, 32, 111, 102, 32, 110, 105, 108, 32, 108, 97, 121, 101,
++	114, 46, 10, 83, 87, 69, 69, 84, 32, 65, 75, 83, 58, 32, 102, 105, 110, 97, 110, 99, 101, 100, 32, 115, 101, 108, 32, 48, 32, 97, 114, 103,
++	48, 32, 48, 32, 105, 110, 32, 48, 47, 48, 32, 111, 117, 116, 32, 48, 47, 48, 32, 45, 62, 32, 48, 120, 48, 10, 83, 87, 69, 69, 84, 32,
++	65, 75, 83, 58, 32, 112, 114, 105, 118, 97, 99, 121, 97, 99, 99, 111, 117, 110, 116, 105, 110, 103, 100, 32, 115, 101, 108, 32, 48, 32, 97, 114,
++	103, 48, 32, 48, 32, 105, 110, 32, 48, 47, 48, 32, 111, 117, 116, 32, 48, 47, 48, 32, 45, 62, 32, 48, 120, 48, 10, 83, 87, 69, 69, 84,
++	32, 65, 75, 83, 58, 32, 108, 115, 100, 32, 115, 101, 108, 32, 48, 32, 97, 114, 103, 48, 32, 48, 32, 105, 110, 32, 48, 47, 48, 32, 111, 117,
++	116, 32, 48, 47, 48, 32, 45, 62, 32, 48, 120, 48, 10, 124, 83, 112, 114, 105, 110, 103, 66, 111, 97, 114, 100, 124, 32, 84, 104, 101, 32, 114,
++	101, 108, 101, 118, 97, 110, 116, 32, 85, 73, 67, 111, 108, 108, 101, 99, 116, 105, 111, 110, 86, 105, 101, 119, 70, 108, 111, 119, 76, 97, 121, 111,
++	117, 116, 32, 105, 110, 115, 116, 97, 110, 99, 101, 32, 105, 115, 32, 60, 85, 73, 67, 111, 108, 108, 101, 99, 116, 105, 111, 110, 86, 10, 83, 87,
++	69, 69, 84, 32, 65, 75, 83, 58, 32, 65, 99, 99, 101, 115, 115, 105, 98, 105, 108, 105, 116, 121, 85, 73, 83, 101, 114, 118, 101, 114, 32, 115,
++	101, 108, 32, 48, 32, 97, 114, 103, 48, 32, 48, 32, 105, 110, 32, 48, 47, 48, 32, 111, 117, 116, 32, 48, 47, 48, 32, 45, 62, 32, 48, 120,
++	48, 10, 70, 97, 105, 108, 101, 100, 32, 116, 111, 32, 115, 101, 110, 100, 32, 101, 120, 99, 101, 112, 116, 105, 111, 110, 32, 69, 88, 67, 95, 67,
++	79, 82, 80, 83, 69, 95, 78, 79, 84, 73, 70, 89, 46, 32, 101, 114, 114, 111, 114, 32, 99, 111, 100, 101, 58, 32, 53, 32, 102, 111, 114, 32,
++	112, 105, 100, 32, 54, 55, 10, 83, 87, 69, 69, 84, 32, 65, 75, 83, 58, 32, 115, 105, 114, 105, 105, 110, 102, 101, 114, 101, 110, 99, 101, 100,
++	32, 115, 101, 108, 32, 48, 32, 97, 114, 103, 48, 32, 48, 32, 105, 110, 32, 48, 47, 48, 32, 111, 117, 116, 32, 48, 47, 48, 32, 45, 62, 32,
++	48, 120, 48, 10, 83, 87, 69, 69, 84, 32, 65, 75, 83, 58, 32, 97, 115, 115, 101, 116, 115, 100, 32, 115, 101, 108, 32, 48, 32, 97, 114, 103,
++	48, 32, 48, 32, 105, 110, 32, 48, 47, 48, 32, 111, 117, 116, 32, 48, 47, 48, 32, 45, 62, 32, 48, 120, 48, 10, 83, 87, 69, 69, 84, 32,
++	65, 75, 83, 58, 32, 109, 97, 105, 108, 100, 32, 115, 101, 108, 32, 49, 55, 32, 97, 114, 103, 48, 32, 48, 32, 105, 110, 32, 49, 47, 48, 32,
++	111, 117, 116, 32, 48, 47, 52, 48, 57, 54, 32, 45, 62, 32, 48, 120, 48, 10, 83, 87, 69, 69, 84, 32, 65, 75, 83, 58, 32, 114, 101, 109,
++	111, 116, 101, 109, 97, 110, 97, 103, 101, 109, 101, 110, 116, 100, 32, 115, 101, 108, 32, 48, 32, 97, 114, 103, 48, 32, 48, 32, 105, 110, 32, 48,
++	47, 48, 32, 111, 117, 116, 32, 48, 47, 48, 32, 45, 62, 32, 48, 120, 48, 10, 83, 87, 69, 69, 84, 32, 65, 75, 83, 58, 32, 112, 97, 115,
++	116, 101, 100, 32, 115, 101, 108, 32, 49, 55, 32, 97, 114, 103, 48, 32, 48, 32, 105, 110, 32, 49, 47, 48, 32, 111, 117, 116, 32, 48, 47, 52,
++	48, 57, 54, 32, 45, 62, 32, 48, 120, 48, 10, 124, 83, 112, 114, 105, 110, 103, 66, 111, 97, 114, 100, 124, 32, 73, 79, 83, 101, 114, 118, 105,
++	99, 101, 77, 97, 116, 99, 104, 105, 110, 103, 102, 97, 105, 108, 101, 100, 32, 102, 111, 114, 58, 32, 65, 112, 112, 108, 101, 77, 50, 83, 99, 97,
++	108, 101, 114, 67, 83, 67, 68, 114, 105, 118, 101, 114, 10, 83, 87, 69, 69, 84, 32, 65, 75, 83, 58, 32, 108, 105, 110, 107, 100, 32, 115, 101,
++	108, 32, 48, 32, 97, 114, 103, 48, 32, 48, 32, 105, 110, 32, 48, 47, 48, 32, 111, 117, 116, 32, 48, 47, 48, 32, 45, 62, 32, 48, 120, 48,
++	10, 83, 87, 69, 69, 84, 32, 84, 79, 85, 67, 72, 58, 32, 105, 100, 101, 110, 116, 105, 102, 121, 58, 32, 83, 80, 73, 32, 116, 114, 97, 110,
++	115, 102, 101, 114, 32, 116, 105, 109, 101, 100, 32, 111, 117, 116, 32, 40, 110, 111, 32, 99, 108, 111, 99, 107, 44, 32, 111, 114, 32, 116, 104, 101,
++	32, 112, 97, 100, 115, 32, 97, 114, 101, 32, 110, 111, 116, 32, 116, 104, 101, 32, 83, 80, 73, 32, 102, 117, 110, 99, 116, 105, 111, 110, 41, 10,
++	73, 79, 75, 32, 98, 97, 99, 107, 98, 111, 97, 114, 100, 100, 58, 32, 109, 97, 116, 99, 104, 105, 110, 103, 49, 32, 60, 100, 105, 99, 116, 32,
++	73, 68, 61, 34, 48, 34, 62, 60, 107, 101, 121, 62, 73, 79, 80, 114, 111, 118, 105, 100, 101, 114, 67, 108, 97, 115, 115, 60, 47, 107, 101, 121,
++	62, 60, 115, 116, 114, 105, 110, 103, 32, 73, 68, 61, 34, 49, 34, 62, 73, 79, 65, 99, 99, 101, 108, 101, 114, 97, 116, 111, 114, 69, 83, 60,
++	47, 115, 116, 114, 105, 110, 103, 62, 60, 107, 101, 121, 62, 73, 79, 83, 101, 114, 118, 105, 99, 101, 78, 111, 116, 105, 102, 105, 99, 97, 116, 105,
++	111, 110, 85, 115, 101, 114, 60, 47, 107, 101, 121, 62, 60, 116, 114, 117, 101, 47, 62, 60, 47, 100, 105, 99, 116, 62, 32, 45, 62, 32, 73, 10,
++	73, 79, 75, 32, 83, 112, 114, 105, 110, 103, 66, 111, 97, 114, 100, 58, 32, 109, 97, 116, 99, 104, 105, 110, 103, 49, 32, 60, 100, 105, 99, 116,
++	32, 73, 68, 61, 34, 48, 34, 62, 60, 107, 101, 121, 62, 73, 79, 80, 114, 111, 118, 105, 100, 101, 114, 67, 108, 97, 115, 115, 60, 47, 107, 101,
++	121, 62, 60, 115, 116, 114, 105, 110, 103, 32, 73, 68, 61, 34, 49, 34, 62, 73, 79, 80, 108, 97, 116, 102, 111, 114, 109, 69, 120, 112, 101, 114,
++	116, 68, 101, 118, 105, 99, 101, 60, 47, 115, 116, 114, 105, 110, 103, 62, 60, 107, 101, 121, 62, 73, 79, 83, 101, 114, 118, 105, 99, 101, 78, 111,
++	116, 105, 102, 105, 99, 97, 116, 105, 111, 110, 85, 115, 101, 114, 60, 47, 107, 101, 121, 62, 60, 116, 114, 117, 101, 47, 62, 60, 47, 100, 105, 10,
++	73, 79, 75, 32, 83, 112, 114, 105, 110, 103, 66, 111, 97, 114, 100, 58, 32, 73, 79, 83, 101, 114, 118, 105, 99, 101, 70, 105, 114, 115, 116, 77,
++	97, 116, 99, 104, 32, 60, 100, 105, 99, 116, 32, 73, 68, 61, 34, 48, 34, 62, 60, 107, 101, 121, 62, 73, 79, 80, 114, 111, 118, 105, 100, 101,
++	114, 67, 108, 97, 115, 115, 60, 47, 107, 101, 121, 62, 60, 115, 116, 114, 105, 110, 103, 32, 73, 68, 61, 34, 49, 34, 62, 73, 79, 72, 73, 68,
++	68, 101, 118, 105, 99, 101, 60, 47, 115, 116, 114, 105, 110, 103, 62, 60, 107, 101, 121, 62, 80, 114, 105, 109, 97, 114, 121, 85, 115, 97, 103, 101,
++	60, 47, 107, 101, 121, 62, 60, 105, 110, 116, 101, 103, 101, 114, 32, 115, 105, 122, 101, 61, 34, 51, 50, 34, 32, 73, 68, 61, 34, 50, 34, 10,
++	73, 79, 75, 32, 83, 112, 114, 105, 110, 103, 66, 111, 97, 114, 100, 58, 32, 73, 79, 83, 101, 114, 118, 105, 99, 101, 70, 105, 114, 115, 116, 77,
++	97, 116, 99, 104, 32, 60, 100, 105, 99, 116, 32, 73, 68, 61, 34, 48, 34, 62, 60, 107, 101, 121, 62, 73, 79, 80, 114, 111, 118, 105, 100, 101,
++	114, 67, 108, 97, 115, 115, 60, 47, 107, 101, 121, 62, 60, 115, 116, 114, 105, 110, 103, 32, 73, 68, 61, 34, 49, 34, 62, 73, 79, 72, 73, 68,
++	68, 101, 118, 105, 99, 101, 60, 47, 115, 116, 114, 105, 110, 103, 62, 60, 107, 101, 121, 62, 68, 101, 118, 105, 99, 101, 85, 115, 97, 103, 101, 80,
++	97, 103, 101, 60, 47, 107, 101, 121, 62, 60, 105, 110, 116, 101, 103, 101, 114, 32, 115, 105, 122, 101, 61, 34, 54, 52, 34, 32, 73, 68, 61, 10,
++	83, 87, 69, 69, 84, 32, 84, 79, 85, 67, 72, 58, 32, 112, 105, 110, 32, 105, 114, 113, 32, 32, 32, 98, 97, 110, 107, 32, 48, 120, 49, 55,
++	52, 100, 48, 48, 99, 48, 91, 48, 93, 32, 102, 117, 110, 99, 61, 48, 32, 100, 97, 116, 61, 48, 32, 112, 117, 100, 61, 48, 10, 83, 87, 69,
++	69, 84, 32, 65, 75, 83, 58, 32, 109, 101, 100, 105, 97, 97, 110, 97, 108, 121, 115, 105, 115, 100, 32, 115, 101, 108, 32, 48, 32, 97, 114, 103,
++	48, 32, 48, 32, 105, 110, 32, 48, 47, 48, 32, 111, 117, 116, 32, 48, 47, 48, 32, 45, 62, 32, 48, 120, 48, 10, 124, 83, 112, 114, 105, 110,
++	103, 66, 111, 97, 114, 100, 124, 32, 77, 97, 107, 101, 32, 97, 32, 115, 121, 109, 98, 111, 108, 105, 99, 32, 98, 114, 101, 97, 107, 112, 111, 105,
++	110, 116, 32, 97, 116, 32, 85, 73, 67, 111, 108, 108, 101, 99, 116, 105, 111, 110, 86, 105, 101, 119, 70, 108, 111, 119, 76, 97, 121, 111, 117, 116,
++	66, 114, 101, 97, 107, 70, 111, 114, 73, 110, 118, 97, 108, 105, 100, 83, 105, 122, 101, 115, 32, 116, 111, 32, 99, 97, 116, 99, 104, 32, 116, 104,
++	105, 115, 32, 105, 110, 32, 116, 104, 101, 32, 100, 101, 98, 117, 103, 103, 101, 114, 46, 10, 83, 87, 69, 69, 84, 32, 81, 82, 58, 32, 116, 97,
++	107, 105, 110, 103, 32, 111, 118, 101, 114, 32, 116, 104, 101, 32, 115, 99, 114, 101, 101, 110, 32, 40, 99, 104, 117, 110, 107, 32, 50, 48, 48, 32,
++	98, 121, 116, 101, 115, 44, 32, 56, 48, 48, 32, 109, 115, 47, 102, 114, 97, 109, 101, 44, 32, 108, 97, 115, 116, 32, 49, 50, 48, 48, 48, 32,
++	98, 121, 116, 101, 115, 41, 10, 83, 87, 69, 69, 84, 32, 84, 79, 85, 67, 72, 58, 32, 83, 80, 73, 32, 114, 101, 103, 115, 32, 97, 102, 116,
++	101, 114, 32, 105, 110, 105, 116, 58, 32, 32, 99, 104, 61, 48, 32, 99, 108, 107, 61, 48, 32, 109, 111, 100, 101, 61, 48, 120, 49, 102, 102, 56,
++	48, 48, 48, 48, 32, 115, 116, 97, 116, 117, 115, 61, 48, 32, 102, 98, 61, 48, 120, 49, 32, 40, 109, 97, 120, 32, 49, 48, 48, 48, 48, 48,
++	48, 48, 32, 72, 122, 59, 32, 116, 104, 101, 10, 83, 87, 69, 69, 84, 32, 65, 75, 83, 58, 32, 77, 111, 98, 105, 108, 101, 67, 97, 108, 32,
++	115, 101, 108, 32, 48, 32, 97, 114, 103, 48, 32, 48, 32, 105, 110, 32, 48, 47, 48, 32, 111, 117, 116, 32, 48, 47, 48, 32, 45, 62, 32, 48,
++	120, 48, 10, 83, 87, 69, 69, 84, 32, 84, 79, 85, 67, 72, 58, 32, 112, 105, 110, 32, 109, 117, 120, 32, 32, 32, 98, 97, 110, 107, 32, 48,
++	120, 49, 48, 99, 52, 48, 48, 99, 48, 91, 49, 93, 32, 102, 117, 110, 99, 61, 48, 32, 100, 97, 116, 61, 48, 32, 112, 117, 100, 61, 48, 120,
++	49, 10, 83, 87, 69, 69, 84, 32, 84, 79, 85, 67, 72, 58, 32, 112, 105, 110, 32, 114, 101, 115, 101, 116, 32, 98, 97, 110, 107, 32, 48, 120,
++	49, 48, 99, 52, 48, 48, 99, 48, 91, 48, 93, 32, 102, 117, 110, 99, 61, 48, 32, 100, 97, 116, 61, 48, 32, 112, 117, 100, 61, 48, 120, 49,
++	10, 83, 87, 69, 69, 84, 32, 84, 79, 85, 67, 72, 58, 32, 112, 105, 110, 32, 99, 115, 32, 32, 32, 32, 98, 97, 110, 107, 32, 48, 120, 49,
++	48, 99, 52, 48, 48, 54, 48, 91, 51, 93, 32, 102, 117, 110, 99, 61, 48, 32, 100, 97, 116, 61, 48, 32, 112, 117, 100, 61, 48, 120, 49, 10,
++	83, 87, 69, 69, 84, 32, 84, 79, 85, 67, 72, 58, 32, 112, 105, 110, 32, 109, 105, 115, 111, 32, 32, 98, 97, 110, 107, 32, 48, 120, 49, 48,
++	99, 52, 48, 48, 54, 48, 91, 50, 93, 32, 102, 117, 110, 99, 61, 48, 32, 100, 97, 116, 61, 48, 32, 112, 117, 100, 61, 48, 120, 49, 10, 83,
++	87, 69, 69, 84, 32, 84, 79, 85, 67, 72, 58, 32, 112, 105, 110, 32, 109, 111, 115, 105, 32, 32, 98, 97, 110, 107, 32, 48, 120, 49, 48, 99,
++	52, 48, 48, 54, 48, 91, 49, 93, 32, 102, 117, 110, 99, 61, 48, 32, 100, 97, 116, 61, 48, 32, 112, 117, 100, 61, 48, 120, 49, 10, 83, 87,
++	69, 69, 84, 32, 84, 79, 85, 67, 72, 58, 32, 112, 105, 110, 32, 99, 108, 107, 32, 32, 32, 98, 97, 110, 107, 32, 48, 120, 49, 48, 99, 52,
++	48, 48, 54, 48, 91, 48, 93, 32, 102, 117, 110, 99, 61, 48, 32, 100, 97, 116, 61, 48, 32, 112, 117, 100, 61, 48, 120, 49, 10, 83, 87, 69,
++	69, 84, 32, 65, 75, 83, 58, 32, 110, 97, 110, 111, 114, 101, 103, 105, 115, 116, 114, 121, 100, 32, 115, 101, 108, 32, 51, 53, 32, 97, 114, 103,
++	48, 32, 48, 32, 105, 110, 32, 49, 47, 48, 32, 111, 117, 116, 32, 48, 47, 52, 48, 57, 54, 32, 45, 62, 32, 48, 120, 48, 10, 83, 87, 69,
++	69, 84, 32, 65, 75, 83, 58, 32, 99, 111, 109, 46, 97, 112, 112, 108, 101, 46, 115, 105, 114, 105, 46, 101, 109, 98, 101, 100, 100, 101, 100, 115,
++	112, 101, 101, 99, 104, 32, 115, 101, 108, 32, 48, 32, 97, 114, 103, 48, 32, 48, 32, 105, 110, 32, 48, 47, 48, 32, 111, 117, 116, 32, 48, 47,
++	48, 32, 45, 62, 32, 48, 120, 48, 10, 83, 87, 69, 69, 84, 32, 83, 85, 82, 70, 58, 32, 83, 112, 114, 105, 110, 103, 66, 111, 97, 114, 100,
++	32, 99, 114, 101, 97, 116, 101, 32, 105, 100, 32, 55, 32, 55, 53, 120, 49, 52, 52, 32, 102, 109, 116, 32, 48, 120, 52, 99, 52, 49, 51, 48,
++	51, 56, 32, 98, 112, 101, 32, 50, 32, 98, 112, 114, 32, 49, 54, 48, 32, 112, 108, 97, 110, 101, 115, 32, 48, 32, 115, 105, 122, 101, 32, 51,
++	50, 55, 54, 56, 32, 107, 101, 121, 115, 32, 54, 32, 45, 62, 32, 48, 120, 48, 10, 83, 87, 69, 69, 84, 32, 65, 75, 83, 58, 32, 100, 97,
++	115, 100, 32, 115, 101, 108, 32, 49, 55, 32, 97, 114, 103, 48, 32, 48, 32, 105, 110, 32, 49, 47, 48, 32, 111, 117, 116, 32, 48, 47, 52, 48,
++	57, 54, 32, 45, 62, 32, 48, 120, 48, 10, 83, 87, 69, 69, 84, 32, 83, 85, 82, 70, 58, 32, 109, 101, 100, 105, 97, 115, 101, 114, 118, 101,
++	114, 100, 32, 99, 114, 101, 97, 116, 101, 32, 105, 100, 32, 53, 48, 32, 49, 57, 50, 120, 49, 52, 52, 32, 102, 109, 116, 32, 48, 120, 52, 99,
++	51, 48, 51, 48, 51, 56, 32, 98, 112, 101, 32, 49, 32, 98, 112, 114, 32, 51, 56, 52, 32, 112, 108, 97, 110, 101, 115, 32, 48, 32, 115, 105,
++	122, 101, 32, 49, 49, 52, 54, 56, 56, 32, 107, 101, 121, 115, 32, 49, 55, 32, 45, 62, 32, 48, 120, 48, 10, 83, 87, 69, 69, 84, 32, 65,
++	75, 83, 58, 32, 115, 101, 97, 114, 99, 104, 112, 97, 114, 116, 121, 100, 32, 115, 101, 108, 32, 49, 55, 32, 97, 114, 103, 48, 32, 48, 32, 105,
++	110, 32, 49, 47, 48, 32, 111, 117, 116, 32, 48, 47, 52, 48, 57, 54, 32, 45, 62, 32, 48, 120, 48, 10, 83, 87, 69, 69, 84, 32, 83, 85,
++	82, 70, 58, 32, 65, 101, 103, 105, 114, 80, 111, 115, 116, 101, 114, 32, 99, 114, 101, 97, 116, 101, 32, 105, 100, 32, 49, 56, 32, 49, 49, 50,
++	53, 120, 50, 52, 51, 54, 32, 102, 109, 116, 32, 48, 120, 52, 49, 51, 48, 51, 48, 51, 56, 32, 98, 112, 101, 32, 49, 32, 98, 112, 114, 32,
++	49, 49, 53, 50, 32, 112, 108, 97, 110, 101, 115, 32, 48, 32, 115, 105, 122, 101, 32, 50, 56, 49, 56, 48, 52, 56, 32, 107, 101, 121, 115, 32,
++	53, 32, 45, 62, 32, 48, 120, 48, 10, 70, 97, 105, 108, 101, 100, 32, 116, 111, 32, 115, 101, 110, 100, 32, 101, 120, 99, 101, 112, 116, 105, 111,
++	110, 32, 69, 88, 67, 95, 67, 79, 82, 80, 83, 69, 95, 78, 79, 84, 73, 70, 89, 46, 32, 101, 114, 114, 111, 114, 32, 99, 111, 100, 101, 58,
++	32, 10, 83, 87, 69, 69, 84, 32, 65, 75, 83, 58, 32, 115, 101, 97, 114, 99, 104, 100, 32, 115, 101, 108, 32, 51, 53, 32, 97, 114, 103, 48,
++	32, 48, 32, 105, 110, 32, 49, 47, 48, 32, 111, 117, 116, 32, 48, 47, 52, 48, 57, 54, 32, 45, 62, 32, 48, 120, 48, 10, 83, 87, 69, 69,
++	84, 32, 65, 75, 83, 58, 32, 85, 115, 97, 103, 101, 84, 114, 97, 99, 107, 105, 110, 103, 65, 103, 101, 110, 116, 32, 115, 101, 108, 32, 48, 32,
++	97, 114, 103, 48, 32, 48, 32, 105, 110, 32, 48, 47, 48, 32, 111, 117, 116, 32, 48, 47, 48, 32, 45, 62, 32, 48, 120, 48, 10, 83, 87, 69,
++	69, 84, 32, 65, 75, 83, 58, 32, 115, 117, 103, 103, 101, 115, 116, 100, 32, 115, 101, 108, 32, 49, 55, 32, 97, 114, 103, 48, 32, 48, 32, 105,
++	110, 32, 49, 47, 48, 32, 111, 117, 116, 32, 48, 47, 52, 48, 57, 54, 32, 45, 62, 32, 48, 120, 48, 10, 83, 87, 69, 69, 84, 32, 65, 75,
++	83, 58, 32, 115, 101, 99, 117, 114, 105, 116, 121, 100, 32, 115, 101, 108, 32, 49, 48, 32, 97, 114, 103, 48, 32, 48, 32, 105, 110, 32, 50, 47,
++	51, 50, 32, 111, 117, 116, 32, 49, 47, 52, 48, 32, 45, 62, 32, 48, 120, 101, 48, 48, 48, 48, 50, 99, 55, 10, 83, 87, 69, 69, 84, 32,
++	84, 79, 85, 67, 72, 58, 32, 109, 97, 112, 112, 105, 110, 103, 32, 83, 80, 73, 32, 48, 120, 49, 48, 100, 52, 48, 48, 48, 48, 44, 32, 85,
++	83, 73, 32, 109, 111, 100, 101, 32, 48, 120, 49, 48, 99, 50, 49, 48, 48, 99, 32, 97, 110, 100, 32, 116, 104, 101, 32, 112, 97, 100, 32, 98,
++	97, 110, 107, 115, 10, 83, 87, 69, 69, 84, 32, 84, 79, 85, 67, 72, 58, 32, 99, 109, 117, 32, 103, 97, 116, 101, 115, 58, 32, 105, 112, 99,
++	108, 107, 95, 52, 91, 48, 120, 50, 48, 50, 99, 93, 61, 48, 120, 50, 48, 48, 48, 48, 48, 32, 112, 99, 108, 107, 95, 52, 91, 48, 120, 50,
++	48, 52, 99, 93, 61, 48, 120, 50, 48, 48, 48, 48, 48, 32, 114, 115, 116, 110, 115, 121, 110, 99, 91, 48, 120, 50, 48, 54, 56, 93, 61, 48,
++	120, 50, 48, 48, 48, 48, 48, 32, 81, 67, 72, 91, 48, 120, 51, 48, 50, 99, 93, 61, 48, 120, 51, 102, 48, 48, 48, 50, 10, 83, 87, 69,
++	69, 84, 32, 84, 79, 85, 67, 72, 58, 32, 115, 121, 115, 114, 101, 103, 32, 85, 83, 73, 49, 49, 32, 109, 111, 100, 101, 32, 40, 48, 120, 49,
++	48, 99, 50, 49, 48, 48, 99, 41, 32, 61, 32, 48, 32, 40, 83, 80, 73, 32, 61, 32, 48, 120, 50, 44, 32, 115, 111, 32, 110, 111, 116, 32,
++	83, 80, 73, 32, 121, 101, 116, 41, 10, 83, 87, 69, 69, 84, 32, 65, 75, 83, 58, 32, 100, 117, 101, 116, 101, 120, 112, 101, 114, 116, 100, 32,
++	115, 101, 108, 32, 49, 55, 32, 97, 114, 103, 48, 32, 48, 32, 105, 110, 32, 49, 47, 48, 32, 111, 117, 116, 32, 48, 47, 52, 48, 57, 54, 32,
++	45, 62, 32, 48, 120, 48, 10, 124, 83, 112, 114, 105, 110, 103, 66, 111, 97, 114, 100, 124, 32, 116, 104, 101, 32, 105, 116, 101, 109, 32, 119, 105,
++	100, 116, 104, 32, 109, 117, 115, 116, 32, 98, 101, 32, 108, 101, 115, 115, 32, 116, 104, 97, 110, 32, 116, 104, 101, 32, 119, 105, 100, 116, 104, 32,
++	111, 102, 32, 116, 104, 101, 32, 85, 73, 67, 111, 108, 108, 101, 99, 116, 105, 111, 110, 86, 105, 101, 119, 32, 109, 105, 110, 117, 115, 32, 116, 104,
++	101, 32, 115, 101, 99, 116, 105, 111, 110, 32, 105, 110, 115, 101, 116, 115, 32, 108, 101, 102, 116, 32, 97, 110, 100, 32, 114, 105, 103, 104, 116, 32,
++	118, 97, 108, 117, 101, 115, 44, 32, 109, 105, 110, 117, 115, 32, 116, 104, 101, 32, 99, 111, 110, 116, 101, 110, 116, 32, 105, 110, 115, 101, 116, 115,
++	32, 108, 101, 102, 116, 32, 10, 83, 87, 69, 69, 84, 32, 65, 75, 83, 58, 32, 83, 112, 114, 105, 110, 103, 66, 111, 97, 114, 100, 32, 115, 101,
++	108, 32, 50, 54, 32, 97, 114, 103, 48, 32, 50, 32, 105, 110, 32, 51, 47, 48, 32, 111, 117, 116, 32, 48, 47, 48, 32, 45, 62, 32, 48, 120,
++	48, 10, 83, 87, 69, 69, 84, 32, 84, 79, 85, 67, 72, 58, 32, 65, 80, 47, 65, 79, 67, 32, 109, 117, 120, 58, 32, 65, 80, 32, 105, 115,
++	32, 78, 79, 84, 32, 100, 114, 105, 118, 105, 110, 103, 32, 105, 116, 32, 108, 111, 119, 44, 32, 116, 104, 101, 32, 98, 117, 115, 32, 109, 97, 121,
++	32, 98, 101, 108, 111, 110, 103, 32, 116, 111, 32, 116, 104, 101, 32, 65, 79, 67, 10, 83, 87, 69, 69, 84, 32, 65, 75, 83, 58, 32, 99, 111,
++	114, 101, 100, 117, 101, 116, 100, 32, 115, 101, 108, 32, 49, 55, 32, 97, 114, 103, 48, 32, 48, 32, 105, 110, 32, 49, 47, 48, 32, 111, 117, 116,
++	32, 48, 47, 52, 48, 57, 54, 32, 45, 62, 32, 48, 120, 48, 10, 83, 87, 69, 69, 84, 32, 83, 85, 82, 70, 58, 32, 83, 112, 114, 105, 110,
++	103, 66, 111, 97, 114, 100, 32, 99, 114, 101, 97, 116, 101, 32, 105, 100, 32, 49, 49, 32, 49, 49, 50, 53, 120, 50, 52, 51, 54, 32, 102, 109,
++	116, 32, 48, 120, 55, 55, 51, 51, 51, 48, 55, 50, 32, 98, 112, 101, 32, 52, 32, 98, 112, 114, 32, 52, 54, 48, 56, 32, 112, 108, 97, 110,
++	101, 115, 32, 48, 32, 115, 105, 122, 101, 32, 49, 49, 50, 51, 57, 52, 50, 52, 32, 107, 101, 121, 115, 32, 49, 48, 32, 45, 62, 32, 48, 120,
++	48, 10, 83, 87, 69, 69, 84, 32, 83, 85, 82, 70, 58, 32, 80, 111, 115, 116, 101, 114, 66, 111, 97, 114, 100, 32, 99, 114, 101, 97, 116, 101,
++	32, 105, 100, 32, 49, 53, 32, 49, 49, 50, 53, 120, 50, 52, 51, 54, 32, 102, 109, 116, 32, 48, 120, 55, 55, 51, 51, 51, 48, 55, 50, 32,
++	98, 112, 101, 32, 52, 32, 98, 112, 114, 32, 52, 54, 48, 56, 32, 112, 108, 97, 110, 101, 115, 32, 48, 32, 115, 105, 122, 101, 32, 49, 49, 50,
++	51, 57, 52, 50, 52, 32, 107, 101, 121, 115, 32, 49, 48, 32, 45, 62, 32, 48, 120, 48, 10, 83, 87, 69, 69, 84, 32, 65, 75, 83, 58, 32,
++	83, 112, 114, 105, 110, 103, 66, 111, 97, 114, 100, 32, 115, 101, 108, 32, 56, 32, 97, 114, 103, 48, 32, 48, 32, 105, 110, 32, 49, 47, 48, 32,
++	111, 117, 116, 32, 48, 47, 48, 32, 45, 62, 32, 48, 120, 101, 48, 48, 48, 48, 50, 99, 55, 10, 83, 87, 69, 69, 84, 32, 65, 75, 83, 58,
++	32, 99, 111, 110, 116, 101, 120, 116, 115, 116, 111, 114, 101, 100, 32, 115, 101, 108, 32, 49, 55, 32, 97, 114, 103, 48, 32, 48, 32, 105, 110, 32,
++	49, 47, 48, 32, 111, 117, 116, 32, 48, 47, 52, 48, 57, 54, 32, 45, 62, 32, 48, 120, 48, 10, 83, 87, 69, 69, 84, 32, 83, 85, 82, 70,
++	58, 32, 83, 112, 114, 105, 110, 103, 66, 111, 97, 114, 100, 32, 99, 114, 101, 97, 116, 101, 32, 105, 100, 32, 49, 51, 32, 49, 49, 50, 53, 120,
++	50, 52, 51, 54, 32, 102, 109, 116, 32, 48, 120, 55, 55, 51, 51, 51, 48, 55, 50, 32, 98, 112, 101, 32, 52, 32, 98, 112, 114, 32, 52, 54,
++	48, 56, 32, 112, 108, 97, 110, 101, 115, 32, 48, 32, 115, 105, 122, 101, 32, 49, 49, 50, 51, 57, 52, 50, 52, 32, 107, 101, 121, 115, 32, 49,
++	48, 32, 45, 62, 32, 48, 120, 48, 10, 83, 87, 69, 69, 84, 32, 84, 79, 85, 67, 72, 58, 32, 99, 109, 117, 32, 98, 97, 115, 101, 32, 48,
++	120, 49, 48, 99, 48, 48, 48, 48, 48, 58, 32, 79, 80, 84, 73, 79, 78, 91, 48, 120, 56, 48, 48, 93, 61, 48, 120, 102, 49, 48, 48, 48,
++	48, 48, 48, 32, 117, 115, 105, 95, 109, 117, 120, 91, 48, 120, 54, 52, 48, 93, 61, 48, 120, 49, 48, 32, 98, 117, 115, 95, 109, 117, 120, 91,
++	48, 120, 54, 48, 48, 93, 61, 48, 120, 49, 48, 32, 98, 117, 115, 95, 97, 117, 116, 111, 91, 48, 120, 54, 48, 52, 93, 61, 48, 32, 117, 115,
++	105, 95, 97, 117, 116, 111, 91, 48, 120, 54, 52, 52, 93, 61, 48, 32, 100, 105, 118, 91, 48, 120, 49, 56, 48, 99, 93, 61, 48, 10,
++};
++static const uint8_t qrz_litlen_len[286] = {
++	15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 13, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
++	8, 14, 13, 15, 15, 13, 15, 15, 13, 14, 15, 15, 10, 9, 10, 13, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 9, 13, 14, 15, 11, 15,
++	15, 11, 11, 11, 11, 10, 12, 11, 15, 13, 15, 13, 11, 11, 15, 11, 11, 15, 13, 10, 12, 12, 14, 14, 15, 15, 15, 9, 15, 9, 15, 13,
++	15, 5, 5, 5, 5, 5, 5, 8, 9, 9, 14, 12, 8, 9, 9, 8, 9, 15, 9, 9, 9, 10, 11, 11, 10, 9, 15, 15, 15, 15, 14, 15,
++	15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
++	15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
++	15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
++	15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
++	14, 4, 5, 5, 5, 6, 6, 6, 7, 5, 6, 7, 6, 6, 7, 7, 6, 5, 6, 7, 6, 6, 7, 8, 7, 8, 11, 12, 12, 11,
++};
++static const uint8_t qrz_dist_len[30] = {
++	12, 14, 14, 11, 10, 9, 5, 5, 7, 6, 6, 6, 4, 6, 3, 6, 4, 5, 4, 4, 4, 4, 4, 5, 4, 5, 4, 4, 8, 13,
++};

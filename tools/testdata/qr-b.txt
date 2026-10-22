@@ -1,0 +1,70 @@
+exec WeatherPoster
+SWEET AKS: assetsd sel 0 arg0 0 in 0/0 out 0/0 -> 0x0
+IOK SpringBoard: path IODeviceTree:/options -> none
+CRASH assetsd[227] sig 6 code 0x0 sub 0x0 slide 0x43d40000 mh 0x1028d0000
+CRASH assetsd pc 0x206357198 lr 0x2158e65f8 sp 0x16d7e6cd0 fp 0x16d7e6cf0 far 0x222bb2e28
+CRASH assetsd bt 0x1d199c4b8 0x21581ef54 0x21580fa4c 0x1c3e12afc 0x21581e424 0x21581e3d4 0x1d18d8794 0x1d18afd48 0x1d18af480 0x1d1
+CRASH assetsd reason ns 2 code 0x6: (none)
+Failed to send exception EXC_CORPSE_NOTIFY. error code: 5 for pid 227
+exec xpcproxy
+IOK SpringBoard: IOServiceFirstMatch <dict ID="0"><key>IOProviderClass</key><string ID="1">AppleHIDKeyboardEventDriverV2</string><
+IOK SpringBoard: IOServiceTerminate <dict ID="0"><key>IOProviderClass</key><string ID="1">AppleHIDKeyboardEventDriverV2</string><k
+IOK SpringBoard: IOServiceFirstMatch <dict ID="0"><key>IOProviderClass</key><string ID="1">IOAccessoryIDBusHIDDevice</string><key>
+IOK SpringBoard: IOServiceTerminate <dict ID="0"><key>IOProviderClass</key><string ID="1">IOAccessoryIDBusHIDDevice</string><key>I
+IOK SpringBoard: path IOPower:/IOPowerConnection/IOPMrootDomain -> IOPMrootDomain
+IOK SpringBoard: open IOPMrootDomain type 0 -> 0x0
+SWEET AKS: SpringBoard sel 32 arg0 0 in 1/0 out 0/0 -> 0xe00002c7
+SWEET AKS: SpringBoard sel 26 arg0 2 in 3/0 out 0/0 -> 0x0
+IOK SpringBoard: matching1 <dict ID="0"><key>IOProviderClass</key><string ID="1">AppleSPUTimesync</string><key>IOServiceNotificati
+IOK SpringBoard: matching1 <dict ID="0"><key>IOPropertyMatch</key><dict ID="1"><key>backlight-control</key><true/></dict><key>IOSe
+|SpringBoard| 1969-12-31 16:02:39.-579 SpringBoard[26:235] 
+|SpringBoard| Unbalanced calls to begin/end appearance transitions for <SBCoverSheetPrimarySlidingViewController: 0x105041a00>.
+|SpringBoard| 
+SWEET AKS: coreduetd sel 17 arg0 0 in 1/0 out 0/4096 -> 0x0
+SWEET AKS: biomed sel 17 arg0 0 in 1/0 out 0/4096 -> 0x0
+IOK SpringBoard: path IODeviceTree:/product -> IOPlatformDevice
+SWEET FB: display on
+SWEET FB: backboardd sel 79 in 2/0 out 0/40 -> 0x0
+|SpringBoard| ### Failed to Soft Linked: /System/Library/Frameworks/CarKit.framework/CarKit
+|SpringBoard| #configurationUpdateManager longPressBehavior: 0 previousValue: 0
+IOK SpringBoard: path IODeviceTree:/buttons -> IOPlatformDevice
+IOK SpringBoard: matching1 <dict ID="0"><key>IOProviderClass</key><string ID="1">IOPlatformExpertDevice</string><key>IOServiceNoti
+IOK SpringBoard: matching1 <dict ID="0"><key>IOProviderClass</key><string ID="1">IOPMPowerSource</string><key>IOServiceNotificatio
+SWEET AKS: mobiletimerd sel 0 arg0 0 in 0/0 out 0/0 -> 0x0
+SWEET AKS: sleepd sel 17 arg0 0 in 1/0 out 0/4096 -> 0x0
+SWEET AKS: contextstored sel 17 arg0 0 in 1/0 out 0/4096 -> 0x0
+|SpringBoard| ACM: LibCall_ACMContextCreate: returning, err = -5.
+IOK SpringBoard: matching1 <dict ID="0"><key>IOPropertyMatch</key><dict ID="1"><key>name</key><string ID="2">gyro</string></dict><
+SWEET SURF: SpringBoard create id 4 272x184 fmt 0x42475241 bpe 4 bpr 1088 planes 0 size 212992 keys 6 -> 0x0
+SWEET SURF: SpringBoard trap 0
+SWEET SURF: SpringBoard create id 5 312x202 fmt 0x4c413038 bpe 2 bpr 640 planes 0 size 131072 keys 6 -> 0x0
+IOK SpringBoard: matching1 <dict ID="0"><key>IOProviderClass</key><string ID="1">AppleKeyStore</string><key>IOServiceNotificationU
+SWEET SURF: SpringBoard sel 35
+IOK backboardd: matching1 <dict ID="0"><key>IOProviderClass</key><string ID="1">IOAcceleratorES</string><key>IOServiceNotification
+SWEET FB: swap 6 layer 0 surface 3 1125x2436 fmt 0x42475241 bpr 4608 a 0,0 1125x2436 b 0,0 1125x2436
+IOK SpringBoard: IOServiceFirstMatch <dict ID="0"><key>IOProviderClass</key><string ID="1">IOHIDDevice</string><key>DeviceUsagePag
+IOK SpringBoard: IOServiceFirstMatch <dict ID="0"><key>IOProviderClass</key><string ID="1">IOHIDDevice</string><key>DeviceUsagePag
+IOK SpringBoard: IOServiceFirstMatch <dict ID="0"><key>IOProviderClass</key><string ID="1">IOHIDDevice</string><key>PrimaryUsage</
+exec AccessibilityUIServer
+|SpringBoard| objc[26]: Class MSDPreferencesFile is implemented in both /System/Library/PrivateFrameworks/MobileStoreDemoKit.frame
+|SpringBoard| objc[26]: Class MSDLogModel is implemented in both /System/Library/PrivateFrameworks/MobileStoreDemoKit.framework/Mo
+|SpringBoard| objc[26]: Class MSDTestPreferences is implemented in both /System/Library/PrivateFrameworks/MobileStoreDemoKit.frame
+|SpringBoard| e of the two will be used. Which one is undefined.
+IOK SpringBoard: path IODeviceTree:/ -> IOPlatformExpertDevice
+|SpringBoard| 1969-12-31 16:02:43.-534 SpringBoard[26:235] 
+|SpringBoard| <CATransformLayer: 0x280222980> - changing property allowsEdgeAntialiasing in transform-only layer, will have no eff
+|SpringBoard| 
+|SpringBoard| <CATransformLayer: 0x280222980> - changing property allowsGroupOpacity in transform-only layer, will have no effect
+|SpringBoard| <CATransformLayer: 0x280222a40> - changing property allowsEdgeAntialiasing in transform-only layer, will have no eff
+|SpringBoard| <CATransformLayer: 0x280222a40> - changing property allowsGroupOpacity in transform-only layer, will have no effect
+|SpringBoard| <CATransformLayer: 0x28023c460> - changing property allowsEdgeAntialiasing in transform-only layer, will have no eff
+|SpringBoard| <CATransformLayer: 0x28023c460> - changing property allowsGroupOpacity in transform-only layer, will have no effect
+|SpringBoard| <CATransformLayer: 0x28023c4a0> - changing property allowsEdgeAntialiasing in transform-only layer, will have no eff
+|SpringBoard| <CATransformLayer: 0x28023c4a0> - changing property allowsGroupOpacity in transform-only layer, will have no effect
+|SpringBoard| <CATransformLayer: 0x280222a40> - changing property allowsGroupBlending in transform-only layer, will have no effect
+|SpringBoard| <CATransformLayer: 0x280222900> - changing property allowsGroupBlending in transform-only layer, will have no effect
+|SpringBoard| <CATransformLayer: 0x2802cf540> - changing property allowsEdgeAntialiasing in transform-only layer, will have no eff
+|SpringBoard| <CATransformLayer: 0x2802cf540> - changing property allowsGroupOpacity in transform-only layer, will have no effect
+|SpringBoard| <CATransformLayer: 0x2802cf540> - changing property backgroundColor in transform-only layer, will have no effect
+|SpringBoard| <CATransformLayer: 0x2802cf7a0> - changing property allowsEdgeAntialiasing in transform-only layer, will have no eff
+|SpringBoard| <CATransformLayer: 0x2802cf7a0> - changing property allowsGroupOpacity in transform-only layer, will have no effect

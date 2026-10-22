@@ -1,0 +1,144 @@
+#!/usr/bin/env python3
+"""pix: one entry point for the device trees (AOSP-style: core + soc/ + device/).
+
+  tools/pix devices                    list devices and their SoCs
+  tools/pix info BOARD                 print the merged board definition
+  tools/pix check BOARD                sanity-check a board definition (alignment, required keys)
+  tools/pix build BOARD [build.sh ...] build the shim image for a device (extra flags go to shim/build.sh)
+  tools/pix xrun ARGS...               one hardware test cycle -> one report (tools/xrun, docs/AUTOMATION.md)
+  tools/pix ci ARGS...                 CI kernel: find/wait/download/verify (tools/ci-kernel)
+  tools/pix stack ARGS...              do the xnu patches apply on pristine xnu-8796? (tools/stack-apply)
+  tools/pix phone ARGS...              what state is the Pixel in, is it bluejay? (tools/phone-state)
+  tools/pix proposals ARGS...          tool-proposal register: list|check|new|validate (tools/tool-proposals)
+  tools/pix recover ARGS...            wait for the phone after a reboot, bounded; software only (tools/hang-recover)
+  tools/pix probe ARGS...              one shim probe cycle: build, capture, boot, verdict (tools/probe-run)
+  tools/pix new-device VENDOR/CODENAME --soc VENDOR/SOC [--name NAME]
+                                       scaffold device/ (and soc/ if missing) with TODO values
+"""
+import json
+import os
+import subprocess
+import sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
+from tools import boards  # noqa: E402
+
+REQUIRED = ["dram_banks", "gicd_base", "gicd_size", "gicr_base", "gicr_size", "gicr_stride", "timer_freq",
+            "vtimer_intid", "fb_base", "fb_size", "fb_width", "fb_height", "fb_stride", "ufs_base", "ufs_size",
+            "ufs_prdt_byte_gran", "uart_base", "watchdog_bases", "cpu_mpidrs", "cpu_compatibles",
+            "psci_system_reset", "boot_header_version", "decon_base"]
+
+
+def need(board):
+    if board not in boards.BOARDS:
+        sys.exit("unknown device '%s' (see: tools/pix devices)" % board)
+
+
+def cmd_devices(_):
+    print("%-10s %-20s %-18s %s" % ("CODENAME", "NAME", "SOC", "STATUS"))
+    for name, (ddir, sdir, merged, _v) in sorted(boards.load_devices().items()):
+        print("%-10s %-20s %-18s %s" % (name, merged["name"], merged["soc"], merged.get("status", "")))
+
+
+def cmd_info(a):
+    need(a[0])
+    ddir, sdir, merged, values = boards.load_devices()[a[0]]
+    print("device tree:", os.path.relpath(ddir, ROOT), "| soc tree:", os.path.relpath(sdir, ROOT))
+    for k, v in values.items():
+        print("  %-20s %s" % (k, hex(v) if isinstance(v, int) and v > 9 else v))
+
+
+def cmd_check(a):
+    need(a[0])
+    v = boards.BOARDS[a[0]]
+    bad = []
+    for k in REQUIRED:
+        if k not in v:
+            bad.append("missing " + k)
+    if not bad:
+        if v["fb_stride"] != v["fb_width"] * 4:
+            bad.append("fb_stride != fb_width*4 (a8r8g8b8 assumed)")
+        if v["fb_size"] < v["fb_stride"] * v["fb_height"]:
+            bad.append("fb_size smaller than stride*height")
+        if len(v["cpu_mpidrs"]) != len(v["cpu_compatibles"]):
+            bad.append("cpu_mpidrs and cpu_compatibles differ in length")
+        if "xnu_ram" in v and (v["xnu_ram"][0] % (32 << 20) or v["xnu_ram"][1] % (32 << 20)):
+            bad.append("xnu_ram base/size must be multiples of 32 MiB (16K-granule L2 block)")
+        for base, size in v["dram_banks"]:
+            if not size:
+                bad.append("empty DRAM bank")
+        for k in ("gicd_base", "gicr_base", "ufs_base", "timer_freq"):
+            if not v[k]:
+                bad.append(k + " is 0 (TODO?)")
+        if "usb_base" in v:     # optional: boards with a DWC3 the kernel (xnu patch 0082) may drive
+            rng = v.get("usb_dma_range")
+            if not v.get("usb_size", 0) >= 0xd000:
+                bad.append("usb_size missing or smaller than the DWC3 register window (0xd000)")
+            if not (isinstance(rng, tuple) and len(rng) == 2 and rng[1]):
+                bad.append("usb_base needs usb_dma_range [base, size] (the reserved range of the bootloader's event buffer)")
+            elif rng[0] % (16 << 10) or rng[1] % (16 << 10):
+                bad.append("usb_dma_range base/size must be multiples of 16 KiB (XNU maps whole kernel pages)")
+    for b in bad:
+        print("FAIL", b)
+    print("%s: %s" % (a[0], "%d problem(s)" % len(bad) if bad else "ok"))
+    sys.exit(1 if bad else 0)
+
+
+def cmd_build(a):
+    need(a[0])
+    sys.exit(subprocess.call([os.path.join(ROOT, "shim/build.sh"), "--board", a[0]] + a[1:], cwd=ROOT))
+
+
+TEMPLATE_DEVICE = {
+    "name": "TODO", "codename": "TODO", "soc": "TODO", "status": "scaffold: values are placeholders",
+    "dram_banks": [["0x0", "0x0"]], "fb_base": "0x0", "fb_size": "0x0", "fb_width": 0, "fb_height": 0,
+    "fb_stride": 0,
+    "notes": {"how": "Fill these from a probe run of the shim on the device (docs/PORTING.md)."},
+}
+
+
+def cmd_new(a):
+    if not a or "--soc" not in a:
+        sys.exit(__doc__)
+    path = a[0]
+    soc = a[a.index("--soc") + 1]
+    name = a[a.index("--name") + 1] if "--name" in a else "TODO"
+    vendor, code = path.split("/")
+    ddir = os.path.join(ROOT, "device", vendor, code)
+    if os.path.exists(ddir):
+        sys.exit("device/%s already exists" % path)
+    os.makedirs(os.path.join(ddir, "hardware"))
+    dev = dict(TEMPLATE_DEVICE, name=name, codename=code, soc=soc)
+    with open(os.path.join(ddir, "board.json"), "w") as f:
+        json.dump(dev, f, indent=2)
+        f.write("\n")
+    open(os.path.join(ddir, "README.md"), "w").write(
+        "# %s (%s)\n\nSoC: `soc/%s`. Status: scaffold.\n\nCaptures from this device go in `hardware/`.\n" % (name, code, soc))
+    sdir = os.path.join(ROOT, "soc", *soc.split("/"))
+    if not os.path.exists(sdir):
+        os.makedirs(os.path.join(sdir, "shim"))
+        with open(os.path.join(sdir, "soc.json"), "w") as f:
+            json.dump({"name": soc.split("/")[1], "marketing": "TODO", "gicd_base": "0x0", "gicd_size": "0x0",
+                       "gicr_base": "0x0", "gicr_size": "0x0", "gicr_stride": "0x0", "timer_freq": 0,
+                       "vtimer_intid": 27, "ufs_base": "0x0", "ufs_size": "0x0", "ufs_prdt_byte_gran": 0,
+                       "uart_base": "0x0", "watchdog_bases": [], "cpu_mpidrs": [], "cpu_compatibles": [],
+                       "psci_system_reset": "0x84000009", "boot_header_version": 4, "decon_base": "0x0"},
+                      f, indent=2)
+            f.write("\n")
+        print("created soc/%s (placeholders)" % soc)
+    print("created device/%s. Next: tools/pix check %s ; see docs/PORTING.md" % (path, code))
+
+
+def wrap(script):
+    def run(a):
+        sys.exit(subprocess.call([os.path.join(ROOT, "tools", script)] + a, cwd=ROOT))
+    return run
+
+
+COMMANDS = {"xrun": wrap("xrun"), "ci": wrap("ci-kernel"), "stack": wrap("stack-apply"), "phone": wrap("phone-state"), "proposals": wrap("tool-proposals"), "recover": wrap("hang-recover"), "probe": wrap("probe-run"), "devices": cmd_devices, "info": cmd_info, "check": cmd_check, "build": cmd_build, "new-device": cmd_new}
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
+        sys.exit(__doc__)
+    COMMANDS[sys.argv[1]](sys.argv[2:])

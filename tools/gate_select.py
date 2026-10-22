@@ -1,0 +1,49 @@
+#!/usr/bin/env python3
+"""Step selection for `tools/check-all.sh --quick`.
+Usage: gate_select.py STAMP_FILE   -> prints the steps to run (space separated), or FULL when there is no usable stamp."""
+import subprocess, sys
+
+ALL = ["build", "build-fast", "build-usb", "build-wlan", "build-gpu", "build-touch", "build-udump", "host-tests", "boot-safety",
+       "unit", "phone-state", "hang-recover", "probe-run", "rootless", "public-split", "validate"]
+SHIM = ALL[:9]
+# build.sh also extracts headers from xnu patches 0087/0088 for its host tests
+SHIM_PREFIX = ("shim/", "soc/", "device/", "tools/imgmeta", "tools/mk", "tools/test-bluejay-boot.py",
+               "tools/check-all.sh", "tools/gate_select.py", "xnu/patches/0087", "xnu/patches/0088")
+UNIT_PREFIX = ("tools/", "soc/", "device/", "qrlog/", "xnu/qr/", "xnu/patches/0081", "xnu/patches/0086", "xnu/patches/0094")
+
+
+def select(files):
+    """Steps needed for this list of changed paths. validate (patch numbering, headers, script syntax) and public-split (every
+    tracked file assigned to a public repo, ~1 s) always run."""
+    need = {"validate", "public-split"}
+    for f in files:
+        if f.startswith(SHIM_PREFIX):
+            need.update(SHIM)
+        if f.startswith(UNIT_PREFIX):
+            need.update(("unit", "phone-state", "hang-recover", "probe-run", "rootless"))
+    return [s for s in ALL if s in need]
+
+
+def git(*a):
+    return subprocess.run(["git", *a], capture_output=True, text=True)
+
+
+def base_from_stamp(path):
+    try:
+        base = open(path).read().strip()
+    except OSError:
+        return None
+    ok = base and git("cat-file", "-e", base + "^{commit}").returncode == 0 and \
+        git("merge-base", "--is-ancestor", base, "HEAD").returncode == 0
+    return base if ok else None
+
+
+def changed(base):
+    tracked = git("diff", "--name-only", base).stdout.split()
+    new = git("ls-files", "--others", "--exclude-standard").stdout.split()
+    return tracked + new
+
+
+if __name__ == "__main__":
+    b = base_from_stamp(sys.argv[1])
+    print("FULL" if b is None else " ".join(select(changed(b))))

@@ -1,0 +1,70 @@
+|SpringBoard| <CATransformLayer: 0x2817d66c0> - changing property allowsGroupOpacity in transform-only layer, will have no effect
+|SpringBoard| <CATransformLayer: 0x2817d6d00> - changing property allowsEdgeAntialiasing in transform-only layer, will have no eff
+|SpringBoard| <CATransformLayer: 0x2817d6d00> - changing property allowsGroupOpacity in transform-only layer, will have no effect
+|SpringBoard| <CATransformLayer: 0x2817d8c20> - changing property backgroundColor in transform-only layer, will have no effect
+|SpringBoard| <CATransformLayer: 0x2817d8ca0> - changing property allowsEdgeAntialiasing in transform-only layer, will have no eff
+|SpringBoard| <CATransformLayer: 0x2817d8ca0> - changing property allowsGroupOpacity in transform-only layer, will have no effect
+|SpringBoard| <CATransformLayer: 0x2817d8de0> - changing property allowsEdgeAntialiasing in transform-only layer, will have no eff
+|SpringBoard| <CATransformLayer: 0x2817d8de0> - changing property allowsGroupOpacity in transform-only layer, will have no effect
+IOK backboardd: matching1 <dict ID="0"><key>IOProviderClass</key><string ID="1">IOAcceleratorES</string><key>IOServiceNotification
+|SpringBoard| <CATransformLayer: 0x2817c5ca0> - changing property allowsEdgeAntialiasing in transform-only layer, will have no eff
+|SpringBoard| <CATransformLayer: 0x2817c5ca0> - changing property allowsGroupOpacity in transform-only layer, will have no effect
+|SpringBoard| <CATransformLayer: 0x2817c5c80> - changing property allowsEdgeAntialiasing in transform-only layer, will have no eff
+|SpringBoard| <CATransformLayer: 0x2817c5c80> - changing property allowsGroupOpacity in transform-only layer, will have no effect
+|SpringBoard| <CATransformLayer: 0x2817c6020> - changing property allowsEdgeAntialiasing in transform-only layer, will have no eff
+|SpringBoard| <CATransformLayer: 0x2817c6020> - changing property allowsGroupOpacity in transform-only layer, will have no effect
+|SpringBoard| <CATransformLayer: 0x2817c59e0> - changing property allowsEdgeAntialiasing in transform-only layer, will have no eff
+|SpringBoard| <CATransformLayer: 0x2817c59e0> - changing property allowsGroupOpacity in transform-only layer, will have no effect
+|SpringBoard| <CATransformLayer: 0x2817c5b40> - changing property allowsEdgeAntialiasing in transform-only layer, will have no eff
+|SpringBoard| <CATransformLayer: 0x2817c5b40> - changing property allowsGroupOpacity in transform-only layer, will have no effect
+|SpringBoard| 1969-12-31 16:04:14.-368 SpringBoard[26:225] 
+|SpringBoard| <CATransformLayer: 0x2817c5a40> - changing property allowsEdgeAntialiasing in transform-only layer, will have no eff
+|SpringBoard| 
+|SpringBoard| <CATransformLayer: 0x2817c5a40> - changing property allowsGroupOpacity in transform-only layer, will have no effect
+|SpringBoard| <CATransformLayer: 0x2817cef60> - changing property allowsEdgeAntialiasing in transform-only layer, will have no eff
+|SpringBoard| <CATransformLayer: 0x2817cef60> - changing property allowsGroupOpacity in transform-only layer, will have no effect
+|SpringBoard| <CATransformLayer: 0x2817cefa0> - changing property allowsEdgeAntialiasing in transform-only layer, will have no eff
+|SpringBoard| <CATransformLayer: 0x2817cefa0> - changing property allowsGroupOpacity in transform-only layer, will have no effect
+|SpringBoard| <CATransformLayer: 0x2817cefc0> - changing property allowsEdgeAntialiasing in transform-only layer, will have no eff
+|SpringBoard| <CATransformLayer: 0x2817cefc0> - changing property allowsGroupOpacity in transform-only layer, will have no effect
+|SpringBoard| <CATransformLayer: 0x2817cf040> - changing property allowsEdgeAntialiasing in transform-only layer, will have no eff
+|SpringBoard| <CATransformLayer: 0x2817cf040> - changing property allowsGroupOpacity in transform-only layer, will have no effect
+|SpringBoard| trying to set state of nil layer.
+exec xpcproxy
+|SpringBoard| <CATransformLayer: 0x2816d8240> - changing property allowsEdgeAntialiasing in transform-only layer, will have no eff
+|SpringBoard| <CATransformLayer: 0x2816d8240> - changing property allowsGroupOpacity in transform-only layer, will have no effect
+|SpringBoard| <CATransformLayer: 0x2816ea2c0> - changing property allowsEdgeAntialiasing in transform-only layer, will have no eff
+|SpringBoard| <CATransformLayer: 0x2816ea2c0> - changing property allowsGroupOpacity in transform-only layer, will have no effect
+|SpringBoard| <CATransformLayer: 0x28167e4c0> - changing property allowsEdgeAntialiasing in transform-only layer, will have no eff
+|SpringBoard| <CATransformLayer: 0x28167e4c0> - changing property allowsGroupOpacity in transform-only layer, will have no effect
+|SpringBoard| <CATransformLayer: 0x28167dfa0> - changing property allowsEdgeAntialiasing in transform-only layer, will have no eff
+|SpringBoard| <CATransformLayer: 0x28167dfa0> - changing property allowsGroupOpacity in transform-only layer, will have no effect
+|SpringBoard| <CATransformLayer: 0x28167d2c0> - changing property allowsEdgeAntialiasing in transform-only layer, will have no eff
+|SpringBoard| <CATransformLayer: 0x28167d2c0> - changing property allowsGroupOpacity in transform-only layer, will have no effect
+|SpringBoard| <CATransformLayer: 0x2816cc520> - changing property allowsGroupBlending in transform-only layer, will have no effect
+|SpringBoard| <CATransformLayer: 0x2816ea2c0> - changing property allowsGroupBlending in transform-only layer, will have no effect
+|SpringBoard| <CATransformLayer: 0x2816d8240> - changing property allowsGroupBlending in transform-only layer, will have no effect
+|SpringBoard| <CATransformLayer: 0x281720c20> - changing property allowsEdgeAntialiasing in transform-only layer, will have no eff
+|SpringBoard| <CATransformLayer: 0x281720c20> - changing property allowsGroupOpacity in transform-only layer, will have no effect
+|SpringBoard| <CATransformLayer: 0x281720be0> - changing property allowsEdgeAntialiasing in transform-only layer, will have no eff
+|SpringBoard| <CATransformLayer: 0x281720be0> - changing property allowsGroupOpacity in transform-only layer, will have no effect
+|SpringBoard| <CATransformLayer: 0x281720b60> - changing property allowsEdgeAntialiasing in transform-only layer, will have no eff
+|SpringBoard| <CATransformLayer: 0x281720b60> - changing property allowsGroupOpacity in transform-only layer, will have no effect
+|SpringBoard| 1969-12-31 16:04:15.-922 SpringBoard[26:225] 
+|SpringBoard| <CATransformLayer: 0x28172ea00> - changing property allowsEdgeAntialiasing in transform-only layer, will have no eff
+|SpringBoard| 
+|SpringBoard| <CATransformLayer: 0x28172ea00> - changing property allowsGroupOpacity in transform-only layer, will have no effect
+|SpringBoard| <CATransformLayer: 0x28172eba0> - changing property allowsEdgeAntialiasing in transform-only layer, will have no eff
+|SpringBoard| <CATransformLayer: 0x28172eba0> - changing property allowsGroupOpacity in transform-only layer, will have no effect
+|SpringBoard| <CATransformLayer: 0x28172ebc0> - changing property allowsEdgeAntialiasing in transform-only layer, will have no eff
+|SpringBoard| <CATransformLayer: 0x28172ebc0> - changing property allowsGroupOpacity in transform-only layer, will have no effect
+SWEET FB: swap 7 layer 0 surface 2 1125x2436 fmt 0x42475241 bpr 4608 a 0,0 1125x2436 b 0,0 1125x2436
+SWEET SURF: SpringBoard create id 7 75x144 fmt 0x4c413038 bpe 2 bpr 160 planes 0 size 32768 keys 6 -> 0x0
+SWEET AKS: SpringBoard sel 27 arg0 2 in 2/0 out 0/0 -> 0x0
+SWEET AKS: SpringBoard sel 8 arg0 0 in 1/0 out 0/0 -> 0xe00002c7
+exec AccessibilityUIServer
+CRASH CollectionsPoste[265] sig 9 code 0x0 sub 0x0 slide 0x268d0000 mh 0x1044a4000
+CRASH CollectionsPoste pc 0x1aeb77a84 lr 0x1aeb77a6c sp 0x16b953ab0 fp 0x16b953ae0 far 0x280dac000
+CRASH CollectionsPoste bt 0x1aeb77928 0x1aec70fd8 0x1d273d540 0x1d2748aa4 0x1d2744e54 0x1aec961f4 0x1aec79f48 0x1aeddf214 0x1aedde
+CRASH CollectionsPoste reason ns 7 code 0x3: extension check-in timeout
+SWEET AKS: contextstored sel 17 arg0 0 in 1/0 out 0/4096 -> 0x0

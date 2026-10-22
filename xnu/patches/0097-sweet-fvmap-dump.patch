@@ -1,0 +1,67 @@
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -123,6 +123,51 @@
+ 	return true;
+ }
+ 
++/*
++ * Read-only dump of the ACPM DVFS frequency/voltage map (fvmap) from the APM SRAM, boot-arg sweetfvmap=<physical address>.
++ * Layout: soc/gs cal-if/fvmap.h (struct fvmap_header, 24 bytes, one per ACPM_DVFS_* index; CPUCL0/1/2 = 2/3/4 from
++ * dt-bindings/clock/gs101.h) and fvmap.c (rate_volt table at sram_base + o_ratevolt). The address is not in code: Google DT
++ * gs101.dtsi has APM SRAM 0x2039000 + fvmap_addr 0x31000 (acpm_ipc node) [read from source, not yet checked on this phone];
++ * every header field is range-checked and printed raw so a wrong address shows up as garbage, not as a trusted value.
++ */
++extern "C" vm_offset_t ml_io_map(vm_offset_t, vm_size_t);   /* osfmk/arm/machine_routines.h:703, XNU-private */
++#define SWEET_FVMAP_BYTES  0x2000u
++#define SWEET_FVMAP_NDOM   14u
++static void
++sweet_fvmap_dump(uint64_t pa)
++{
++	const uint64_t page = 0x4000;
++	uint64_t base = pa & ~(page - 1), end = (pa + SWEET_FVMAP_BYTES + page - 1) & ~(page - 1);
++	vm_offset_t va = ml_io_map((vm_offset_t)base, (vm_size_t)(end - base));
++
++	if (va == 0) {
++		IOLog("SWEET FVMAP: ml_io_map(%#llx) failed\n", pa);
++		return;
++	}
++	const volatile uint8_t *m = (const volatile uint8_t *)(va + (vm_offset_t)(pa - base));
++	IOLog("SWEET FVMAP: pa=%#llx\n", pa);
++	for (unsigned int i = 0; i < SWEET_FVMAP_NDOM; i++) {
++		const volatile uint8_t *h = m + 24u * i;
++		unsigned int nlv = h[1], init = h[8];
++		unsigned int o_rv = h[20] | (h[21] << 8);
++		IOLog("SWEET FVMAP: dom %u type=%u num_of_lv=%u num_of_members=%u init_lv=%u o_ratevolt=%#x\n",
++		    i, h[0], nlv, h[2], init, o_rv);
++		if (i < 2 || i > 4) {
++			continue;   /* only CPUCL0/1/2 tables */
++		}
++		if (nlv == 0 || nlv > 32 || o_rv + 8u * nlv > SWEET_FVMAP_BYTES || (o_rv & 3u)) {
++			IOLog("SWEET FVMAP: dom %u table rejected (nlv=%u o_ratevolt=%#x)\n", i, nlv, o_rv);
++			continue;
++		}
++		for (unsigned int l = 0; l < nlv; l++) {
++			const volatile uint8_t *e = m + o_rv + 8u * l;
++			uint32_t rate = e[0] | (e[1] << 8) | (e[2] << 16) | ((uint32_t)e[3] << 24);
++			uint32_t volt = e[4] | (e[5] << 8) | (e[6] << 16) | ((uint32_t)e[7] << 24);
++			IOLog("SWEET FVMAP: dom %u lv %u rate=%u volt=%u%s\n", i, l, rate, volt, l == init ? " <- init_lv" : "");
++		}
++	}
++}
++
+ /* Do not wait in a nub's start(): matching can be asynchronous or serialized. */
+ void
+ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+@@ -182,6 +227,12 @@
+ 	ml_set_max_cpus(topology->max_cpu_id + 1);
+ 	IOLog("SWEET CPU: %u/%u CPUs initialized, SGI1 verified\n",
+ 	    topology->num_cpus, topology->num_cpus);
++	{
++		uint64_t fvpa = 0;
++		if (PE_parse_boot_argn("sweetfvmap", &fvpa, sizeof(fvpa)) && fvpa != 0) {
++			sweet_fvmap_dump(fvpa);
++		}
++	}
+ 	thread_terminate(current_thread());
+ }
+ 

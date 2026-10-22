@@ -1,0 +1,2 @@
+UDUMP OK first=2290150 blocks=256 bytes=1048576 crc32=242DE7D8 rate=0.22 MiB/s
+saved logs/udump-20261021T130315Z.bin

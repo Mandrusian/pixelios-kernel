@@ -1,0 +1,64 @@
+#!/bin/bash
+# Do xnu/patches/*.sh (stagers) and *.patch apply cleanly, in order, on a pristine xnu-8796.141.3? ONE short report.
+#   tools/stack-apply [--only-new PATCH] [--keep]
+#   --only-new PATCH   still applies the whole stack, but the verdict is about PATCH (name, path or number, e.g. 0088)
+#   --keep             keep the scratch copy (printed) for inspection
+# Pristine clone (shallow, made on first use, needs network): ~/pixelios-artifacts/xnu-pristine. The scratch copy lives under
+# ~/pixelios-artifacts/scratch/ (SSD, never /tmp) and is deleted afterwards. Stagers fetch libpthread/bearssl/hfs from GitHub;
+# `xcrun` is stubbed (empty TargetConditionals.h) as in docs/research/14-patch-audit.md. Like CI (dxb) the .sh run first.
+# Progress: ~/pixelios-artifacts/scratch/stack-apply.log. Exit: 0 PASS, 1 FAIL, 2 ERROR.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+ROOT=$PWD
+A=${ARTIFACTS:-$HOME/pixelios-artifacts}
+TAG=xnu-8796.141.3
+only=""; keep=0
+while [ $# -gt 0 ]; do case "$1" in
+	--only-new) only=$2; shift 2 ;; --keep) keep=1; shift ;;
+	*) echo "unknown option $1 (see the header of tools/stack-apply)" >&2; exit 2 ;; esac; done
+mkdir -p "$A/scratch"; LOG=$A/scratch/stack-apply.log; : >"$LOG"
+W=""
+cleanup() { [ -z "$W" ] || [ "$keep" = 1 ] || rm -rf -- "$W"; }
+trap cleanup EXIT
+finish() { local res=$1; shift; { echo "RESULT: $res $1"; shift; [ $# -eq 0 ] || printf '%s\n' "$@"; echo "log: $LOG"; }; case $res in PASS) exit 0 ;; ERROR) exit 2 ;; *) exit 1 ;; esac; }
+
+P=$A/xnu-pristine
+if [ ! -d "$P/.git" ]; then
+	rm -rf -- "$P"
+	git clone -q --depth 1 --branch "$TAG" https://github.com/apple-oss-distributions/xnu "$P" >>"$LOG" 2>&1 || { rm -rf -- "$P"; finish ERROR "cannot clone pristine $TAG (network?)" "$(tail -n 3 "$LOG")"; }
+fi
+[ "$(git -C "$P" describe --tags --exact-match 2>/dev/null)" = "$TAG" ] || finish ERROR "$P is not at tag $TAG (delete it to re-clone)"
+W=$(mktemp -d "$A/scratch/stack-XXXXXX")
+cp -a "$P/." "$W/"
+mkdir -p "$W/.stub/sdk/usr/include"; : >"$W/.stub/sdk/usr/include/TargetConditionals.h"
+printf '#!/bin/sh\necho "%s"\n' "$W/.stub/sdk" >"$W/.stub/xcrun"; chmod +x "$W/.stub/xcrun"
+cd "$W"
+
+stagers=("$ROOT"/xnu/patches/*.sh); patches=("$ROOT"/xnu/patches/*.patch)
+for s in "${stagers[@]}"; do
+	env MACHINE_CONFIG=SWEET MACOS_VERSION=13.5 PATH="$W/.stub:$PATH" bash "$s" >>"$LOG" 2>&1 \
+		|| finish ERROR "stager $(basename "$s") failed (network?)" "$(tail -n 5 "$LOG" | cut -c1-200)"
+done
+total=${#patches[@]}; ok=0; failed=""; err=""; onlyname=""; onlyok=""
+if [ -n "$only" ]; then
+	for p in "${patches[@]}"; do case "$(basename "$p")" in "$(basename "$only")"|"$only"-*|"$only".patch) onlyname=$(basename "$p") ;; esac; done
+	[ -n "$onlyname" ] || finish ERROR "--only-new $only matches no xnu/patches/*.patch"
+fi
+for p in "${patches[@]}"; do
+	n=$(basename "$p")
+	if e=$(git apply --check "$p" 2>&1) && git apply "$p" >>"$LOG" 2>&1; then
+		ok=$((ok + 1)); [ "$n" != "$onlyname" ] || onlyok=1
+	else
+		failed=$n; err=$(printf '%s\n' "$e" | head -n 10 | cut -c1-200); break
+	fi
+done
+st="${#stagers[@]} stagers"
+if [ -z "$failed" ]; then
+	if [ -n "$only" ]; then finish PASS "$onlyname applies cleanly (whole stack: $ok/$total patches + $st on $TAG)"; fi
+	finish PASS "$ok/$total patches (+ $st) apply cleanly in order on $TAG"
+fi
+if [ -n "$only" ]; then
+	if [ -n "$onlyok" ]; then why="$onlyname applied, but LATER patch $failed fails"
+	else why="$onlyname not applied: patch $failed fails first"; [ "$failed" = "$onlyname" ] && why="$onlyname FAILS to apply"; fi
+else why="$ok/$total ok, first failure $failed ($((total - ok - 1)) not tried)"; fi
+finish FAIL "$why" "FIRST FAILURE $failed (git apply error, 10 lines):" "$err"

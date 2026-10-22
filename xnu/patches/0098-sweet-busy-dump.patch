@@ -1,0 +1,57 @@
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -168,6 +168,38 @@
+ 	}
+ }
+ 
++/*
++ * Registry-busy dump, boot-arg sweetbusy=<seconds> (3 dumps, that far apart; absent = off). configd's InterfaceNamer holds
++ * SCNetworkInterfaceCopyAll (so Settings -> About) until IOKit is quiet, observed run about1 [4+ minutes]; getBusyState() of a
++ * service counts its own holds plus its children's (adjustBusy propagates to the provider) [read from source IOService.cpp], so
++ * the busy services with no busy child are the ones holding it. Read-only.
++ */
++static void
++sweet_busy_dump(unsigned int n)
++{
++	IOService *root = IOService::getServiceRoot();
++	IORegistryIterator *it = IORegistryIterator::iterateOver(gIOServicePlane, kIORegistryIterateRecursively);
++
++	IOLog("SWEET BUSY %u: root busy=%u\n", n, root ? (unsigned)root->getBusyState() : 0u);
++	if (it == NULL) {
++		return;
++	}
++	IORegistryEntry *e;
++	do {
++		it->reset();
++		while ((e = it->getNextObjectRecursive())) {
++			IOService *s = OSDynamicCast(IOService, e);
++			if (s != NULL && s->getBusyState() != 0) {
++				IORegistryEntry *p = s->getParentEntry(gIOServicePlane);
++				IOLog("SWEET BUSY %u: %s class=%s busy=%u state=%#llx provider=%s\n", n, s->getName(),
++				    s->getMetaClass()->getClassName(), (unsigned)s->getBusyState(), (uint64_t)s->getState(),
++				    p ? p->getName() : "-");
++			}
++		}
++	} while (!it->isValid());
++	it->release();
++}
++
+ /* Do not wait in a nub's start(): matching can be asynchronous or serialized. */
+ void
+ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+@@ -233,6 +265,15 @@
+ 			sweet_fvmap_dump(fvpa);
+ 		}
+ 	}
++	{
++		unsigned int busy_s = 0;
++		if (PE_parse_boot_argn("sweetbusy", &busy_s, sizeof(busy_s)) && busy_s != 0) {
++			for (unsigned int n = 0; n < 3; n++) {
++				IOSleep(busy_s * 1000u);
++				sweet_busy_dump(n);
++			}
++		}
++	}
+ 	thread_terminate(current_thread());
+ }
+ 

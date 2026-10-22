@@ -1,0 +1,903 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index a5edaa3..88a8bfb 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -112,6 +112,7 @@ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/sweet_keys_gs101.c		standard
++bsd/dev/sweet_touch_gs101.c		standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/sweet_ftm5.h b/bsd/dev/sweet_ftm5.h
+new file mode 100644
+index 0000000..f24d945
+--- /dev/null
++++ b/bsd/dev/sweet_ftm5.h
+@@ -0,0 +1,152 @@
++/*
++ * STMicro FTM5 ("ALIX", chip id 0x36 0x48) wire protocol: the pure parts of the Pixel 6a touch driver
++ * (bsd/dev/sweet_touch_gs101.c). No kernel headers, so shim/ftm5_host_test.c builds this file with plain cc.
++ *
++ * Every constant is from Google's downstream driver, repo kernel/google-modules/touch/fts_touch,
++ * branch android-gs-bluejay-5.10-android13-qpr3 (commit f87fd67f), directory ftm5/. "fts.c:N" etc. are
++ * lines of that tree. The driver is the SPI build (SPI_INETERFACE, ftsHardware.h:60).
++ */
++#ifndef SWEET_FTM5_H
++#define SWEET_FTM5_H
++
++#include <stdint.h>
++
++#define FTM5_CMD_HW_REG_R     0xFB   /* fts_lib/ftsHardware.h:195 (SPI build) */
++#define FTM5_CMD_HW_REG_W     0xFA   /* fts_lib/ftsHardware.h:183 */
++#define FTM5_CMD_FIFO_READ    0x87   /* FIFO_CMD_READALL, fts_lib/ftsHardware.h:171 (SPI build) */
++#define FTM5_CMD_SCAN_MODE    0xA0   /* fts_lib/ftsSoftware.h:70 */
++#define FTM5_SCAN_ACTIVE      0x00   /* fts_lib/ftsSoftware.h:99 */
++#define FTM5_SCAN_ALL         0xFF   /* fts.c:5624: "enable all the possible scans mode" */
++#define FTM5_DUMMY_BYTES      1      /* DUMMY_HW_REG / DUMMY_FIFO, fts_lib/ftsHardware.h:212,218 */
++#define FTM5_ADDR_DCHIP_ID    0x20000000u  /* ADDR_DCHIP_ID, fts_lib/ftsHardware.h:270 */
++#define FTM5_EVENT_SIZE       8      /* FIFO_EVENT_SIZE, fts_lib/ftsHardware.h:161 */
++#define FTM5_FIFO_DEPTH       32     /* fts_lib/ftsHardware.h:163 */
++#define FTM5_TOUCH_ID_MAX     10     /* fts.h:203 */
++#define FTM5_SPI_DELAY_CS_US  10     /* SPI_DELAY_CS, fts_lib/ftsHardware.h:64: wait before raising CS */
++
++/* Event ID byte 0 (fts_lib/ftsSoftware.h:377-383). The driver dispatches on the high nibble (fts.c:4570). */
++#define FTM5_EVT_NOEVENT          0x00
++#define FTM5_EVT_CONTROLLER_READY 0x03
++#define FTM5_EVT_ENTER_POINT      0x13
++#define FTM5_EVT_MOTION_POINT     0x23
++#define FTM5_EVT_LEAVE_POINT      0x33
++
++/* Touch type, low nibble of byte 1 (fts_lib/ftsSoftware.h:550-556). */
++#define FTM5_TYPE_HOVER   0x0
++#define FTM5_TYPE_FINGER  0x1
++#define FTM5_TYPE_GLOVE   0x2
++#define FTM5_TYPE_STYLUS  0x3
++#define FTM5_TYPE_PALM    0x4
++#define FTM5_TYPE_GRIP    0x7
++
++enum ftm5_kind {
++	FTM5_NONE = 0,     /* empty slot, stop reading */
++	FTM5_READY,        /* controller ready (after reset) */
++	FTM5_DOWN,         /* contact present: enter or motion of a finger/glove/stylus */
++	FTM5_UP,           /* contact left */
++	FTM5_CANCEL,       /* palm or grip: the contact is not a finger, release it */
++	FTM5_IGNORED,      /* status/user/debug/error events, hover, bad ids */
++};
++
++struct ftm5_ev {
++	enum ftm5_kind kind;
++	unsigned id;       /* touch id 0..9 */
++	int x, y;          /* raw panel coordinates (0..max-coords) */
++};
++
++/* Build the read of a 32-bit hardware register: opcode + big-endian address (fts_lib/ftsIO.c:633-664, the
++ * address is emitted most significant byte first with ADDR_SIZE_HW_REG = BITS_32). Returns the length (5).
++ * The reply carries FTM5_DUMMY_BYTES of junk first. */
++static inline unsigned
++ftm5_hwreg_read_cmd(uint8_t *cmd, uint32_t addr)
++{
++	cmd[0] = FTM5_CMD_HW_REG_R;
++	cmd[1] = (uint8_t)(addr >> 24);
++	cmd[2] = (uint8_t)(addr >> 16);
++	cmd[3] = (uint8_t)(addr >> 8);
++	cmd[4] = (uint8_t)addr;
++	return 5;
++}
++
++/* Compare the first two bytes of the chip-id register with the expected pair.
++ * 1 = same order as st,dchip_id (fts.h:299), 2 = swapped, 0 = no match. The byte order of the register is a
++ * GUESS (the downstream tree does not read it back), hence both orders are reported. */
++static inline int
++ftm5_chip_id_match(const uint8_t *got, const uint8_t *want)
++{
++	if (got[0] == want[0] && got[1] == want[1]) {
++		return 1;
++	}
++	if (got[0] == want[1] && got[1] == want[0]) {
++		return 2;
++	}
++	return 0;
++}
++
++/* Number of events still queued behind this one: byte 7 bits 4:0, at most FIFO_DEPTH-1 (fts.c:4523-4551). */
++static inline unsigned
++ftm5_events_remaining(const uint8_t *ev)
++{
++	unsigned n = ev[7] & 0x1fu;
++	return n > FTM5_FIFO_DEPTH - 1 ? FTM5_FIFO_DEPTH - 1 : n;
++}
++
++/* Decode one 8-byte FIFO event. Layout from fts_enter_pointer_event_handler (fts.c:3046-3069) and the leave
++ * handler (fts.c:3206-3216): byte 1 = id<<4 | type, x = (b3 & 0xf) << 8 | b2, y = b4 << 4 | b3 >> 4. */
++static inline struct ftm5_ev
++ftm5_parse_event(const uint8_t *e)
++{
++	struct ftm5_ev r = { FTM5_IGNORED, 0, 0, 0 };
++	unsigned type = e[1] & 0x0fu;
++
++	if (e[0] == FTM5_EVT_NOEVENT) {
++		r.kind = FTM5_NONE;
++		return r;
++	}
++	if (e[0] == FTM5_EVT_CONTROLLER_READY) {
++		r.kind = FTM5_READY;
++		return r;
++	}
++	if (e[0] != FTM5_EVT_ENTER_POINT && e[0] != FTM5_EVT_MOTION_POINT && e[0] != FTM5_EVT_LEAVE_POINT) {
++		return r;
++	}
++	r.id = e[1] >> 4;
++	if (r.id >= FTM5_TOUCH_ID_MAX) {
++		return r;           /* "Invalid touch ID", fts.c:3063: not reported */
++	}
++	if (e[0] == FTM5_EVT_LEAVE_POINT) {
++		r.kind = FTM5_UP;   /* every known type releases (fts.c:3232-3250) */
++		return r;
++	}
++	r.x = ((int)(e[3] & 0x0fu) << 8) | e[2];
++	r.y = ((int)e[4] << 4) | (e[3] >> 4);
++	switch (type) {
++	case FTM5_TYPE_FINGER:
++	case FTM5_TYPE_GLOVE:
++	case FTM5_TYPE_STYLUS:  /* GUESS: STYLUS_MODE is not known to be built; the fallthrough there is finger */
++		r.kind = FTM5_DOWN;
++		break;
++	case FTM5_TYPE_PALM:
++	case FTM5_TYPE_GRIP:
++		r.kind = FTM5_CANCEL;   /* fts.c:3122-3138 reports these as MT_TOOL_PALM */
++		break;
++	default:                /* hover (touch_condition = 0, fts.c:3139-3141) or unknown */
++		break;
++	}
++	return r;
++}
++
++/* Map a raw coordinate 0..max_in onto 0..size-1 (identity for the 1079x2399 -> 1080x2400 panel). */
++static inline int
++ftm5_scale(int v, int max_in, int size)
++{
++	if (max_in <= 0 || size <= 1 || v <= 0) {
++		return 0;
++	}
++	if (v >= max_in) {
++		return size - 1;
++	}
++	return (int)((int64_t)v * (size - 1) / max_in);
++}
++
++#endif /* SWEET_FTM5_H */
+diff --git a/bsd/dev/sweet_touch_gs101.c b/bsd/dev/sweet_touch_gs101.c
+new file mode 100644
+index 0000000..8b44f74
+--- /dev/null
++++ b/bsd/dev/sweet_touch_gs101.c
+@@ -0,0 +1,707 @@
++/*
++ * Pixel 6a (gs101, "bluejay") touchscreen: STMicro FTM5 over SPI11, polled, reported through
++ * sweet_hid_touch() (iokit/Kernel/arm/hid/SweetHID.cpp). Design and unknowns: docs/research/15-touch-gs101.md.
++ *
++ * Silent no-op unless the ADT has /sweet-touch (tools/mkadt.py adds it only for boards whose board.json has a
++ * touch_chip_id), so the Redmi Note 10 Pro tree is unchanged. Every address, pin and limit comes from that node.
++ *
++ * Boot-args:
++ *   sweettouch=0|1|2     0 off; 1 identify only (phase 1); 2 identify, then enable and poll (phase 2, default)
++ *   sweettouchdelay=S    seconds to wait before the first register access (default 45): a bus hang then
++ *                        happens after the GUI and the persistent log got there first
++ *   sweettouchmux=1      drive the AP/AOC mux (TS_SPI_SEL) low = AP if the AP is not already driving it low
++ *
++ * Sources ("Linux" = mainline v6.12, "DS-gs" = kernel/gs android-gs-bluejay-5.10-android13-qpr3, FTM5 = the
++ * fts_touch module of the same branch, see sweet_ftm5.h):
++ *  - SPI engine registers/PIO flow: Linux drivers/spi/spi-s3c64xx.c (S3C64XX_SPI_* defines :29-:110,
++ *    s3c64xx_flush_fifo :227, s3c64xx_enable_datapath :488, s3c64xx_wait_for_pio :614, s3c64xx_spi_hwinit :1118,
++ *    gs101_spi_port_config :1617 = 64-entry FIFO, 32-bit register access only, clock from CMU).
++ *  - USI: Linux drivers/soc/samsung/exynos-usi.c (SW_CONF bits :19-:25, USI_CON/USI_OPTION :28-:34). The USI block
++ *    position (engine + 0xc0) is taken from the mainline usi1.. nodes (gs101.dtsi:378) and applied to USI11 by analogy: GUESS.
++ *  - Pins: Linux drivers/pinctrl/samsung/pinctrl-exynos-arm64.c (exynos850_bank_type_off :47: CON 4 bits/pin at +0,
++ *    DAT 1 bit/pin at +4, PUD at +8), DS-gs gs101-pinctrl.dtsi:1024-1036 (spi11_bus function 2, spi11_cs function 1).
++ *  - Board wiring: DS-gs gs101-common-touch.dtsi:8-17, 63-100, gs101-fts-touch.dtsi:8-39.
++ * Not verifiable here, so unverified: the CMU gate/rate of the USI11 clock (the SPI clock is clk_from_cmu), the
++ * state ABL leaves the pins/USI in, whether the S2MPG10 rails LDO25M/LDO26M are on.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <mach/mach_time.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include <libkern/libkern.h>
++#include <stdint.h>
++#include "sweet_ftm5.h"
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_deallocate(thread_t);
++extern kern_return_t thread_terminate(thread_t);
++extern void sweet_hid_touch(int finger, int down, int x, int y);
++void sweet_touch_gs101_init(void);
++
++#define TG_COMPAT        "google,gs101-ftm5-spi"
++#define TG_PAGE          0x4000u          /* kernel page: ml_io_map maps whole pages */
++
++/* Samsung pad controller (see header comment) */
++#define PIN_CON          0x00u
++#define PIN_DAT          0x04u
++#define PIN_PUD          0x08u
++#define PIN_FUNC_INPUT   0u
++#define PIN_FUNC_OUTPUT  1u
++
++/* SPI engine (spi-s3c64xx.c) */
++#define SPI_CH_CFG       0x00u
++#define SPI_CLK_CFG      0x04u
++#define SPI_MODE_CFG     0x08u
++#define SPI_CS_REG       0x0cu
++#define SPI_INT_EN       0x10u
++#define SPI_STATUS       0x14u
++#define SPI_TX_DATA      0x18u
++#define SPI_RX_DATA      0x1cu
++#define SPI_PACKET_CNT   0x20u
++#define SPI_PENDING_CLR  0x24u
++#define SPI_SWAP_CFG     0x28u
++#define SPI_FB_CLK       0x2cu
++#define CH_SW_RST        (1u << 5)
++#define CH_RXCH_ON       (1u << 1)
++#define CH_TXCH_ON       (1u << 0)
++#define CH_HS_EN         (1u << 6)
++#define PKT_CNT_EN       (1u << 16)
++#define ST_RX_LVL(v)     (((v) >> 15) & 0x1ffu)  /* S3C64XX_SPI_ST_RX_FIFO_RDY_V2 = GENMASK(23, 15) */
++#define ST_TX_LVL(v)     (((v) >> 6) & 0x1ffu)   /* S3C64XX_SPI_ST_TX_FIFO_RDY_V2 = GENMASK(14, 6) */
++#define MODE_TRAILCNT    (0x3ffu << 19)          /* S3C64XX_SPI_MAX_TRAILCNT << S3C64XX_SPI_TRAILCNT_OFF */
++#define PND_ERR_CLR      0x1eu                   /* RX/TX over/underrun clear bits 4:1, spi_hwinit :1141 */
++#define SPI_FIFO_BYTES   64u                     /* gs101_spi_port_config.fifo_depth */
++
++/* USI (exynos-usi.c) */
++#define USI_CON          0x04u
++#define USI_CON_RESET    (1u << 0)
++
++struct tg_pin {
++	uint64_t bank_pa;    /* physical address of the bank's CON register */
++	uint32_t pin;
++	vm_offset_t va;
++};
++
++static struct {
++	uint64_t spi_pa, spi_size, usi_mode_pa;
++	uint32_t usi_off, usi_mode_spi, usi_mode_mask, spi_func, max_hz;
++	uint32_t chip_id[2], max_x, max_y, width, height;
++	struct tg_pin clk, mosi, miso, cs, irq, reset, mux;
++	vm_offset_t spi, usi, usi_mode;
++	int mode, mux_force;
++	uint32_t delay_s;
++	int sleep_chan;
++	bool down[FTM5_TOUCH_ID_MAX];
++	int last_x[FTM5_TOUCH_ID_MAX], last_y[FTM5_TOUCH_ID_MAX];
++} tg;
++
++static uint32_t
++tg_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++tg_wr(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(base + off) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static uint64_t
++tg_now_us(void)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / 1000u;
++}
++
++static void
++tg_sleep_ms(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&tg.sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++/* Map the page(s) around [pa, pa+len) and return the virtual address of pa. */
++static vm_offset_t
++tg_map(uint64_t pa, uint64_t len)
++{
++	uint64_t base = pa & ~(uint64_t)(TG_PAGE - 1u);
++	uint64_t end = (pa + len + TG_PAGE - 1u) & ~(uint64_t)(TG_PAGE - 1u);
++	vm_offset_t va = ml_io_map((vm_offset_t)base, (vm_size_t)(end - base));
++	return va ? va + (vm_offset_t)(pa - base) : 0;
++}
++
++/* ---- pins ---- */
++
++static bool
++tg_pin_map(struct tg_pin *p)
++{
++	p->va = tg_map(p->bank_pa, 0x20);
++	return p->va != 0;
++}
++
++static uint32_t
++tg_pin_func(const struct tg_pin *p)
++{
++	return (tg_rd(p->va, PIN_CON) >> (p->pin * 4u)) & 0xfu;
++}
++
++static void
++tg_pin_set_func(const struct tg_pin *p, uint32_t f)
++{
++	uint32_t v = tg_rd(p->va, PIN_CON);
++	v &= ~(0xfu << (p->pin * 4u));
++	v |= (f & 0xfu) << (p->pin * 4u);
++	tg_wr(p->va, PIN_CON, v);
++}
++
++static int
++tg_pin_get(const struct tg_pin *p)
++{
++	return (int)((tg_rd(p->va, PIN_DAT) >> p->pin) & 1u);
++}
++
++static void
++tg_pin_put(const struct tg_pin *p, int val)
++{
++	uint32_t v = tg_rd(p->va, PIN_DAT);
++	v = val ? (v | (1u << p->pin)) : (v & ~(1u << p->pin));
++	tg_wr(p->va, PIN_DAT, v);
++}
++
++static void
++tg_pin_report(const char *name, const struct tg_pin *p)
++{
++	printf("SWEET TOUCH: pin %-5s bank %#llx[%u] func=%#x dat=%d pud=%#x\n", name,
++	    (unsigned long long)p->bank_pa, p->pin, tg_pin_func(p), tg_pin_get(p),
++	    (tg_rd(p->va, PIN_PUD) >> (p->pin * 4u)) & 0xfu);
++}
++
++/* ---- SPI engine: polled PIO, mode 0, 8 bits per word ---- */
++
++static void
++tg_spi_flush(void)
++{
++	uint32_t v;
++	uint64_t t0;
++
++	tg_wr(tg.spi, SPI_PACKET_CNT, 0);
++	v = tg_rd(tg.spi, SPI_CH_CFG) & ~(CH_RXCH_ON | CH_TXCH_ON);
++	tg_wr(tg.spi, SPI_CH_CFG, v);
++	v = (tg_rd(tg.spi, SPI_CH_CFG) | CH_SW_RST) & ~CH_HS_EN;
++	tg_wr(tg.spi, SPI_CH_CFG, v);
++	t0 = tg_now_us();
++	while (ST_TX_LVL(tg_rd(tg.spi, SPI_STATUS)) && tg_now_us() - t0 < 1000u) {
++	}
++	t0 = tg_now_us();
++	while (ST_RX_LVL(tg_rd(tg.spi, SPI_STATUS)) && tg_now_us() - t0 < 1000u) {
++		(void)tg_rd(tg.spi, SPI_RX_DATA);
++	}
++	tg_wr(tg.spi, SPI_CH_CFG, tg_rd(tg.spi, SPI_CH_CFG) & ~CH_SW_RST);
++	tg_wr(tg.spi, SPI_MODE_CFG, MODE_TRAILCNT);   /* byte-wide channel and bus, no DMA, no 4-burst */
++}
++
++/* One burst of len bytes (len <= 64) with the chip select already low. tx may be NULL (zeros are clocked out),
++ * rx may be NULL (the received bytes are dropped). Returns 0 or -1 on timeout. */
++static int
++tg_spi_burst(const uint8_t *tx, uint8_t *rx, unsigned len)
++{
++	uint32_t chcfg;
++	uint64_t t0;
++	unsigned i;
++
++	if (len == 0 || len > SPI_FIFO_BYTES) {
++		return -1;
++	}
++	tg_spi_flush();
++	chcfg = (tg_rd(tg.spi, SPI_CH_CFG) & ~CH_TXCH_ON) | CH_RXCH_ON;
++	tg_wr(tg.spi, SPI_PACKET_CNT, len | PKT_CNT_EN);
++	for (i = 0; i < len; i++) {
++		tg_wr(tg.spi, SPI_TX_DATA, tx ? tx[i] : 0u);   /* byte per 32-bit write: use_32bit_io */
++	}
++	tg_wr(tg.spi, SPI_CH_CFG, chcfg | CH_TXCH_ON);
++	t0 = tg_now_us();
++	while (ST_RX_LVL(tg_rd(tg.spi, SPI_STATUS)) < len) {
++		if (tg_now_us() - t0 > 20000u) {   /* 64 bytes at even 100 kHz take 5 ms */
++			tg_wr(tg.spi, SPI_CH_CFG, tg_rd(tg.spi, SPI_CH_CFG) & ~(CH_RXCH_ON | CH_TXCH_ON));
++			return -1;
++		}
++	}
++	for (i = 0; i < len; i++) {
++		uint32_t d = tg_rd(tg.spi, SPI_RX_DATA);
++		if (rx) {
++			rx[i] = (uint8_t)d;
++		}
++	}
++	tg_wr(tg.spi, SPI_CH_CFG, tg_rd(tg.spi, SPI_CH_CFG) & ~(CH_RXCH_ON | CH_TXCH_ON));
++	return 0;
++}
++
++/* The FTM5 transaction shape of fts_lib/ftsIO.c:174-262: write ncmd bytes, then read nrd bytes, one chip-select
++ * assertion (two spi_transfers in one spi_message). nrd = 0 is a plain write (ftsIO.c:264). */
++static int
++tg_xfer(const uint8_t *cmd, unsigned ncmd, uint8_t *rd, unsigned nrd)
++{
++	int err;
++
++	tg_pin_put(&tg.cs, 0);                 /* chip select is active low (spi mode 0, no spi-cs-high) */
++	delay(1);
++	err = tg_spi_burst(cmd, NULL, ncmd);
++	if (!err && nrd) {
++		err = tg_spi_burst(NULL, rd, nrd);
++	}
++	delay(FTM5_SPI_DELAY_CS_US);
++	tg_pin_put(&tg.cs, 1);
++	delay(2);
++	return err;
++}
++
++/* Read n bytes after the cmd, dropping the leading dummy byte (DUMMY_HW_REG / DUMMY_FIFO). n <= 48. */
++static int
++tg_read(const uint8_t *cmd, unsigned ncmd, uint8_t *out, unsigned n)
++{
++	uint8_t buf[FTM5_DUMMY_BYTES + 48];
++	unsigned i;
++
++	if (n > 48u) {
++		return -1;
++	}
++	if (tg_xfer(cmd, ncmd, buf, FTM5_DUMMY_BYTES + n)) {
++		return -1;
++	}
++	for (i = 0; i < n; i++) {
++		out[i] = buf[FTM5_DUMMY_BYTES + i];
++	}
++	return 0;
++}
++
++/* ---- ADT ---- */
++
++static bool
++tg_dt_u32(DTEntry node, const char *name, uint32_t *out, unsigned count)
++{
++	uint32_t const *p = NULL;
++	unsigned int size = 0;
++	if (SecureDTGetProperty(node, name, (void const **)&p, &size) != kSuccess || size < count * 4u) {
++		printf("SWEET TOUCH: /sweet-touch has no usable \"%s\"\n", name);
++		return false;
++	}
++	for (unsigned i = 0; i < count; i++) {
++		out[i] = p[i];
++	}
++	return true;
++}
++
++static bool
++tg_dt_u64(DTEntry node, const char *name, uint64_t *out, unsigned count)
++{
++	uint64_t const *p = NULL;
++	unsigned int size = 0;
++	if (SecureDTGetProperty(node, name, (void const **)&p, &size) != kSuccess || size < count * 8u) {
++		printf("SWEET TOUCH: /sweet-touch has no usable \"%s\"\n", name);
++		return false;
++	}
++	for (unsigned i = 0; i < count; i++) {
++		out[i] = p[i];
++	}
++	return true;
++}
++
++static bool
++tg_dt_pin(DTEntry node, const char *name, struct tg_pin *pin)
++{
++	uint64_t v[2];
++	if (!tg_dt_u64(node, name, v, 2) || v[1] > 7) {
++		return false;
++	}
++	pin->bank_pa = v[0];
++	pin->pin = (uint32_t)v[1];
++	return true;
++}
++
++static bool
++tg_parse(DTEntry node)
++{
++	uint64_t reg[2], mode_reg[1];
++	uint32_t u[2];
++
++	if (!tg_dt_u64(node, "reg", reg, 2) || !tg_dt_u32(node, "usi-regs-offset", &tg.usi_off, 1) ||
++	    !tg_dt_u64(node, "usi-mode-reg", mode_reg, 1) ||
++	    !tg_dt_u32(node, "usi-mode-spi", &tg.usi_mode_spi, 1) ||
++	    !tg_dt_u32(node, "usi-mode-mask", &tg.usi_mode_mask, 1) ||
++	    !tg_dt_u32(node, "spi-pin-func", &tg.spi_func, 1) || !tg_dt_u32(node, "max-hz", &tg.max_hz, 1) ||
++	    !tg_dt_u32(node, "chip-id", tg.chip_id, 2) || !tg_dt_u32(node, "max-coords", u, 2) ||
++	    !tg_dt_pin(node, "pin-clk", &tg.clk) || !tg_dt_pin(node, "pin-mosi", &tg.mosi) ||
++	    !tg_dt_pin(node, "pin-miso", &tg.miso) || !tg_dt_pin(node, "pin-cs", &tg.cs) ||
++	    !tg_dt_pin(node, "pin-irq", &tg.irq) || !tg_dt_pin(node, "pin-reset", &tg.reset) ||
++	    !tg_dt_pin(node, "pin-mux", &tg.mux)) {
++		return false;
++	}
++	tg.spi_pa = reg[0];
++	tg.spi_size = reg[1];
++	tg.usi_mode_pa = mode_reg[0];
++	tg.max_x = u[0];
++	tg.max_y = u[1];
++	if (!tg_dt_u32(node, "screen", u, 2)) {
++		return false;
++	}
++	tg.width = u[0];
++	tg.height = u[1];
++	return tg.spi_size >= 0x100 && tg.usi_off + 0x20 <= tg.spi_size && tg.max_x && tg.max_y &&
++	       tg.width > 1 && tg.height > 1 && tg.spi_func < 16;
++}
++
++/* ---- bring-up ---- */
++
++static bool
++tg_map_all(void)
++{
++	tg.spi = tg_map(tg.spi_pa, tg.spi_size);
++	tg.usi_mode = tg_map(tg.usi_mode_pa, 4);
++	tg.usi = tg.spi ? tg.spi + (vm_offset_t)tg.usi_off : 0;
++	return tg.spi && tg.usi_mode && tg_pin_map(&tg.clk) && tg_pin_map(&tg.mosi) && tg_pin_map(&tg.miso) &&
++	       tg_pin_map(&tg.cs) && tg_pin_map(&tg.irq) && tg_pin_map(&tg.reset) && tg_pin_map(&tg.mux);
++}
++
++/* Phase 0: only reads of the pad controllers and the USI mode register. Returns false when the AP must not
++ * touch the bus. */
++static bool
++tg_report_and_check_mux(void)
++{
++	uint32_t usi_mode = tg_rd(tg.usi_mode, 0);
++	bool ap_drives_low;
++
++	printf("SWEET TOUCH: sysreg USI11 mode (%#llx) = %#x (SPI = %#x, so %s)\n",
++	    (unsigned long long)tg.usi_mode_pa, usi_mode, tg.usi_mode_spi,
++	    (usi_mode & tg.usi_mode_mask) == tg.usi_mode_spi ? "already SPI" : "not SPI yet");
++	tg_pin_report("clk", &tg.clk);
++	tg_pin_report("mosi", &tg.mosi);
++	tg_pin_report("miso", &tg.miso);
++	tg_pin_report("cs", &tg.cs);
++	tg_pin_report("irq", &tg.irq);
++	tg_pin_report("reset", &tg.reset);
++	tg_pin_report("mux", &tg.mux);
++	ap_drives_low = tg_pin_func(&tg.mux) == PIN_FUNC_OUTPUT && tg_pin_get(&tg.mux) == 0;
++	printf("SWEET TOUCH: AP/AOC mux: %s\n", ap_drives_low ? "AP drives it low = the AP owns the bus" :
++	    "AP is NOT driving it low, the bus may belong to the AOC");
++	if (!ap_drives_low) {
++		if (!tg.mux_force) {
++			printf("SWEET TOUCH: leaving the bus alone; boot-arg sweettouchmux=1 drives the mux low\n");
++			return false;
++		}
++		tg_pin_put(&tg.mux, 0);
++		tg_pin_set_func(&tg.mux, PIN_FUNC_OUTPUT);
++		printf("SWEET TOUCH: sweettouchmux=1: mux driven low, now func=%#x dat=%d\n",
++		    tg_pin_func(&tg.mux), tg_pin_get(&tg.mux));
++	}
++	return true;
++}
++
++/* Phase 1a: USI to SPI mode, SPI pads, SPI engine init (exynos_usi_set_sw_conf + exynos_usi_enable +
++ * s3c64xx_spi_hwinit). Returns false if the engine does not look alive. */
++static bool
++tg_spi_setup(void)
++{
++	uint32_t v;
++
++	v = tg_rd(tg.usi_mode, 0);
++	if ((v & tg.usi_mode_mask) != tg.usi_mode_spi) {
++		tg_wr(tg.usi_mode, 0, (v & ~tg.usi_mode_mask) | tg.usi_mode_spi);
++	}
++	v = tg_rd(tg.usi, USI_CON);
++	printf("SWEET TOUCH: USI_CON=%#x (bit0 = reset), USI mode now %#x\n", v, tg_rd(tg.usi_mode, 0));
++	if (v & USI_CON_RESET) {
++		tg_wr(tg.usi, USI_CON, v & ~USI_CON_RESET);
++		delay(1);
++	}
++	/* chip select: high (inactive) before it becomes an output */
++	tg_pin_put(&tg.cs, 1);
++	tg_pin_set_func(&tg.cs, PIN_FUNC_OUTPUT);
++	tg_pin_set_func(&tg.clk, tg.spi_func);
++	tg_pin_set_func(&tg.mosi, tg.spi_func);
++	tg_pin_set_func(&tg.miso, tg.spi_func);
++
++	printf("SWEET TOUCH: SPI regs before init: ch=%#x clk=%#x mode=%#x status=%#x fb=%#x\n",
++	    tg_rd(tg.spi, SPI_CH_CFG), tg_rd(tg.spi, SPI_CLK_CFG), tg_rd(tg.spi, SPI_MODE_CFG),
++	    tg_rd(tg.spi, SPI_STATUS), tg_rd(tg.spi, SPI_FB_CLK));
++	tg_wr(tg.spi, SPI_INT_EN, 0);
++	tg_wr(tg.spi, SPI_MODE_CFG, 0);
++	tg_wr(tg.spi, SPI_PACKET_CNT, 0);
++	tg_wr(tg.spi, SPI_PENDING_CLR, PND_ERR_CLR);
++	tg_wr(tg.spi, SPI_PENDING_CLR, 0);
++	tg_wr(tg.spi, SPI_SWAP_CFG, 0);
++	tg_wr(tg.spi, SPI_CH_CFG, 0);              /* CPOL = 0, CPHA = 0 (no spi-cpol/cpha in the DT), master */
++	tg_wr(tg.spi, SPI_FB_CLK, 1);              /* samsung,spi-feedback-delay = <1>, gs101-fts-touch.dtsi:35 */
++	tg_spi_flush();
++	printf("SWEET TOUCH: SPI regs after init:  ch=%#x clk=%#x mode=%#x status=%#x fb=%#x (max %u Hz; the\n"
++	    "SWEET TOUCH: actual SCK = CMU ipclk / 4 and is unverified)\n",
++	    tg_rd(tg.spi, SPI_CH_CFG), tg_rd(tg.spi, SPI_CLK_CFG), tg_rd(tg.spi, SPI_MODE_CFG),
++	    tg_rd(tg.spi, SPI_STATUS), tg_rd(tg.spi, SPI_FB_CLK), tg.max_hz);
++	return true;
++}
++
++static bool
++tg_identify(void)
++{
++	uint8_t cmd[5], id[4] = { 0 }, want[2];
++	int match;
++
++	want[0] = (uint8_t)tg.chip_id[0];
++	want[1] = (uint8_t)tg.chip_id[1];
++	cmd[0] = 0;
++	(void)ftm5_hwreg_read_cmd(cmd, FTM5_ADDR_DCHIP_ID);
++	if (tg_read(cmd, sizeof(cmd), id, sizeof(id))) {
++		printf("SWEET TOUCH: identify: SPI transfer timed out (no clock, or the pads are not the SPI function)\n");
++		return false;
++	}
++	match = ftm5_chip_id_match(id, want);
++	printf("SWEET TOUCH: identify: reg %#x = %02x %02x %02x %02x, want %02x %02x -> %s\n", FTM5_ADDR_DCHIP_ID,
++	    id[0], id[1], id[2], id[3], want[0], want[1],
++	    match == 1 ? "FTM5 answers" : match == 2 ? "FTM5 answers (bytes swapped)" :
++	    (id[0] == 0xff && id[1] == 0xff) ? "no answer, MISO high (rails off, in reset, or bus not ours?)" :
++	    (id[0] == 0 && id[1] == 0) ? "no answer, MISO low (rails off, in reset, or bus not ours?)" :
++	    "unexpected value");
++	return match != 0;
++}
++
++/* ---- phase 2 ---- */
++
++static void
++tg_release_all(void)
++{
++	for (unsigned i = 0; i < FTM5_TOUCH_ID_MAX; i++) {
++		if (tg.down[i]) {
++			tg.down[i] = false;
++			sweet_hid_touch((int)i, 0, tg.last_x[i], tg.last_y[i]);
++		}
++	}
++}
++
++static void
++tg_handle(const uint8_t *e, unsigned *logged)
++{
++	struct ftm5_ev ev = ftm5_parse_event(e);
++
++	switch (ev.kind) {
++	case FTM5_DOWN:
++		tg.last_x[ev.id] = ftm5_scale(ev.x, (int)tg.max_x, (int)tg.width);
++		tg.last_y[ev.id] = ftm5_scale(ev.y, (int)tg.max_y, (int)tg.height);
++		tg.down[ev.id] = true;
++		sweet_hid_touch((int)ev.id, 1, tg.last_x[ev.id], tg.last_y[ev.id]);
++		break;
++	case FTM5_UP:
++	case FTM5_CANCEL:
++		if (tg.down[ev.id]) {
++			tg.down[ev.id] = false;
++			sweet_hid_touch((int)ev.id, 0, tg.last_x[ev.id], tg.last_y[ev.id]);
++		}
++		break;
++	case FTM5_READY:
++		printf("SWEET TOUCH: controller ready event\n");
++		break;
++	case FTM5_NONE:
++		return;
++	default:
++		break;
++	}
++	if (ev.kind != FTM5_DOWN || *logged < 40u) {
++		if (*logged < 200u) {
++			printf("SWEET TOUCH: ev %02x %02x %02x %02x %02x %02x %02x %02x -> kind %d id %u raw %d,%d\n",
++			    e[0], e[1], e[2], e[3], e[4], e[5], e[6], e[7], (int)ev.kind, ev.id, ev.x, ev.y);
++			(*logged)++;
++		}
++	}
++}
++
++/* Drain the event FIFO the way fts_interrupt_handler does (fts.c:4547-4560): one event, then the remaining count
++ * from its byte 7. Returns -1 on a bus error, else the number of events handled. */
++static int
++tg_drain(unsigned *logged)
++{
++	static const uint8_t cmd[1] = { FTM5_CMD_FIFO_READ };
++	uint8_t first[FTM5_EVENT_SIZE];
++	unsigned remaining, handled = 1;
++
++	if (tg_read(cmd, 1, first, FTM5_EVENT_SIZE)) {
++		return -1;
++	}
++	if (first[0] == FTM5_EVT_NOEVENT) {
++		return 0;
++	}
++	tg_handle(first, logged);
++	remaining = ftm5_events_remaining(first);
++	while (remaining) {
++		uint8_t buf[6 * FTM5_EVENT_SIZE];
++		unsigned n = remaining > 6u ? 6u : remaining;
++		if (tg_read(cmd, 1, buf, n * FTM5_EVENT_SIZE)) {
++			return -1;
++		}
++		for (unsigned i = 0; i < n; i++) {
++			tg_handle(buf + i * FTM5_EVENT_SIZE, logged);
++			handled++;
++		}
++		remaining -= n;
++	}
++	return (int)handled;
++}
++
++/* fts_system_reset (fts_lib/ftsCore.c:66-108) with a reset gpio: low, 10 ms, high, wait for CONTROLLER_READY. */
++static bool
++tg_reset_and_ready(unsigned *logged)
++{
++	static const uint8_t cmd[1] = { FTM5_CMD_FIFO_READ };
++	uint64_t t0;
++
++	tg_pin_put(&tg.reset, 0);
++	tg_pin_set_func(&tg.reset, PIN_FUNC_OUTPUT);
++	tg_sleep_ms(10);
++	tg_pin_put(&tg.reset, 1);
++	t0 = tg_now_us();
++	while (tg_now_us() - t0 < 1500000u) {   /* GENERAL_TIMEOUT is not known: 1.5 s, GUESS */
++		uint8_t e[FTM5_EVENT_SIZE];
++		if (tg_read(cmd, 1, e, FTM5_EVENT_SIZE)) {
++			return false;
++		}
++		if (e[0] != FTM5_EVT_NOEVENT && *logged < 200u) {
++			/* boot events are only logged: nothing is reported to HID before the controller is ready */
++			printf("SWEET TOUCH: boot ev %02x %02x %02x %02x %02x %02x %02x %02x\n",
++			    e[0], e[1], e[2], e[3], e[4], e[5], e[6], e[7]);
++			(*logged)++;
++		}
++		if (ftm5_parse_event(e).kind == FTM5_READY) {
++			return true;
++		}
++		tg_sleep_ms(5);
++	}
++	return false;
++}
++
++/* setScanMode(SCAN_MODE_ACTIVE, 0xFF), fts_lib/ftsCore.c:339-366: first a write whose meaning the downstream
++ * source does not explain (cmd1, repeated in setFeatures and writeSysCmd), then the scan-mode command. */
++static bool
++tg_enable_scan(void)
++{
++	static const uint8_t cmd1[7] = { FTM5_CMD_HW_REG_W, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00 };
++	static const uint8_t cmd[3] = { FTM5_CMD_SCAN_MODE, FTM5_SCAN_ACTIVE, FTM5_SCAN_ALL };
++
++	return tg_xfer(cmd1, sizeof(cmd1), NULL, 0) == 0 && tg_xfer(cmd, sizeof(cmd), NULL, 0) == 0;
++}
++
++static void
++tg_run(void)
++{
++	unsigned logged = 0, errors = 0;
++
++	printf("SWEET TOUCH: gs101 FTM5 driver, mode %d, starting in %u s\n", tg.mode, tg.delay_s);
++	tg_sleep_ms(tg.delay_s * 1000u);
++	printf("SWEET TOUCH: mapping SPI %#llx, USI mode %#llx and the pad banks\n",
++	    (unsigned long long)tg.spi_pa, (unsigned long long)tg.usi_mode_pa);
++	if (!tg_map_all()) {
++		printf("SWEET TOUCH: MMIO mapping failed\n");
++		return;
++	}
++	if (!tg_report_and_check_mux() || !tg_spi_setup()) {
++		return;
++	}
++	if (!tg_identify()) {
++		printf("SWEET TOUCH: phase 1 result: chip did not answer; nothing else is touched\n");
++		return;
++	}
++	if (tg.mode < 2) {
++		printf("SWEET TOUCH: phase 1 done (sweettouch=1): identify only\n");
++		return;
++	}
++	printf("SWEET TOUCH: phase 2: reset pulse, scan enable, poll\n");
++	if (!tg_reset_and_ready(&logged)) {
++		printf("SWEET TOUCH: no controller-ready event after the reset pulse (GUESS: continuing)\n");
++	}
++	if (!tg_enable_scan()) {
++		printf("SWEET TOUCH: scan-mode write failed, stopping\n");
++		return;
++	}
++	printf("SWEET TOUCH: scanning, %dx%d raw -> %ux%u\n", (int)tg.max_x + 1, (int)tg.max_y + 1, tg.width, tg.height);
++	for (;;) {
++		int n = tg_drain(&logged);
++		if (n < 0) {
++			if (errors++ % 100u == 0) {
++				printf("SWEET TOUCH: FIFO read failed (%u)\n", errors);
++			}
++			if (errors == 10) {
++				tg_release_all();
++			}
++		} else {
++			errors = 0;
++		}
++		tg_sleep_ms(n > 0 ? 1 : 8);
++	}
++}
++
++static void
++tg_thread(void *arg, wait_result_t result)
++{
++	(void)arg;
++	(void)result;
++	tg_run();
++	(void)thread_terminate(current_thread());   /* every early exit above ends here, as the old drivers did */
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++void
++sweet_touch_gs101_init(void)
++{
++	static int started;
++	DTEntry node;
++	char const *compat = NULL;
++	unsigned int csize = 0;
++	int mode = 2, delay_s = 45, mux = 0;
++	thread_t thread;
++
++	if (started) {
++		return;
++	}
++	started = 1;
++	if (SecureDTLookupEntry(NULL, "/sweet-touch", &node) != kSuccess ||
++	    SecureDTGetProperty(node, "compatible", (void const **)&compat, &csize) != kSuccess ||
++	    compat == NULL || csize < sizeof(TG_COMPAT) || strncmp(compat, TG_COMPAT, sizeof(TG_COMPAT)) != 0) {
++		return;    /* not this board: stay silent */
++	}
++	(void)PE_parse_boot_argn("sweettouch", &mode, sizeof(mode));
++	if (mode <= 0) {
++		printf("SWEET TOUCH: gs101 driver disabled (sweettouch=%d)\n", mode);
++		return;
++	}
++	if (mode > 2) {
++		mode = 2;
++	}
++	(void)PE_parse_boot_argn("sweettouchdelay", &delay_s, sizeof(delay_s));
++	(void)PE_parse_boot_argn("sweettouchmux", &mux, sizeof(mux));
++	if (delay_s < 0 || delay_s > 3600) {
++		delay_s = 45;
++	}
++	if (!tg_parse(node)) {
++		printf("SWEET TOUCH: /sweet-touch is incomplete, driver not started\n");
++		return;
++	}
++	tg.mode = mode;
++	tg.delay_s = (uint32_t)delay_s;
++	tg.mux_force = mux == 1;
++	if (kernel_thread_start(tg_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 95db214..ff5f54c 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -54,6 +54,7 @@ extern void sweet_sample_start(void);
+ extern void sweet_restart_poll(void);   /* bsd/dev/sweet_restart.c */
+ extern void sweet_usb_probe(void);
+ extern void sweet_keys_gs101_start(void);   /* bsd/dev/sweet_keys_gs101.c, no-op without ADT /sweet-keys */
++extern void sweet_touch_gs101_init(void);
+ 
+ #define REG_CAP         0x00
+ #define REG_IS          0x20
+@@ -689,6 +690,7 @@ sweet_ufs_init(void)
+ 	sweet_sample_start();
+ 	sweet_usb_probe();
+ 	sweet_keys_gs101_start();
++	sweet_touch_gs101_init();     /* no-op without the ADT node /sweet-touch (bluejay only) */
+ 	return 0;
+ }
+ 

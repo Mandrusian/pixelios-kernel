@@ -1,0 +1,296 @@
+#!/usr/bin/env python3
+"""tool-proposals: the tool-proposal register (docs/TOOL-PROPOSALS.md, docs/tool-proposals/TP-NNN-slug.md).
+
+  tools/tool-proposals list [--index]        id, tool, status; --index prints the markdown table of the README
+  tools/tool-proposals check NAME_OR_KEYWORD exists in tools/, tools/pix, docs/AUTOMATION.md, or already proposed?
+  tools/tool-proposals new NAME [--extends X] [--related TP-NNN] [--force]
+                                             write the next free TP-NNN-slug.md (does not edit the index)
+  tools/tool-proposals validate              front matter, sections, ids, references, README index in sync
+
+check: last line `RESULT: EXISTS|ALREADY-PROPOSED|NONE ...`, exit 0 NONE / 1 hit / 2 error.
+validate: last line `RESULT: PASS|FAIL ...`, exit 0 / 1 / 2. No device access; writes only docs/tool-proposals/.
+Env TP_ROOT overrides the repo root (tests).
+"""
+import datetime, os, re, sys
+
+ROOT = os.environ.get("TP_ROOT") or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PDIR = os.path.join(ROOT, "docs", "tool-proposals")
+README = os.path.join(ROOT, "docs", "TOOL-PROPOSALS.md")
+FIELDS = ["id", "tool", "status", "proposed_by", "date", "exposed_by", "extends", "related", "usage", "refs"]
+OPTIONAL_EMPTY = ("extends", "related")
+STATUSES = ("proposed", "approved", "building", "done", "rejected", "superseded")
+SECTIONS = ["checked", "why", "output", "risks", "amendments"]
+FNAME = re.compile(r"^TP-(\d{3})-([a-z0-9][a-z0-9-]*)\.md$")
+
+TEMPLATE = """---
+id: {id}
+tool: "{tool}"
+status: proposed
+proposed_by: "<model> (<role: driver|delegate|reviewer>)"
+date: {date}
+exposed_by: "<the run/session/step that showed the need>"
+extends: "{extends}"
+related: "{related}"
+usage: "{tool} [flags]"
+refs: "-"
+---
+
+## checked
+<what you looked at, why none fits; related TP ids or `none`>
+
+## why
+<manual work or waiting removed, with the measured cost>
+
+## output
+<report shape: last line `RESULT: ...`, exit codes 0/1/2, log dir>
+
+## risks
+<devices touched, timeouts, what must never happen (AGENTS.md hard rules); `none` if none>
+
+## amendments
+(none)
+"""
+
+
+class Err(Exception):
+    pass
+
+
+def parse(path):
+    """-> (front matter dict, body text). Strict: flat `key: "value"` / `key: value` between two `---` lines."""
+    lines = open(path, encoding="utf-8").read().split("\n")
+    if not lines or lines[0] != "---" or "---" not in lines[1:]:
+        raise Err("no front matter (--- block) at top")
+    end = lines.index("---", 1)
+    fm = {}
+    for n, ln in enumerate(lines[1:end], 2):
+        m = re.match(r'^([a-z_]+): (?:"(.*)"|([^"#\s][^#]*?))\s*(?:#.*)?$', ln)
+        if not m:
+            raise Err("line %d not `key: value`: %r" % (n, ln[:40]))
+        if m.group(1) in fm:
+            raise Err("duplicate key " + m.group(1))
+        fm[m.group(1)] = m.group(2) if m.group(2) is not None else m.group(3)
+    return fm, "\n".join(lines[end + 1:])
+
+
+def files():
+    if not os.path.isdir(PDIR):
+        raise Err("missing " + PDIR)
+    return sorted(f for f in os.listdir(PDIR) if f.endswith(".md"))
+
+
+def load():
+    """-> list of (filename, fm, body, parse error)."""
+    out = []
+    for f in files():
+        try:
+            fm, body = parse(os.path.join(PDIR, f))
+            out.append((f, fm, body, None))
+        except Err as e:
+            out.append((f, {}, "", str(e)))
+    return out
+
+
+def section(body, name):
+    m = re.search(r"^## %s[ \t]*\n(.*?)(?=^## |\Z)" % name, body, re.M | re.S)
+    return None if m is None else m.group(1).strip()
+
+
+def index_lines(props):
+    rows = ["| id | tool | status |", "|---|---|---|"]
+    for f, fm, body, err in props:
+        if err:
+            continue
+        am = section(body, "amendments")
+        flag = " (amended)" if am not in (None, "", "(none)") else ""
+        rows.append("| %s | %s | %s%s |" % (fm.get("id", "?"), fm.get("tool", "?"), fm.get("status", "?"), flag))
+    return rows
+
+
+def readme_table():
+    if not os.path.isfile(README):
+        raise Err("missing " + README)
+    rows, on = [], False
+    for ln in open(README, encoding="utf-8").read().split("\n"):
+        if ln.startswith("|"):
+            on = True
+            rows.append(ln.rstrip())
+        elif on:
+            break
+    return rows
+
+
+def cmd_list(a):
+    props = load()
+    if a == ["--index"]:
+        print("\n".join(index_lines(props)))
+        return 0
+    if a:
+        raise Err("usage: list [--index]")
+    for f, fm, body, err in props:
+        print("%-7s %-50s %s" % (fm.get("id", f), fm.get("tool", "?"), fm.get("status", err and "BAD-FRONT-MATTER")))
+    return 0
+
+
+def pix_commands():
+    p = os.path.join(ROOT, "tools", "pix")
+    if not os.path.isfile(p):
+        return []
+    return re.findall(r"^\s+tools/pix ([a-z][\w-]*)", open(p, encoding="utf-8").read(), re.M)
+
+
+def hits(word):
+    """-> (exists lines, proposed lines)"""
+    w = word.lower()
+    ex, pr = [], []
+    tdir = os.path.join(ROOT, "tools")
+    if os.path.isdir(tdir):
+        ex += ["EXISTS tools/" + f for f in sorted(os.listdir(tdir)) if w in f.lower() and not f.startswith("__")]
+    ex += ["EXISTS tools/pix " + c for c in pix_commands() if w in c.lower()]
+    auto = os.path.join(ROOT, "docs", "AUTOMATION.md")
+    if os.path.isfile(auto):
+        ex += ["EXISTS docs/AUTOMATION.md: " + ln.strip() for ln in open(auto, encoding="utf-8").read().split("\n")
+               if ln.startswith("#") and w in ln.lower()]
+    for f, fm, body, err in load():
+        if not err and (w in fm.get("tool", "").lower() or w in fm.get("usage", "").lower()):
+            pr.append("PROPOSED %s (%s)" % (fm.get("id", f), fm.get("status", "?")))
+    return ex, pr
+
+
+def cmd_check(a):
+    if len(a) != 1:
+        raise Err("usage: check NAME_OR_KEYWORD")
+    ex, pr = hits(a[0])
+    for ln in ex + pr:
+        print(ln)
+    kind = "EXISTS" if ex else "ALREADY-PROPOSED" if pr else "NONE"
+    print("RESULT: %s %s exists=%d proposed=%d" % (kind, a[0], len(ex), len(pr)))
+    return 1 if ex or pr else 0
+
+
+def cmd_new(a):
+    force = "--force" in a
+    a = [x for x in a if x != "--force"]
+    opts = {"--extends": "", "--related": ""}
+    rest = []
+    i = 0
+    while i < len(a):
+        if a[i] in opts and i + 1 < len(a):
+            opts[a[i]] = a[i + 1]
+            i += 2
+        else:
+            rest.append(a[i])
+            i += 1
+    if len(rest) != 1 or rest[0].startswith("-"):
+        raise Err("usage: new NAME [--extends X] [--related TP-NNN] [--force]")
+    name = rest[0]
+    ex, pr = hits(name)
+    if (ex or pr) and not force:
+        for ln in ex + pr:
+            print(ln)
+        print("RESULT: %s %s (use --force, or amend the existing proposal)" % ("EXISTS" if ex else "ALREADY-PROPOSED", name))
+        return 1
+    ids = [int(m.group(1)) for f in files() for m in [FNAME.match(f)] if m]
+    n = max(ids, default=0) + 1
+    slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+    if not slug:
+        raise Err("bad NAME")
+    tool = name if "/" in name or " " in name else "tools/" + name
+    path = os.path.join(PDIR, "TP-%03d-%s.md" % (n, slug))
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(TEMPLATE.format(id="TP-%03d" % n, tool=tool, date=datetime.date.today().isoformat(),
+                                extends=opts["--extends"], related=opts["--related"]))
+    print(os.path.relpath(path, ROOT))
+    return 0
+
+
+def ref_ok(token, ids):
+    token = token.strip()
+    if re.fullmatch(r"TP-\d{3}", token):
+        return token in ids
+    return os.path.exists(os.path.join(ROOT, token.split()[0]))
+
+
+def cmd_validate(a):
+    if a:
+        raise Err("usage: validate")
+    props = load()
+    bad = []
+    ids = {fm["id"] for f, fm, b, e in props if "id" in fm}
+    seen = {}
+    nums = []
+    for f, fm, body, err in props:
+        m = FNAME.match(f)
+        if not m:
+            bad.append("%s: file name is not TP-NNN-slug.md" % f)
+        if err:
+            bad.append("%s: %s" % (f, err))
+            continue
+        for k in FIELDS:
+            v = fm.get(k)
+            if v is None:
+                bad.append("%s: missing field %s" % (f, k))
+            elif not v.strip() and k not in OPTIONAL_EMPTY:
+                bad.append("%s: empty field %s" % (f, k))
+            elif v.strip() and k not in OPTIONAL_EMPTY and (re.search(r"<[^>]*>", v) or v.strip().upper() == "TODO"):
+                bad.append("%s: field %s is still a placeholder" % (f, k))
+        for k in fm:
+            if k not in FIELDS:
+                bad.append("%s: unknown field %s" % (f, k))
+        i = fm.get("id", "")
+        if not re.fullmatch(r"TP-\d{3}", i):
+            bad.append("%s: id %r is not TP-NNN" % (f, i))
+        else:
+            nums.append(int(i[3:]))
+            if m and m.group(1) != i[3:]:
+                bad.append("%s: file name id differs from front matter id %s" % (f, i))
+            if i in seen:
+                bad.append("%s: duplicate id %s (also %s)" % (f, i, seen[i]))
+            seen[i] = f
+        if fm.get("status") not in STATUSES:
+            bad.append("%s: status %r not in %s" % (f, fm.get("status"), "/".join(STATUSES)))
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", fm.get("date", "")):
+            bad.append("%s: date must be YYYY-MM-DD" % f)
+        for k in OPTIONAL_EMPTY:
+            for t in filter(None, (x.strip() for x in fm.get(k, "").split(","))):
+                if not ref_ok(t, ids):
+                    bad.append("%s: %s references unknown %r" % (f, k, t))
+        for s in SECTIONS:
+            c = section(body, s)
+            if c is None:
+                bad.append("%s: missing section ## %s" % (f, s))
+            elif not c:
+                bad.append("%s: empty section ## %s" % (f, s))
+    if sorted(nums) != list(range(1, len(nums) + 1)):
+        bad.append("ids not contiguous from TP-001: %s" % ", ".join("TP-%03d" % n for n in sorted(nums)))
+    want, have = index_lines(props), readme_table()
+    if want != have:
+        bad.append("docs/TOOL-PROPOSALS.md index out of sync with the files (compare `tools/tool-proposals list --index`)")
+        for w in want:
+            if w not in have:
+                bad.append("  missing/different in README: " + w)
+        for h in have:
+            if h not in want:
+                bad.append("  extra/different in README: " + h)
+    for b in bad[:10]:
+        print("  " + b)
+    if len(bad) > 10:
+        print("  ... %d more" % (len(bad) - 10))
+    print("RESULT: %s %d proposals, %d problems" % ("FAIL" if bad else "PASS", len(props), len(bad)))
+    return 1 if bad else 0
+
+
+def main(argv):
+    cmds = {"list": cmd_list, "check": cmd_check, "new": cmd_new, "validate": cmd_validate}
+    if not argv or argv[0] not in cmds:
+        sys.stderr.write(__doc__)
+        return 2
+    try:
+        return cmds[argv[0]](argv[1:])
+    except (Err, OSError) as e:
+        print("RESULT: ERROR %s" % e)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

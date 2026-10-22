@@ -1,0 +1,28 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -616,6 +616,17 @@
+ 	char want[64] = "userdata";
+ 	int error;
+ 
++	/*
++	 * USB first (docs/research/09): a UFS failure is when the live log is needed most.
++	 * Independent of UFS (own DMA, own thread); sweetusb=0 returns at once; once only, this
++	 * function runs again if the first attempt failed.
++	 */
++	static bool usb_probed;
++	if (!usb_probed) {
++		usb_probed = true;
++		sweet_usb_probe();
++	}
++
+ 	if (SecureDTLookupEntry(NULL, "/sweet-ufs", &node) != kSuccess ||
+ 	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||
+ 	    size < 2 * sizeof(uintptr_t)) {
+@@ -688,7 +699,6 @@
+ 	    su.writable ? "read-write" : "read-only", su.dma_pa);
+ 	sweet_log_start();
+ 	sweet_sample_start();
+-	sweet_usb_probe();
+ 	sweet_keys_gs101_start();
+ 	sweet_touch_gs101_init();     /* no-op without the ADT node /sweet-touch (bluejay only) */
+ 	return 0;

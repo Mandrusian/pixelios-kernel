@@ -1,0 +1,21 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -279,10 +279,17 @@
+ 	AppleCLCD *fb = (AppleCLCD *)owner;
+ 	uint64_t now = mach_absolute_time();
+ 	uint64_t count = ++fb->fVsyncCount;
++	/*
++	 * CA::WindowServer::IOMFBServer::vsync_callback(fb, a1, a2, a3, refcon): a2 is the vsync's host time and
++	 * a2 + a3 the next one (a3 = the refresh period). a3 was 0, so CA saw every frame deadline as already past
++	 * (ios-flame 0121: 15.8 -> 21 fps on their swipe benchmark; read from their source, unmeasured here).
++	 */
++	uint64_t period;
++	nanoseconds_to_absolutetime((uint64_t)SWEET_FB_VSYNC_US * 1000, &period);
+ 	uint64_t values[6] = {
+ 		(uint32_t)count, (uint32_t)(count >> 32),
+ 		(uint32_t)now, (uint32_t)(now >> 32),
+-		0, 0,
++		(uint32_t)period, (uint32_t)(period >> 32),
+ 	};
+ 
+ 	IOLockLock(fb->fLock);

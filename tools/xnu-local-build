@@ -1,0 +1,651 @@
+#!/bin/bash
+# Build the patched XNU kernel on this Linux box (no Mac, no Xcode) the way CI (.github/workflows/xnu.yml -> blacktop
+# darwin-xnu-build) does, and compare it with a CI kernel. ONE report ending RESULT: PASS|FAIL|ERROR.
+#   tools/xnu-local-build [--stack DIR] [--label NAME] [--jobs N] [--timeout SEC] [--fresh] [--deps-only] [--make-args STR]
+#                         [--compare KERNEL]
+#   --stack DIR      directory holding the *.sh stagers and *.patch files (default: <repo>/xnu/patches)
+#   --label NAME     work tree name under $LOCALBUILD/work (default: main). A changed stack is synced into the same tree, so only the
+#                    files whose patched content changed are rebuilt; a different label is a separate tree.
+#   --jobs N         make -jN (default 4, capped at 4: the dev machine runs out of memory)
+#   --make-args STR  extra arguments for the final make (debugging, e.g. "-d" or "-n")
+#   --timeout SEC    kill the whole run after SEC seconds (default 3600)
+#   --fresh          delete the work dir first (cold build)
+#   --deps-only      only fetch/build the host toolchain and dependencies, no kernel
+#   --compare KERNEL a CI kernel to compare with (default none): size, sha256, external and SWEET symbol sets, section sizes
+# Output kernel: $LOCALBUILD/out/kernel.development.sweet (also left in the work tree under fakeroot/System/Library/Kernels).
+# Everything big lives in $LOCALBUILD (default ~/pixelios-artifacts/localbuild), never in git or /tmp. No sudo: flex and
+# bison, if missing, are unpacked from the Debian .deb files into $LOCALBUILD/hostroot (apt-get download + dpkg -x).
+# Method (ideas from hackios-xnu-kernel/xnu-deps, own code): stock clang as a Mach-O cross compiler (-target
+# arm64-apple-macos14.0), theos cctools (ld64, libtool, nm, otool, strip), MacOSX14.0.sdk, a fake xcrun, mig/unifdef/csh built
+# from source, Apple's closed iig replaced by pre-generated DriverKit headers from the SDK plus generated stubs.
+# Progress: ~/pixelios-artifacts/scratch/xnu-local-build.log. Exit: 0 PASS, 1 FAIL, 2 ERROR.
+set -euo pipefail
+ARGS=("$@"); SELF=$(readlink -f "$0"); cd "$(dirname "$SELF")/.."
+ROOT=$PWD
+A=${ARTIFACTS:-$HOME/pixelios-artifacts}
+LB=${LOCALBUILD:-$A/localbuild}
+TAG=xnu-8796.141.3
+stack=$ROOT/xnu/patches; label=""; makeargs=""; jobs=4; tmo=3600; fresh=0; depsonly=0; compare=""
+while [ $# -gt 0 ]; do case "$1" in
+	--stack) stack=$(cd "$2" && pwd); shift 2 ;; --label) label=$2; shift 2 ;;
+	--jobs) jobs=$2; shift 2 ;; --make-args) makeargs=$2; shift 2 ;; --timeout) tmo=$2; shift 2 ;; --fresh) fresh=1; shift ;;
+	--deps-only) depsonly=1; shift ;; --compare) compare=$2; shift 2 ;;
+	*) echo "unknown option $1 (see the header of tools/xnu-local-build)" >&2; exit 2 ;; esac; done
+[ "$jobs" -le 4 ] 2>/dev/null || jobs=4
+mkdir -p "$A/scratch" "$LB"; LOG=$A/scratch/xnu-local-build.log; : >"$LOG"
+START=$(date +%s)
+finish() { local res=$1; shift; { echo "RESULT: $res $1"; shift; [ $# -eq 0 ] || printf '%s\n' "$@"; echo "log: $LOG"; }; case $res in PASS) exit 0 ;; ERROR) exit 2 ;; *) exit 1 ;; esac; }
+say() { echo "[$(( $(date +%s) - START ))s] $*" | tee -a "$LOG" >&2; }
+# the whole run is bounded
+if [ -z "${XLB_INNER:-}" ]; then
+	set +e; XLB_INNER=1 timeout --foreground "$tmo" bash "$SELF" "${ARGS[@]}"; rc=$?; set -e
+	[ $rc -ne 124 ] || { echo "RESULT: ERROR timeout after ${tmo}s (log: $LOG)"; exit 2; }
+	exit $rc
+fi
+
+# ---------------------------------------------------------------- prerequisites
+miss=""
+for t in git curl tar xz make cc clang clang++ perl python3 m4 autoreconf automake awk rsync dpkg apt-get; do command -v $t >/dev/null || miss="$miss $t"; done
+[ -z "$miss" ] || finish ERROR "missing host tools:$miss" "install them with: sudo apt install git curl xz-utils make clang perl python3 m4 autoconf automake gawk rsync"
+
+THEOS=$LB/theos; CCT=$THEOS/toolchain/linux/iphone/bin; SDK=$LB/sdk/MacOSX14.0.sdk
+D=$LB/deps; HB=$D/host/bin; HI=$D/host/inc; FRB=$D/fakeroot-base
+MACSDK_SHA=5e4d3be6b445f0eacc0333ff2117e93e4433d8c4fe44053a14f735033a98aaa9
+TC_SHA=a72a7a577e2fbe2838b6b5e9c72034fa7d114af96f0e1d4b016f18730ce4056e
+MACSDK_URL=https://github.com/joseluisq/macosx-sdks/releases/download/14.0/MacOSX14.0.sdk.tar.xz
+TC_URL=https://github.com/L1ghtmann/llvm-project/releases/download/test-210562a/iOSToolchain-x86_64.tar.xz
+fetchsha() { # DIR URL SHA|TAG
+	[ -d "$1/.git" ] && return 0
+	rm -rf -- "$1"; git init -q "$1"
+	git -C "$1" fetch -q --depth 1 "$2" "$3" >>"$LOG" 2>&1 || finish ERROR "cannot fetch $3 from $2 (network?)"
+	git -C "$1" -c advice.detachedHead=false checkout -q FETCH_HEAD
+}
+
+# ---------------------------------------------------------------- 1. cctools + SDK (theos pieces, macOS SDK)
+if [ ! -x "$CCT/ld" ]; then
+	say "fetching theos cctools toolchain (86 MB)"
+	mkdir -p "$THEOS/toolchain" "$LB/dl"
+	curl -sfL -o "$LB/dl/tc.tar.xz" "$TC_URL" || finish ERROR "cannot download $TC_URL"
+	[ "$(sha256sum "$LB/dl/tc.tar.xz" | cut -d' ' -f1)" = "$TC_SHA" ] || finish ERROR "sha256 mismatch for $TC_URL"
+	tar -xJf "$LB/dl/tc.tar.xz" -C "$THEOS/toolchain"
+fi
+if [ ! -d "$THEOS/sdks/iPhoneOS16.5.sdk/usr" ]; then
+	say "fetching theos iPhoneOS16.5.sdk (233 MB)"
+	rm -rf "$LB/dl/sdks"
+	git clone -q --depth 1 --filter=blob:none --sparse https://github.com/theos/sdks "$LB/dl/sdks" >>"$LOG" 2>&1 || finish ERROR "cannot clone theos/sdks"
+	git -C "$LB/dl/sdks" sparse-checkout set iPhoneOS16.5.sdk >>"$LOG" 2>&1
+	mkdir -p "$THEOS/sdks"; mv "$LB/dl/sdks/iPhoneOS16.5.sdk" "$THEOS/sdks/"
+fi
+if [ ! -d "$SDK/usr/include" ]; then
+	# CI = Xcode 15.0.1 (first Xcode_* by sort -V) = macOS 14.0 SDK (the CI kernel says sdk 14.0)
+	say "fetching MacOSX14.0.sdk (67 MB download, 1.5 GB unpacked)"
+	mkdir -p "$LB/sdk" "$LB/dl"
+	curl -sfL -o "$LB/dl/MacOSX14.0.sdk.tar.xz" "$MACSDK_URL" || finish ERROR "cannot download $MACSDK_URL"
+	[ "$(sha256sum "$LB/dl/MacOSX14.0.sdk.tar.xz" | cut -d' ' -f1)" = "$MACSDK_SHA" ] || finish ERROR "sha256 mismatch for $MACSDK_URL"
+	tar -xJf "$LB/dl/MacOSX14.0.sdk.tar.xz" -C "$LB/sdk"
+fi
+# flex/bison without root
+if ! command -v flex >/dev/null || ! command -v bison >/dev/null; then
+	if [ ! -x "$LB/hostroot/usr/bin/flex" ] || [ ! -x "$LB/hostroot/usr/bin/bison" ]; then
+		say "flex/bison not installed: unpacking the Debian packages into $LB/hostroot (no root)"
+		mkdir -p "$LB/dl/debs" "$LB/hostroot"
+		( cd "$LB/dl/debs" && apt-get download flex bison libfl2 libfl-dev ) >>"$LOG" 2>&1 \
+			|| finish ERROR "cannot download flex/bison" "install them with: sudo apt install flex bison"
+		for deb in "$LB"/dl/debs/*.deb; do dpkg -x "$deb" "$LB/hostroot"; done
+	fi
+	export PATH=$LB/hostroot/usr/bin:$PATH BISON_PKGDATADIR=$LB/hostroot/usr/share/bison
+	export LIBRARY_PATH=$LB/hostroot/usr/lib/x86_64-linux-gnu C_INCLUDE_PATH=$LB/hostroot/usr/include
+fi
+# the syscall tables (bsd/kern/makesyscalls.sh) need gawk-style "\\(" handling; mawk emits a backslash
+if ! awk --version 2>&1 | grep -q GNU; then
+	if [ ! -x "$LB/hostroot/usr/bin/gawk" ]; then
+		say "awk is not GNU awk: unpacking gawk into $LB/hostroot (no root)"
+		mkdir -p "$LB/dl/debs" "$LB/hostroot"
+		( cd "$LB/dl/debs" && apt-get download gawk libsigsegv2 ) >>"$LOG" 2>&1 || finish ERROR "cannot download gawk" "install it with: sudo apt install gawk"
+		for deb in "$LB"/dl/debs/gawk_*.deb "$LB"/dl/debs/libsigsegv2_*.deb; do dpkg -x "$deb" "$LB/hostroot"; done
+	fi
+	mkdir -p "$HB"; printf '#!/bin/sh\nLD_LIBRARY_PATH=%s/hostroot/usr/lib/x86_64-linux-gnu exec %s/hostroot/usr/bin/gawk "$@"\n' "$LB" "$LB" >"$HB/awk"; chmod +x "$HB/awk"
+fi
+command -v flex >/dev/null && command -v bison >/dev/null || finish ERROR "flex/bison unusable" "install them with: sudo apt install flex bison"
+
+# ---------------------------------------------------------------- 2. host wrappers (generated, own code)
+mkdir -p "$HB" "$HI"
+# generated files are only rewritten when their content changes: the force-included headers are dependencies of every object
+upd() { cmp -s "$1.new" "$1" && rm -f "$1.new" || mv "$1.new" "$1"; }
+w() { cat >"$HB/$1.new"; chmod +x "$HB/$1.new"; upd "$HB/$1"; }
+hdr() { cat >"$1.new"; upd "$1"; }
+# stock clang as the Mach-O cross compiler. The kernel is arm64 (CI: plain arm64, macOS platform, minos 14.0).
+w xnu-clang <<EOF
+#!/bin/bash
+case "\$(basename "\$0")" in *++) drv=clang++; extra=(-fno-use-cxa-atexit) ;; *) drv=clang; extra=() ;; esac
+a=()
+for x in "\$@"; do case "\$x" in
+	-enable-trivial-auto-var-init-zero-knowing-it-will-be-removed-from-clang|-fapple-kext-vtable-verify|-Wno-vla-cxx-extension) ;;
+	-Werror|-Werror=*|-Weverything|-pedantic-errors) ;;
+	*) a+=("\$x") ;; esac; done
+exec /usr/bin/\$drv -include $HI/xnu_clang_compat.h -target arm64-apple-macos14.0 -mcpu=cortex-a76 --ld-path=$CCT/ld -w "\${extra[@]}" "\${a[@]}"
+EOF
+ln -sfn xnu-clang "$HB/xnu-clang++"
+# host-side build tools of the kernel build (SETUP/*): native Linux clang, Apple-only flags dropped
+w host-cc <<EOF
+#!/bin/bash
+a=(); skip=0
+for x in "\$@"; do
+	if [ \$skip = 1 ]; then skip=0; continue; fi
+	case "\$x" in -isysroot) skip=1 ;; -mmacosx-version-min=*|-Werror|-Werror=*) ;; *) a+=("\$x") ;; esac
+done
+exec /usr/bin/clang -include $HI/hostcompat.h -I$HI -I\${XLB_XNU:-.}/EXTERNAL_HEADERS -D_GNU_SOURCE -w "\${a[@]}"
+EOF
+w xcrun <<EOF
+#!/bin/bash
+# the one question set the XNU makefiles ask xcrun
+find=""; show=""
+while [ \$# -gt 0 ]; do case "\$1" in
+	-sdk|--sdk) shift 2 ;; -verbose|--verbose) shift ;;
+	-find|--find|-f) find=\$2; shift 2 ;;
+	-show-sdk-path|--show-sdk-path) show=path; shift ;;
+	-show-sdk-version|--show-sdk-version|-show-sdk-platform-version|--show-sdk-platform-version) show=version; shift ;;
+	-show-sdk-platform-path|--show-sdk-platform-path) show=platform; shift ;;
+	*) break ;; esac; done
+case "\$show" in path) echo $SDK; exit 0 ;; version) echo 14.0; exit 0 ;; platform) echo $D/host/Platforms/MacOSX.platform; exit 0 ;; esac
+if [ -n "\$find" ]; then
+	case "\$find" in clang) echo $HB/xnu-clang; exit 0 ;; clang++) echo $HB/xnu-clang++; exit 0 ;; esac
+	for d in $HB $D/host/cct /usr/bin; do [ -x "\$d/\$find" ] && { echo "\$d/\$find"; exit 0; }; done
+	exit 1
+fi
+[ \$# -gt 0 ] && exec "\$@"
+EOF
+mkdir -p "$D/host/Platforms/MacOSX.platform"
+# Apple's closed iig (DriverKit interface generator): header = the pre-generated one in the SDK, implementation = a stand-in
+# generated from that header by iig-impl.py (metaclasses, Dispatch stubs, wrappers that call the kernel's own X_Impl).
+w iig <<EOF
+#!/bin/bash
+def=""; hdr=""; impl=""
+while [ \$# -gt 0 ]; do case "\$1" in --def) def=\$2; shift 2 ;; --header) hdr=\$2; shift 2 ;; --impl) impl=\$2; shift 2 ;; --) break ;; *) shift ;; esac; done
+name=\$(basename "\$def" .iig)
+src=\$(find $SDK/System/Library/Frameworks/Kernel.framework/Headers -path '*DriverKit*' -name "\$name.h" | head -1)
+[ -n "\$src" ] || { echo "iig stand-in: no pre-generated header for \$name" >&2; exit 1; }
+cp "\$src" "\$hdr"
+python3 -I $HB/iig-impl.py "\$src" "\$impl" "\${XLB_XNU:-.}" || exit 1
+# both outputs get the .iig file's time: the makefile makes every X.iig.cpp depend on every generated header, so a header written
+# after an impl would recompile that impl on every run
+touch -r "\$def" "\$hdr" "\$impl"
+EOF
+w iig-impl.py <<'EOF'
+#!/usr/bin/env python3
+# usage: iig-impl.py PREGENERATED_HEADER OUT.iig.cpp XNU_ROOT
+# Stand-in for the implementation file Apple's iig would generate. For every DriverKit class in the header:
+#  - the OSMetaClass definition, unless the kernel itself already defines it;
+#  - Dispatch(), MetaClass::Dispatch(), _Dispatch() and X_Invoke(): RPC from a user-space driver is not supported (kIOReturnUnsupported);
+#  - for every method that has a kernel-side X_Impl: the public wrapper calls X_Impl directly (the supermethod argument only
+#    matters for a driver running in user space). Methods that take an IORPC (replies to a driver) return kIOReturnUnsupported.
+import re, subprocess, sys
+hdr, out, xnu = sys.argv[1:4]
+t = open(hdr).read()
+
+def macro(name):
+    ls = t.split('\n')
+    for i, l in enumerate(ls):
+        if re.match(r'#define %s\b' % re.escape(name), l):
+            body = [l.split(None, 2)[2] if len(l.split(None, 2)) > 2 else '']
+            while body[-1].endswith('\\') and i + 1 < len(ls):
+                i += 1; body[-1] = body[-1][:-1]; body.append(ls[i])
+            body[-1] = body[-1].rstrip('\\')
+            return '\n'.join(body)
+    return ''
+
+def kernel_has(pattern):
+    r = subprocess.run(['grep', '-rEq', '--include=*.cpp', '--include=*.c', '--include=*.h', pattern,
+                        xnu + '/iokit', xnu + '/libkern', xnu + '/osfmk', xnu + '/bsd'])
+    return r.returncode == 0
+
+def split_args(a):
+    parts, depth, cur = [], 0, ''
+    for ch in a:
+        depth += ch in '(<'; depth -= ch in ')>'
+        if ch == ',' and depth == 0: parts.append(cur.strip()); cur = ''
+        else: cur += ch
+    if cur.strip(): parts.append(cur.strip())
+    return parts
+
+o = ['/* generated by tools/xnu-local-build (iig stand-in) from %s */' % hdr.split('/')[-1],
+     '#include <IOKit/IOLib.h>', '#include <IOKit/IOReturn.h>', '#include <IOKit/IOService.h>', '#include <IOKit/IOUserClient.h>',
+     '#include <IOKit/IOUserServer.h>', '#include <IOKit/IOBufferMemoryDescriptor.h>', '#include <IOKit/IODMACommand.h>',
+     '#include <DriverKit/IODispatchSource.h>', '#include <DriverKit/IODispatchQueue.h>', '#include <DriverKit/IOEventLink.h>',
+     '#include <DriverKit/IOWorkGroup.h>', '#include <DriverKit/OSAction.h>', '#include <DriverKit/IOMemoryMap.h>',
+     '#include <DriverKit/IODataQueueDispatchSource.h>', '#include <DriverKit/IOInterruptDispatchSource.h>',
+     '#include <DriverKit/IOServiceNotificationDispatchSource.h>', '#include <DriverKit/IOServiceStateNotificationDispatchSource.h>', '']
+decl = {m.group(1): (m.group(2), m.group(3)) for m in re.finditer(r'^class\s+(?:__attribute__\(\((?:[^()]|\((?:[^()]|\([^()]*\))*\))*\)\)\s+)?(\w+)\s*:\s*public\s+(\w+)[^{]*\{\s*(OSDeclare\w+)\(', t, re.M)}
+for cls in re.findall(r'^#define (\w+)_Methods\b', t, re.M):
+    if cls in decl:
+        sup, dm = decl[cls]
+        if not kernel_has(r'OSDefineMetaClass\w*\(\s*%s\s*,' % cls):
+            o.append('OSDefineMetaClassAnd%sStructors(%s, %s);' % ('Abstract' if 'Abstract' in dm else '', cls, sup))
+    o.append('kern_return_t %s::Dispatch(const IORPC rpc) { return kIOReturnUnsupported; }' % cls)
+    o.append('kern_return_t %s::MetaClass::Dispatch(const IORPC rpc) { return kIOReturnUnsupported; }' % cls)
+    body = macro(cls + '_Methods') + '\n' + macro(cls + '_KernelMethods')
+    body = re.sub(r'/\*.*?\*/', ' ', body, flags=re.S)
+    decls = []
+    for st in body.split(';'):
+        st = re.sub(r'\b(public|protected|private)\s*:', ' ', st)
+        st = re.sub(r'__attribute__\(\((?:[^()]|\((?:[^()]|\([^()]*\))*\))*\)\)', ' ', st)
+        st = ' '.join(st.split())
+        d = re.match(r'^(?P<pre>[^()]*?)\b(?P<name>\w+)\s*\((?P<args>.*)\)\s*(?P<post>[\w ]*)$', st)
+        if d: decls.append(d)
+    impls = {d.group('name')[:-5] for d in decls if d.group('name').endswith('_Impl')}
+    calls = {d.group('name') for d in decls if d.group('name').endswith('_Call')}
+    for d in decls:
+        n, args = d.group('name'), re.sub(r'\s*=\s*NULL\b', '', d.group('args'))
+        if n.endswith('_Impl') or n == 'Dispatch' or d.group('pre').split()[:1] == ['typedef']: continue
+        ps = split_args(args)
+        ret = ' '.join(x for x in d.group('pre').split() if x not in ('static', 'virtual', 'inline'))
+        post = ' const' if 'const' in d.group('post').split() else ''
+        has_super = re.search(r'OSDispatchMethod\s+supermethod\s*$', args) is not None
+        argl = split_args(macro(args.strip())) if re.fullmatch(r'\w+_Args', args.strip()) else ps   # X_Call(Cls_X_Args)
+        names = [re.search(r'(\w+)\s*$', p).group(1) for p in argl[:-1 if has_super else None]]
+        unsupported = '' if ret == 'void' else ('return kIOReturnUnsupported;' if ret == 'kern_return_t' else 'return %s();' % ret)
+        if (cls, n) == ('IOUserClient', 'CreateActionKernelCompletion'):
+            # the action that completes an async external method in the kernel: typed OSAction_IOUserClient_KernelCompletion
+            stmt = ('OSString * t = OSString::withCString("OSAction_IOUserClient_KernelCompletion"); '
+                    'kern_return_t r = OSAction::CreateWithTypeName(this, IOUserClient_KernelCompletion_ID, IOUserClient_AsyncCompletion_ID, '
+                    'referenceSize, t, action); OSSafeReleaseNULL(t); return r;')
+        elif n.endswith('_Call'):   # static entry the RPC server side uses to reach the kernel's X_Impl
+            stmt = ('' if ret == 'void' else 'return ') + '%s_Impl(%s);' % (n[:-5], ', '.join(names)) if kernel_has(r'\b%s::%s_Impl\b' % (cls, n[:-5])) else unsupported
+        elif n.endswith('_Invoke') or n == '_Dispatch':
+            stmt = unsupported   # server side of the RPC from a user-space driver
+        elif has_super and ps[0].startswith('IORPC') or has_super and n not in impls:
+            stmt = unsupported   # a reply to / a call into a user-space driver
+        elif has_super or ('static' in d.group('pre').split() and n in impls and n + '_Call' not in calls and not kernel_has(r'^%s::%s\b' % (cls, n))):
+            if not kernel_has(r'\b%s::%s_Impl\b' % (cls, n)): stmt = unsupported
+            else: stmt = ('' if ret == 'void' else 'return ') + '%s_Impl(%s);' % (n, ', '.join(names))
+        else: continue
+        o.append('%s %s::%s(%s)%s { %s }' % (ret, cls, n, ', '.join(ps), post, stmt))
+open(out, 'w').write('\n'.join(o) + '\n')
+EOF
+# BSD install -S (safe copy) does not exist in GNU install, where it eats the next argument
+w install <<EOF
+#!/bin/bash
+a=(); for x in "\$@"; do [ "\$x" = -S ] || a+=("\$x"); done
+exec /usr/bin/install "\${a[@]}"
+EOF
+w true-tool <<EOF
+#!/bin/sh
+exit 0
+EOF
+ln -sfn true-tool "$HB/codesign"
+ln -sfn /usr/bin/python3 "$HB/python"   # the lldbmacros install rules run "env python"
+# plutil -convert binary1 FILE (the kernel embeds symbolsets.plist as a binary plist)
+w plutil <<'EOF'
+#!/usr/bin/env python3
+import plistlib, sys
+a = sys.argv[1:]
+if a[:2] == ["-convert", "binary1"]:
+    f = a[-1]
+    d = plistlib.load(open(f, "rb"))
+    plistlib.dump(d, open(f, "wb"), fmt=plistlib.FMT_BINARY)
+EOF
+hdr "$HI/xnu_clang_compat.h" <<'EOF'
+/* Force-included in every kernel TU. Stock clang lacks Apple clang's kalloc_type builtins (the CI toolchain has them).
+ * Approximation (a deliberate loss of fidelity, see docs/AUTOMATION.md): the type "summary" tells the allocator whether a
+ * type holds pointers, data or both. Here: scalars/enums/arrays of them = data, pointers = pointer, C structs = mixed,
+ * C++ polymorphic classes = mixed, other C++ classes = data. Every choice allocates fine; only the zone segregation (a
+ * hardening feature) differs from Apple's. Pretend to be Xcode 15.0's clang (15000100) where the tree keys on that. */
+#ifndef __apple_build_version__
+#define __apple_build_version__ 15000100
+#endif
+#if !defined(__ASSEMBLER__) && !defined(ASSEMBLER) && !__has_builtin(__builtin_xnu_type_signature)
+#define XNU_NO_TYPE_BUILTINS 1
+#ifdef __cplusplus
+template <class T> struct __xlb_sum { enum : unsigned { v = (__is_class(T) || __is_union(T)) ? (__is_polymorphic(T) ? 7u : 5u) : 5u }; };
+template <class T> struct __xlb_sum<T *> { enum : unsigned { v = 3u }; };
+template <class T> struct __xlb_sum<T *const> { enum : unsigned { v = 3u }; };
+template <class T> struct __xlb_sum<T *volatile> { enum : unsigned { v = 3u }; };
+template <class T> struct __xlb_sum<const T> : __xlb_sum<T> {};
+template <class T> struct __xlb_sum<volatile T> : __xlb_sum<T> {};
+template <class T, decltype(sizeof(0)) N> struct __xlb_sum<T[N]> : __xlb_sum<T> {};
+#define __builtin_xnu_type_summary(type) (__xlb_sum<type>::v)
+#define __builtin_xnu_type_signature(type) (__xlb_sum<type>::v == 5u ? "2" : (__xlb_sum<type>::v == 3u ? "1" : "12"))
+#define __builtin_xnu_types_compatible(a, b) __is_same(a, b)
+#else
+#define __xlb_cls(type) __builtin_classify_type(*(type *)0)
+#define __builtin_xnu_type_summary(type) (__xlb_cls(type) == 5 ? 3U : ((__xlb_cls(type) == 12 || __xlb_cls(type) == 13) ? 7U : 5U))
+#define __builtin_xnu_type_signature(type) (__xlb_cls(type) == 5 ? "1" : ((__xlb_cls(type) == 12 || __xlb_cls(type) == 13) ? "12" : "2"))
+#define __builtin_xnu_types_compatible(a, b) __builtin_types_compatible_p(a, b)
+#endif
+#endif
+EOF
+hdr "$HI/hostcompat.h" <<'EOF'
+/* force-included in the kernel build's host tools (SETUP/*): what BSD libc has and glibc lacks */
+#include <errno.h>
+#include <fcntl.h>
+#include <libgen.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/param.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+#include <byteswap.h>
+extern char *program_invocation_short_name;
+static inline const char *getprogname(void) { return program_invocation_short_name; }
+#ifndef __unused
+#define __unused __attribute__((unused))
+#endif
+#ifndef __dead2
+#define __dead2 __attribute__((noreturn))
+#endif
+#ifndef __printflike
+#define __printflike(a, b) __attribute__((format(printf, a, b)))
+#endif
+/* kextsymboltool seeks in its output, which the export check points at /dev/null: BSD lseek returns the offset there, Linux 0 */
+static inline off_t xlb_lseek(int fd, off_t off, int whence) {
+	off_t r = (lseek)(fd, off, whence); struct stat st;
+	return (r != off && whence == SEEK_SET && fstat(fd, &st) == 0 && S_ISCHR(st.st_mode)) ? off : r;
+}
+#define lseek xlb_lseek
+#define OSSwapInt16(x) bswap_16(x)
+#define OSSwapInt32(x) bswap_32(x)
+#define OSSwapInt64(x) bswap_64(x)
+typedef uintptr_t vm_offset_t;
+typedef uintptr_t vm_size_t;
+typedef int boolean_t;
+#ifndef TRUE
+#define TRUE 1
+#define FALSE 0
+#endif
+/* BSD setmode/getmode: the build only uses absolute octal modes */
+static inline void *setmode(const char *s) { char *e; long v = strtol(s, &e, 8); if (*e || v < 0) return NULL; mode_t *m = malloc(sizeof *m); *m = (mode_t)v; return m; }
+static inline mode_t getmode(const void *set, mode_t omode) { (void)omode; return *(const mode_t *)set; }
+#ifndef O_EXLOCK
+#define O_EXLOCK 0
+#endif
+#ifndef O_SHLOCK
+#define O_SHLOCK 0
+#endif
+#ifndef O_SYMLINK
+#define O_SYMLINK 0
+#endif
+EOF
+hdr "$HI/libc.h" <<'EOT'
+#pragma once
+#include <fcntl.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/file.h>
+#include <sys/mman.h>
+#include <sys/param.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+EOT
+hdr "$HI/copyfile.h" <<'EOT'
+#pragma once
+#include <unistd.h>
+#define COPYFILE_DATA 8
+typedef void *copyfile_state_t;
+static inline int fcopyfile(int from, int to, copyfile_state_t st, unsigned flags) {
+	char buf[65536]; ssize_t n; (void)st; (void)flags;
+	while ((n = read(from, buf, sizeof buf)) > 0) { for (char *p = buf; n > 0;) { ssize_t w = write(to, p, n); if (w < 0) return -1; p += w; n -= w; } }
+	return n < 0 ? -1 : 0;
+}
+EOT
+mkdir -p "$HI/mach/machine" "$HI/mach-o" "$HI/uuid" "$HI/architecture"
+hdr "$HI/mach/mach_init.h" <<'EOT'
+#pragma once
+#include <stdint.h>
+typedef uint64_t mach_vm_size_t;
+#define mach_vm_round_page(x) (((x) + 16383) & ~(uint64_t)16383)  /* the CI host (Apple silicon) has 16 KiB pages */
+EOT
+hdr "$HI/mach/machine.h" <<'EOT'
+#pragma once
+#include <stdint.h>
+typedef int cpu_type_t;
+typedef int cpu_subtype_t;
+typedef int cpu_threadtype_t;
+#define CPU_ARCH_ABI64 0x01000000
+#define CPU_TYPE_ARM64 (12 | CPU_ARCH_ABI64)
+EOT
+hdr "$HI/mach/vm_prot.h" <<'EOT'
+#pragma once
+typedef int vm_prot_t;
+#define VM_PROT_READ 1
+#define VM_PROT_WRITE 2
+#define VM_PROT_EXECUTE 4
+EOT
+hdr "$HI/mach/machine/thread_status.h" </dev/null
+hdr "$HI/architecture/byte_order.h" <<'EOT'
+#pragma once
+#include <stdint.h>
+#include <byteswap.h>
+enum NXByteOrder { NX_UnknownByteOrder, NX_LittleEndian, NX_BigEndian };
+EOT
+hdr "$HI/uuid/uuid.h" <<'EOT'
+#include <stdio.h>
+#include <stdlib.h>
+typedef unsigned char uuid_t[16];
+static inline void uuid_generate(uuid_t out) {
+	FILE *f = fopen("/dev/urandom", "rb");
+	if (!f || fread(out, 1, 16, f) != 16) abort();
+	fclose(f); out[6] = (out[6] & 0x0f) | 0x40; out[8] = (out[8] & 0x3f) | 0x80;
+}
+EOT
+hdr "$HI/mach-o/arch.h" <<'EOT'
+#pragma once
+#include <mach/machine.h>
+#include <architecture/byte_order.h>
+typedef struct { const char *name; cpu_type_t cputype; cpu_subtype_t cpusubtype; enum NXByteOrder byteorder; const char *description; } NXArchInfo;
+static inline const NXArchInfo *NXGetLocalArchInfo(void) {
+	static const NXArchInfo a = { "arm64", 0x0100000c, 0, NX_LittleEndian, NULL }; return &a;
+}
+EOT
+hdr "$HI/mach-o/swap.h" <<'EOT'
+#pragma once
+/* byte swapping is only reached for a big-endian target; arm64 and the host are both little-endian */
+#include <stdlib.h>
+#include <mach-o/arch.h>
+#include <mach-o/loader.h>
+#include <mach-o/nlist.h>
+#define XLB_NOSWAP(n, T) static inline void n(T *p, enum NXByteOrder o) { (void)p; (void)o; abort(); }
+XLB_NOSWAP(swap_mach_header, struct mach_header)
+XLB_NOSWAP(swap_mach_header_64, struct mach_header_64)
+XLB_NOSWAP(swap_segment_command, struct segment_command)
+XLB_NOSWAP(swap_segment_command_64, struct segment_command_64)
+XLB_NOSWAP(swap_symtab_command, struct symtab_command)
+XLB_NOSWAP(swap_uuid_command, struct uuid_command)
+static inline void swap_nlist(struct nlist *p, uint32_t n, enum NXByteOrder o) { abort(); }
+static inline void swap_nlist_64(struct nlist_64 *p, uint32_t n, enum NXByteOrder o) { abort(); }
+EOT
+export PATH=$HB:$PATH
+
+# ---------------------------------------------------------------- 3. dependency sources and host tools
+fetchsha "$D/AvailabilityVersions" https://github.com/apple-oss-distributions/AvailabilityVersions AvailabilityVersions-121
+fetchsha "$D/libdispatch" https://github.com/apple-oss-distributions/libdispatch libdispatch-1415.140.2
+fetchsha "$D/mm_bootstrap_cmds" https://github.com/markmentovai/bootstrap_cmds f337e600741638896fb6056ce87c6479f74b89a3
+fetchsha "$D/tcsh" https://github.com/tcsh-org/tcsh.git b7db07931546178c4cb2542b5fc850c483628ed5
+fetchsha "$D/unifdef" https://github.com/fanf2/unifdef.git 08d12cd3059fe072929ea001ad9833f5487fd355
+mkdir -p "$FRB/usr/local/bin" "$FRB/usr/local/libexec" "$FRB/usr/local/lib/kernel" "$FRB/usr/local/include/kernel/os"
+if [ ! -x "$FRB/usr/local/bin/migcom" ]; then
+	say "building mig (bootstrap_cmds)"
+	( cd "$D/mm_bootstrap_cmds" && autoreconf --install && sh configure --prefix="$FRB/usr/local" && make -j"$jobs" && make install ) >>"$LOG" 2>&1 \
+		|| finish ERROR "mig did not build, see $LOG"
+fi
+if [ ! -x "$HB/unifdef" ]; then
+	say "building unifdef"
+	printf '"@(#) $Version: unifdef-2.12 $\\n"\n"@(#) $Date: 2020-11-06 11:22:51 +0000 $\\n"\n' >"$D/unifdef/version.h"
+	cc -std=gnu11 -O2 -w -o "$HB/unifdef" "$D/unifdef/unifdef.c" >>"$LOG" 2>&1 || finish ERROR "unifdef did not build"
+fi
+if [ ! -x "$HB/tcsh" ]; then
+	say "building tcsh (XNU's config/doconf is a csh script)"
+	( cd "$D/tcsh" && ./configure --prefix="$D/host" && make -j"$jobs" && cp tcsh "$HB/tcsh" ) >>"$LOG" 2>&1 || finish ERROR "tcsh did not build, see $LOG"
+fi
+ln -sfn tcsh "$HB/csh"
+# cctools for the kernel build only (kept off PATH while host tools build: theos ld/as/libtool would shadow the system ones)
+mkdir -p "$D/host/cct"
+for t in nm otool strip lipo libtool nmedit ctf_insert codesign_allocate install_name_tool dsymutil size; do ln -sfn "$CCT/$t" "$D/host/cct/$t"; done
+if [ ! -f "$FRB/usr/local/libexec/availability.pl" ]; then
+	say "AvailabilityVersions"
+	# ruby (dyld VersionMap.h only) is not needed: make -k
+	( cd "$D/AvailabilityVersions" && make -k install OBJROOT="$D/av.obj" SYMROOT="$D/av.sym" DSTROOT="$FRB" ) >>"$LOG" 2>&1 || true
+fi
+[ -f "$FRB/usr/local/libexec/availability.pl" ] || finish ERROR "availability.pl not found under $FRB"
+# the kernel half of libdispatch's private firehose header (libfirehose_kernel.a itself is stage 6)
+unifdef -DOS_FIREHOSE_SPI=1 -DKERNEL=1 "$D/libdispatch/os/firehose_buffer_private.h" >"$FRB/usr/local/include/kernel/os/firehose_buffer_private.h" || [ $? -eq 1 ]
+cp "$D/libdispatch/src/firehose/firehose_types.defs" "$FRB/usr/local/include/kernel/os/firehose_types.defs"
+say "dependencies ready"
+[ "$depsonly" = 0 ] || finish PASS "dependencies ready in $LB (deps-only)"
+
+# ---------------------------------------------------------------- 4. patched source tree (same recipe as CI: build.sh patches())
+P=$A/xnu-pristine
+if [ ! -d "$P/.git" ]; then
+	say "cloning pristine $TAG"
+	git clone -q --depth 1 --branch "$TAG" https://github.com/apple-oss-distributions/xnu "$P" >>"$LOG" 2>&1 || { rm -rf -- "$P"; finish ERROR "cannot clone pristine $TAG (network?)"; }
+fi
+[ "$(git -C "$P" describe --tags --exact-match 2>/dev/null)" = "$TAG" ] || finish ERROR "$P is not at tag $TAG"
+DXB_SHA=663906528d1cd5ea8fde7de6f16de73db9511549   # same pin as .github/workflows/xnu.yml
+fetchsha "$LB/dxb" https://github.com/blacktop/darwin-xnu-build "$DXB_SHA"
+shopt -s nullglob
+stagers=("$stack"/*.sh); ours=("$stack"/*.patch)
+[ ${#ours[@]} -gt 0 ] || finish ERROR "no *.patch in $stack"
+stackhash=$( (cat "${stagers[@]}" "${ours[@]}"; cat "$LB/dxb/patches/"*.patch) | sha256sum | cut -c1-12)
+[ -n "$label" ] || label=main   # one rolling work tree: a changed stack is synced into it, so only the changed files rebuild
+W=$LB/work/$label
+[ "$fresh" = 0 ] || rm -rf -- "$W"
+X=$W/xnu; FR=$W/fakeroot; OBJ=$W/build/xnu.obj; SYM=$W/build/xnu.sym
+MACOS_VERSION=13.5; RCDK=22.6.0; KDKROOT=$LB/no-kdk   # the closed KDK libs are only linked for T6000/T8101/VMAPPLE
+# a new version of this script (its generators and flags) invalidates every object: start the work tree over
+toolhash=$(sha256sum "$SELF" | cut -c1-8)
+[ "$(cat "$W/.toolhash" 2>/dev/null)" = "$toolhash" ] || rm -rf -- "$W"
+mkdir -p "$W"; echo "$toolhash" >"$W/.toolhash"
+
+# stage_tree DIR: a pristine copy plus everything CI's build.sh does to it, plus ours (patches() in blacktop's build.sh)
+stage_tree() {
+	local t=$1 s p applied=0 skipped=""
+	rm -rf -- "$t"; mkdir -p "$t"; cp -a "$P/." "$t/"
+	cd "$t"
+	sed -i 's|^AVAILABILITY_PL="${SDKROOT}/${DRIVERKITROOT}|AVAILABILITY_PL="${FAKEROOT_DIR}|g' bsd/sys/make_symbol_aliasing.sh
+	sed -i 's|^#include.*BSD.xcconfig.*||g' libsyscall/Libsyscall.xcconfig
+	# not CI: the directory cscope.genhdrs is touched by each run, which regenerated sysproto.h and recompiled ~80 BSD files every time
+	sed -i -E 's/^(syscall\.h|sysproto\.h): (\$\(TARGET\)\/bsd\.syscalls\.master) (\$\(OBJROOT\)\/cscope\.genhdrs)/\1: \2 | \3/' bsd/sys/Makefile
+	sed -i 's|^LDFLAGS_KERNEL_SDK	= -L$(SDKROOT).*|LDFLAGS_KERNEL_SDK	= -L$(FAKEROOT_DIR)/usr/local/lib/kernel -lfirehose_kernel|g' makedefs/MakeInc.def
+	sed -i 's|^\(INCFLAGS_SDK[[:space:]]*=\) -I$(SDKROOT)/usr/local/include/\(kernel\)\{0,1\}|\1 -I$(FAKEROOT_DIR)/usr/local/include/kernel|' makedefs/MakeInc.def
+	sed -i 's|export MIG := $(shell $(XCRUN) -sdk $(SDKROOT) -find mig)|export MIG := $(shell find $(FAKEROOT_DIR) -name "mig")|g' makedefs/MakeInc.cmd
+	sed -i 's|export MIGCOM := $(shell $(XCRUN) -sdk $(SDKROOT) -find migcom)|export MIGCOM := $(shell find $(FAKEROOT_DIR) -name "migcom")|g' makedefs/MakeInc.cmd
+	for s in "${stagers[@]}"; do
+		env PATH="$HB:$PATH" MACHINE_CONFIG=SWEET MACOS_VERSION=$MACOS_VERSION KDKROOT=$KDKROOT bash "$s" >>"$LOG" 2>&1 || finish ERROR "stager $(basename "$s") failed (network?)" "$(tail -n 5 "$LOG" | cut -c1-200)"
+	done
+	# CI copies ours next to blacktop's top-level patches and applies the lot, skipping any that does not git-apply --check
+	mapfile -t allp < <(for p in "${ours[@]}" "$LB"/dxb/patches/*.patch; do echo "$p"; done | awk -F/ '{print $NF"\t"$0}' | LC_ALL=C sort | cut -f2)
+	for p in "${allp[@]}"; do
+		if git apply --check "$p" >>"$LOG" 2>&1; then git apply "$p" >>"$LOG" 2>&1; applied=$((applied + 1)); else skipped="$skipped $(basename "$p")"; fi
+	done
+	echo "$applied patches applied; skipped (CI skips them too):${skipped:- none}" | tee "$W/patches.txt" >>"$LOG"
+	# not CI steps, work-copy edits only. SETUP/config/doconf is a csh script and there is no /bin/csh without root: use our tcsh.
+	sed -i "1s|.*|#!$HB/tcsh -f|" SETUP/config/doconf
+	# stock clang (C++) rejects *(void *) inside __typeof__; Apple clang's kalloc_type macros rely on it only for a compile-time check
+	perl -0pi -e 's/(#define KALLOC_TYPE_IS_COMPATIBLE_PTR\(ptr, type\)).*?\n\n/$1 (1)\n\n/s' osfmk/kern/kalloc.h
+}
+if [ ! -d "$X" ]; then
+	say "new work tree $W (stack $stackhash: ${#stagers[@]} stagers, ${#ours[@]} patches)"
+	stage_tree "$X"
+	rm -rf -- "$FR"; mkdir -p "$FR"; cp -a "$FRB/." "$FR/"
+	echo "$stackhash" >"$W/.stackhash"; : >"$W/.cold"
+elif [ "$(cat "$W/.stackhash" 2>/dev/null)" != "$stackhash" ]; then
+	# the stack changed: stage a second copy and sync only the files that differ, so make rebuilds just those
+	say "stack changed ($(cat "$W/.stackhash" 2>/dev/null) -> $stackhash): syncing the differing files into $X"
+	stage_tree "$W/xnu.new"
+	changed=$(rsync -rlpc --delete --exclude=/.git --out-format='%n' "$W/xnu.new/" "$X/" | grep -v '/$' || true)
+	rm -rf -- "$W/xnu.new"
+	say "$(printf '%s\n' "$changed" | grep -c . || true) files changed"
+	if printf '%s\n' "$changed" | grep -q -E '\.(h|defs|exports|iig|sh|py|json|plist|xcconfig)$|Makefile|\.template$|^config/'; then rm -f "$FR/.xnu_headers_installed"; fi
+	echo "$stackhash" >"$W/.stackhash"
+else
+	say "reusing work tree $W (same stack): incremental build"
+fi
+say "$(cat "$W/patches.txt")"
+cd "$X"
+export PATH=$HB:$D/host/cct:$PATH
+export MACHINE_CONFIG=SWEET XLB_XNU=$X
+MK=(make SDKROOT=macosx XCRUN="$HB/xcrun" HOST_SDKROOT_RESOLVED=/ HOST_CC="$HB/host-cc" HOST_FLEX="$(command -v flex)" HOST_BISON="$(command -v bison)" HOST_GM4="$(command -v m4)"
+	PLUTIL="$HB/plutil" HOST_CODESIGN="$HB/true-tool" HOST_CODESIGN_ALLOCATE="$HB/true-tool" CC="$HB/xnu-clang" CXX="$HB/xnu-clang++" LOGCOLORS=n
+	BUILD_WERROR=0 BUILD_LTO=0 DO_CTFMERGE=0 SRCROOT="$X" OBJROOT="$OBJ" SYMROOT="$SYM" DSTROOT="$FR" FAKEROOT_DIR="$FR" KDKROOT="$KDKROOT"
+	TIGHTBEAMC=tightbeamc-not-supported RC_DARWIN_KERNEL_VERSION=$RCDK MEMORY_SIZE=$(awk '/MemTotal/{print $2*1024}' /proc/meminfo)
+	SYSCTL_HW_PHYSICALCPU=$(nproc) SYSCTL_HW_LOGICALCPU=$(nproc) KERNEL_BUILDS_IN_PARALLEL=1)
+
+# ---------------------------------------------------------------- 5. headers, libfirehose_kernel, kernel
+if [ ! -f "$FR/.xnu_headers_installed" ]; then
+	say "make installhdrs"
+	nice "${MK[@]}" installhdrs ARCH_CONFIGS="X86_64 ARM64" OBJROOT="$W/build/xnu-hdrs.obj" SYMROOT="$W/build/xnu-hdrs.sym" -j"$jobs" >"$W/installhdrs.log" 2>&1 \
+		|| finish ERROR "make installhdrs failed" "$(grep -m5 -E 'error|Error' "$W/installhdrs.log" | cut -c1-200)" "see $W/installhdrs.log"
+	touch "$FR/.xnu_headers_installed"
+fi
+FH=$FR/usr/local/lib/kernel/libfirehose_kernel.a
+if [ ! -f "$FH" ]; then
+	say "libfirehose_kernel.a (arm64)"
+	mkdir -p "$W/build/firehose"
+	PH=$FR/System/Library/Frameworks/Kernel.framework
+	xnu-clang -c -Os -arch arm64 -mkernel -nostdinc -Wno-packed -DKERNEL=1 -DDISPATCH_USE_DTRACE=0 -DOS_ATOMIC_CONFIG_MEMORY_ORDER_DEPENDENCY=1 \
+		-DOS_ATOMIC_CONFIG_STARVATION_FREE_ONLY=0 -I"$D/libdispatch" -I"$PH/PrivateHeaders" -I"$PH/Headers" -I"$FR/usr/local/include/os" -I"$FR/usr/local/include/firehose" \
+		-I"$FR/usr/local/include/kernel" -I"$SDK/System/Library/Frameworks/Kernel.framework/Headers" \
+		-o "$W/build/firehose/firehose_buffer.o" "$D/libdispatch/src/firehose/firehose_buffer.c" >"$W/firehose.log" 2>&1 \
+		|| finish ERROR "libfirehose_kernel did not compile" "$(grep -m5 'error' "$W/firehose.log" | cut -c1-200)" "see $W/firehose.log"
+	# what Apple's toolchain links in but stock clang/this host does not provide (documented in docs/LOCAL-BUILD.md):
+	#  - __cxa_atexit: stock clang lowers a static destructor (KLDBootstrap) to __cxa_atexit, Apple's to __mod_term_func
+	#  - the compiler-rt PGO entry points OSKext.cpp references (kext PGO data is not collected here)
+	cat >"$W/build/firehose/xlb_stubs.c" <<'EOT'
+typedef unsigned long long u64;
+int __cxa_atexit(void (*f)(void *), void *arg, void *dso) { (void)f; (void)arg; (void)dso; return 0; }
+u64 __llvm_profile_get_size_for_buffer_internal(const char *a, const char *b, const char *c, const char *d, const char *e, const char *f) { (void)a; (void)b; (void)c; (void)d; (void)e; (void)f; return 0; }
+int __llvm_profile_write_buffer_internal(char *buf, const char *a, const char *b, const char *c, const char *d, const char *e, const char *f) { (void)buf; (void)a; (void)b; (void)c; (void)d; (void)e; (void)f; return -1; }
+EOT
+	xnu-clang -c -Os -arch arm64 -mkernel -nostdinc -o "$W/build/firehose/xlb_stubs.o" "$W/build/firehose/xlb_stubs.c" >>"$W/firehose.log" 2>&1 \
+		|| finish ERROR "stub object did not compile" "see $W/firehose.log"
+	libtool -static -o "$FH" "$W/build/firehose/firehose_buffer.o" "$W/build/firehose/xlb_stubs.o" >>"$W/firehose.log" 2>&1
+fi
+KERN=$FR/System/Library/Kernels/kernel.development.sweet
+rm -f "$KERN"   # never report a kernel left over from an earlier build
+BT=$(date +%s)
+say "make install (DEVELOPMENT ARM64 SWEET) -j$jobs -k"
+set +e
+# shellcheck disable=SC2086
+nice "${MK[@]}" install -j"$jobs" -k TARGET_CONFIGS="DEVELOPMENT ARM64 SWEET" $makeargs >"$W/build.log" 2>&1
+mrc=$?; set -e
+BWALL=$(( $(date +%s) - BT ))
+say "make exit $mrc after ${BWALL}s"
+errs=$(grep -c -E 'error:|\*\*\* \[' "$W/build.log" || true)
+[ -f "$KERN" ] && [ $mrc -eq 0 ] || finish FAIL "build failed ($errs error lines, make exit $mrc, ${BWALL}s)" "$(grep -m8 -E 'error:|\*\*\* \[|undefined' "$W/build.log" | cut -c1-220)" "build log: $W/build.log"
+sha=$(sha256sum "$KERN" | cut -d' ' -f1)
+mkdir -p "$LB/out"; cp -f "$KERN" "$LB/out/kernel.development.sweet"
+rep=("kernel: $LB/out/kernel.development.sweet" "sha256: $sha" "size: $(stat -c %s "$KERN") bytes" "build wall: ${BWALL}s ($( [ -f "$W/.cold" ] && echo cold || echo incremental)), total run $(( $(date +%s) - START ))s, -j$jobs" "patches: $(cat "$W/patches.txt")" "make exit $mrc, $errs error lines (CI uses make -k too; see $W/build.log)")
+rm -f "$W/.cold"
+if [ -n "$compare" ]; then
+	[ -f "$compare" ] || finish ERROR "--compare kernel not found: $compare"
+	export LC_ALL=C
+	# symbol names without the compiler's per-build suffixes (.site.N, .N, .llvm.N, .cold outlines)
+	norm() { sed -E 's/\.cold$//; s/(\.site)?\.[0-9]+$//; s/\.llvm\.[0-9]+$//' | sort -u; }
+	for k in ci:"$compare" local:"$KERN"; do
+		nm -g "${k#*:}" 2>/dev/null | awk '{print $NF}' | norm >"$W/ext.${k%%:*}"
+		nm "${k#*:}" 2>/dev/null | awk '{print $NF}' | norm | grep -E -i 'sweet|appleclcd' >"$W/sweet.${k%%:*}" || true
+		otool -l "${k#*:}" 2>/dev/null | awk '/segname/ && !/sectname/{g=$2} /sectname/{s=$2} /      size /{print g"/"s, strtonum($2)}' | sort -u >"$W/sect.${k%%:*}"
+	done
+	join -a1 -a2 -e 0 -o 0,1.2,2.2 "$W/sect.ci" "$W/sect.local" | awk '$2!=$3{printf "%s CI=%d local=%d (%+d)\n",$1,$2,$3,$3-$2}' >"$W/sect.diff"
+	e_l=$(comm -13 "$W/ext.ci" "$W/ext.local" | wc -l); e_c=$(comm -23 "$W/ext.ci" "$W/ext.local" | wc -l)
+	s_l=$(comm -13 "$W/sweet.ci" "$W/sweet.local" | wc -l); s_c=$(comm -23 "$W/sweet.ci" "$W/sweet.local" | wc -l)
+	comm -23 "$W/ext.ci" "$W/ext.local" >"$W/ext.only-ci"; comm -13 "$W/ext.ci" "$W/ext.local" >"$W/ext.only-local"
+	comm -23 "$W/sweet.ci" "$W/sweet.local" >"$W/sweet.only-ci"; comm -13 "$W/sweet.ci" "$W/sweet.local" >"$W/sweet.only-local"
+	rep+=("compare with $compare: size $(stat -c %s "$compare") CI vs $(stat -c %s "$KERN") local, sha256 $( [ "$(sha256sum "$compare" | cut -d' ' -f1)" = "$sha" ] && echo IDENTICAL || echo differs)"
+		"external symbols: $(wc -l <"$W/ext.ci") CI, $(wc -l <"$W/ext.local") local, $e_c only CI, $e_l only local (lists: $W/ext.only-ci, $W/ext.only-local)"
+		"SWEET/AppleCLCD symbols (all, normalized): $(wc -l <"$W/sweet.ci") CI, $(wc -l <"$W/sweet.local") local, $s_c only CI, $s_l only local (lists: $W/sweet.only-*)"
+		"section size differences ($(wc -l <"$W/sect.diff") of $(wc -l <"$W/sect.ci")): $W/sect.diff")
+	od=$(command -v llvm-objdump-19 || command -v llvm-objdump || echo /usr/lib/llvm-19/bin/llvm-objdump)
+	if [ -x "$od" ]; then
+		insn_ci=$("$od" -d "$compare" 2>/dev/null | grep -c -E '\<(xpaci|paciasp|autiasp|stlur|stlurb|stlurh|ldapur|eor3|rax1|xar|bcax)\>' || true)
+		insn_loc=$("$od" -d "$KERN" 2>/dev/null | grep -c -E '\<(xpaci|paciasp|autiasp|stlur|stlurb|stlurh|ldapur|eor3|rax1|xar|bcax)\>' || true)
+		rep+=("unsupported v8.3+/PAC/LRCPC2/SHA3 insns: $insn_ci CI vs $insn_loc local")
+	fi
+fi
+finish PASS "kernel.development.sweet built locally in ${BWALL}s" "${rep[@]}"

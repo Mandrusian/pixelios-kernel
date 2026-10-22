@@ -1,0 +1,212 @@
+/* ---- kernel side: take over the screen with the console log as looping QR codes ---- */
+#pragma clang diagnostic ignored "-Weverything"
+
+extern struct vc_info vinfo;		/* osfmk/console/video_console.c */
+extern int sweet_console_muted;		/* osfmk/console/serial_console.c: stop drawing console text */
+extern uint32_t sweet_log_snapshot(char *out, uint32_t max);	/* bsd/dev/sweet_ufs.c (QL1) */
+extern uint32_t sweet_log_copy(uint64_t *pos, char *out, uint32_t max);	/* bsd/dev/sweet_ufs.c: console bytes [*pos, total) */
+
+/* While set, AppleCLCD (iokit/Kernel/arm/SweetFramebuffer.cpp) neither presents iOS frames nor fades the panel: the code stays on screen. */
+int sweet_qr_hold;
+
+static char sweet_qr_snap[16384];
+static char sweet_qr_frame[1024];
+static int sweet_qr_chan;
+
+static void
+sweet_qr_nap(uint32_t ms)
+{
+	(void)tsleep(&sweet_qr_chan, PZERO, "sweetqr", (int)MAX(1, (hz * ms) / 1000));
+}
+
+/* QL1 (boot-arg sweetqr_fmt=1): the deduplicated 12 kB tail of the log as a looping series of text QR codes. */
+static void
+sweet_qr1_loop(void)
+{
+	uint32_t chunk = 200, ms = 800, tail = 12000;
+
+	PE_parse_boot_argn("sweetqr_chunk", &chunk, sizeof(chunk));
+	PE_parse_boot_argn("sweetqr_ms", &ms, sizeof(ms));
+	PE_parse_boot_argn("sweetqr_tail", &tail, sizeof(tail));
+	if (chunk < 40 || chunk > 600) {
+		chunk = 200;
+	}
+	if (tail < chunk || tail > sizeof(sweet_qr_snap)) {
+		tail = 12000;
+	}
+	if (ms < 100) {
+		ms = 100;
+	}
+	printf("SWEET QR: taking over the screen (QL1, chunk %u bytes, %u ms/frame, last %u bytes)\n", chunk, ms, tail);
+	sweet_console_muted = 1;
+	for (;;) {
+		sweet_restart_poll();
+		uint32_t len = sweet_log_snapshot(sweet_qr_snap, tail);
+		uint32_t n = qrlog_nframes(len, chunk);
+		for (uint32_t i = 0; i < n; i++) {
+			/* vinfo (video_console.c), not PE_state.video: that one holds the PHYSICAL base */
+			struct vc_info *v = &vinfo;
+			if (!v->v_baseaddr || v->v_depth < 32) {
+				(void)tsleep(&sweet_qr_chan, PZERO, "sweetqr", hz);
+				continue;
+			}
+			qrlog_make_frame(sweet_qr_snap, len, chunk, i, sweet_qr_frame);
+			(void)qrlog_draw((volatile uint32_t *)v->v_baseaddr, v->v_width, v->v_height,
+			    v->v_rowbytes, sweet_qr_frame);
+			sweet_qr_nap(ms);
+		}
+	}
+}
+
+/* QL2 (default; qrlog/qrstream.h, host tools/qrl2.py): compressed append-only stream, repair frames, tiles. */
+static qs_t sweet_qs;
+static char sweet_qr_text[QS_TILES_MAX][QS_TEXT_MAX + 1];
+
+/* Feed the console bytes written since the last call into the stream (at most `budget` per call). */
+static void
+sweet_qr2_pump(uint64_t *pos, uint32_t budget, uint32_t *fed)
+{
+	static char copy[1024];
+
+	while (budget) {
+		uint32_t n = sweet_log_copy(pos, copy, (uint32_t)MIN((uint32_t)sizeof(copy), budget));
+		if (n == 0) {
+			break;
+		}
+		qs_feed(&sweet_qs, *pos - n, copy, n);
+		*fed += n;
+		budget -= n;
+	}
+}
+
+static void
+sweet_qr2_loop(uint32_t delay)
+{
+	uint32_t ver = 10, ecc = 0, tiles = 2, unit = 8192, k = 64, red = 0, ms = 800, flush_ms = 3000, hold = 1, fec = 1;
+	uint64_t t0 = mach_absolute_time(), pos = 0, last_new = t0, last_stat = t0;
+	uint32_t klog = 2, fed_total = 0;
+
+	PE_parse_boot_argn("sweetqr_ver", &ver, sizeof(ver));
+	PE_parse_boot_argn("sweetqr_ecc", &ecc, sizeof(ecc));
+	PE_parse_boot_argn("sweetqr_tiles", &tiles, sizeof(tiles));
+	PE_parse_boot_argn("sweetqr_unit", &unit, sizeof(unit));
+	PE_parse_boot_argn("sweetqr_k", &k, sizeof(k));
+	PE_parse_boot_argn("sweetqr_ms", &ms, sizeof(ms));
+	PE_parse_boot_argn("sweetqr_flush", &flush_ms, sizeof(flush_ms));
+	PE_parse_boot_argn("sweetqr_hold", &hold, sizeof(hold));
+	PE_parse_boot_argn("sweetqr_fec", &fec, sizeof(fec));
+	PE_parse_boot_argn("sweetqr_red", &red, sizeof(red));
+	while ((1u << klog) < k && klog < 9) {
+		klog++;
+	}
+	if (ms < 100) {
+		ms = 100;
+	}
+	uint32_t sid = (uint32_t)((t0 >> 3) ^ (t0 >> 19) ^ (t0 >> 35));
+	uint32_t B = qs_init(&sweet_qs, ver, ecc, tiles, unit, klog, sid);
+	if (B == 0) {
+		printf("SWEET QR: QL2 config rejected (ver %u ecc %u tiles %u unit %u k %u), falling back to QL1\n", ver, ecc, tiles, unit, k);
+		sweet_qr1_loop();
+		return;
+	}
+	qs_set_fec(&sweet_qs, fec);
+	qs_set_red(&sweet_qs, red);
+	uint64_t ticks_per_ms = 0;
+	{
+		uint64_t one = 0;
+		nanoseconds_to_absolutetime(1000000ULL, &one);
+		ticks_per_ms = one ? one : 1;
+	}
+	/* Feed the log from its first byte while the boot runs, so nothing early is lost; take over the screen after `delay` s. */
+	uint64_t deadline = t0 + (uint64_t)delay * 1000 * ticks_per_ms;
+	while (mach_absolute_time() < deadline) {
+		sweet_restart_poll();
+		uint32_t fed = 0;
+		sweet_qr2_pump(&pos, 256 * 1024, &fed);
+		if (fed) {
+			last_new = mach_absolute_time();
+		} else if (qs_pending(&sweet_qs) && mach_absolute_time() - last_new > (uint64_t)flush_ms * ticks_per_ms) {
+			(void)qs_flush(&sweet_qs);
+		}
+		sweet_qr_nap(fed ? 100 : 1000);
+	}
+	printf("SWEET QR: taking over the screen (QL2 sid %04x, QR v%u ecc %u, %u tile(s), %u B/frame, K %u, unit %u, %u ms/tick)\n",
+	    sid & 0xffff, sweet_qs.ver, ecc, tiles, B, 1u << klog, unit, ms);
+	sweet_console_muted = 1;
+	sweet_qr_hold = (int)hold;
+	for (;;) {
+		sweet_restart_poll();
+		uint32_t fed = 0;
+		sweet_qr2_pump(&pos, 64 * 1024, &fed);
+		uint64_t now = mach_absolute_time();
+		if (fed) {
+			last_new = now;
+		} else if (qs_pending(&sweet_qs) && now - last_new > (uint64_t)flush_ms * ticks_per_ms) {
+			(void)qs_flush(&sweet_qs);
+		}
+		fed_total += fed;
+		if (now - last_stat > 30000ULL * ticks_per_ms) {
+			last_stat = now;
+			printf("SWEET QR2: console %llu B -> stream %llu B (%llu blocks of %u B), %u B fed in the last 30 s\n",
+			    pos, sweet_qs.tx_len, qs_hi(&sweet_qs), sweet_qs.D, fed_total);
+			fed_total = 0;
+		}
+		struct vc_info *v = &vinfo;
+		if (!v->v_baseaddr || v->v_depth < 32) {
+			sweet_qr_nap(1000);
+			continue;
+		}
+		const char *tp[QS_TILES_MAX];
+		uint32_t nt = 0;
+		for (uint32_t t = 0; t < tiles; t++) {
+			if (qs_next_frame(&sweet_qs, sweet_qr_text[t]) == 0) {
+				break;
+			}
+			tp[nt++] = sweet_qr_text[t];
+		}
+		if (nt == 0) {
+			sweet_qr_nap(250);	/* first block not complete yet */
+			continue;
+		}
+		(void)qs_draw(&sweet_qs, (volatile uint32_t *)v->v_baseaddr, v->v_width, v->v_height, v->v_rowbytes, tp, nt);
+		sweet_qr_nap(ms);
+	}
+}
+
+static void
+sweet_qr_thread(__unused void *arg, __unused wait_result_t wr)
+{
+	uint32_t delay = 0, fmt = 2;
+
+	PE_parse_boot_argn("sweetqr", &delay, sizeof(delay));
+	PE_parse_boot_argn("sweetqr_fmt", &fmt, sizeof(fmt));
+	if (fmt == 1) {
+		/* Let the boot make progress first; the log keeps filling meanwhile. */
+		(void)tsleep(&sweet_qr_chan, PZERO, "sweetqr", (int)(hz * delay));
+		sweet_qr1_loop();
+	} else {
+		sweet_qr2_loop(delay);
+	}
+}
+
+void sweet_qr_start(void);
+
+/* boot-arg sweetqr=<seconds to wait before taking over the screen>; absent/0 = off. */
+void
+sweet_qr_start(void)
+{
+	static int started;
+	uint32_t delay = 0;
+	thread_t thread;
+
+	if (started) {
+		return;
+	}
+	started = 1;
+	if (!PE_parse_boot_argn("sweetqr", &delay, sizeof(delay)) || delay == 0) {
+		return;
+	}
+	if (kernel_thread_start(sweet_qr_thread, NULL, &thread) == KERN_SUCCESS) {
+		thread_deallocate(thread);
+	}
+}

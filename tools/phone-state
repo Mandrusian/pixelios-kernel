@@ -1,0 +1,108 @@
+#!/bin/bash
+# What state is the Pixel in, and is it the bluejay? ONE bounded command (every probe is wrapped in `timeout`).
+#   tools/phone-state [--expect android|recovery|fastboot|none] [--wait S] | --self-test
+# Output <= 4 lines, last: RESULT: PASS|FAIL|ERROR state=fastboot|recovery|android|booting|absent|other product=bluejay|unknown
+# Exit 0 PASS / 1 FAIL / 2 ERROR. Serials are never printed. Non-bluejay devices are reported, never touched beyond the id query.
+# Other tools only assume vendor 18d1. fastboot is queried only when the usb id says fastboot (18d1:d001 / 18d1:4ee0),
+# because a bare `fastboot getvar` against a phone in recovery hangs 120 s.
+TMO=${PS_TMO:-8}; [ "$TMO" -le 8 ] || TMO=8
+t() { timeout -k 1 "$TMO" "$@"; }
+
+probe() { # sets state, prod, note; returns 0 ok, 2 probe error (timeout)
+	state=absent prod=unknown note=""
+	local usb out s st rc=0 other=0 info dev boot p
+	usb=$(t lsusb 2>/dev/null) || { rc=$?; [ "$rc" -lt 124 ] || { note="lsusb timed out"; return 2; }; usb=""; }
+	echo "$usb" | grep -qi 'ID 18d1:' || { note="no Google USB device"; return 0; }
+	rc=0; out=$(t adb devices 2>/dev/null) || rc=$?
+	[ "$rc" -lt 124 ] || { note="adb devices timed out"; return 2; }
+	while read -r s st; do
+		[ -n "$s" ] && [ -n "$st" ] || continue
+		case "$st" in device|recovery|sideload|rescue) ;; *) other=1; continue ;; esac
+		rc=0; info=$(t adb -s "$s" shell 'getprop ro.product.device; getprop sys.boot_completed' 2>/dev/null) || rc=$?
+		[ "$rc" -lt 124 ] || { note="adb getprop timed out"; return 2; }
+		info=$(echo "$info" | tr -d '\r')
+		dev=$(echo "$info" | sed -n 1p); boot=$(echo "$info" | sed -n 2p)
+		[ "$dev" = bluejay ] || { other=1; continue; }
+		prod=bluejay
+		case "$st" in device) if [ "$boot" = 1 ]; then state=android; else state=booting; fi ;; *) state=recovery ;; esac
+		note="adb $st"; return 0
+	done < <(echo "$out" | sed 1d)
+	if [ $other = 0 ] && echo "$usb" | grep -qi 'ID 18d1:\(d001\|4ee0\)'; then
+		rc=0; out=$(t fastboot devices 2>/dev/null) || rc=$?
+		[ "$rc" -lt 124 ] || { note="fastboot devices timed out"; return 2; }
+		if [ -n "$out" ]; then
+			p=$(t fastboot getvar product 2>&1 | sed -n 's/^product: *//p' | head -1)
+			[ -n "$p" ] || { note="fastboot getvar product gave nothing/timed out"; return 2; }
+			if [ "$p" = bluejay ]; then state=fastboot prod=bluejay note="fastboot"; else state=other; note="OTHER-DEVICE (not touched)"; fi
+			return 0
+		fi
+	fi
+	state=other; note="OTHER-DEVICE (not touched)"
+	return 0
+}
+
+main() {
+	local expect="" wait=0 end rc ok want=""
+	while [ $# -gt 0 ]; do case "$1" in
+		--expect) expect=${2:-}; shift 2 ;; --wait) wait=${2:-}; shift 2 ;;
+		*) echo "usage: $0 [--expect android|recovery|fastboot|none] [--wait S] | --self-test" >&2; exit 2 ;; esac; done
+	case "$expect" in ""|android|recovery|fastboot|none) ;; *) echo "bad --expect" >&2; exit 2 ;; esac
+	[[ "$wait" =~ ^[0-9]+$ ]] || { echo "bad --wait" >&2; exit 2; }
+	[ "$wait" -le 300 ] || wait=300
+	[ "$expect" = none ] && want=absent || want=$expect
+	end=$(( $(date +%s) + wait ))
+	while :; do
+		probe; rc=$?
+		if [ $rc = 0 ]; then
+			if [ -n "$want" ]; then [ "$state" = "$want" ] && break; else [ "$prod" = bluejay ] && break; fi
+		fi
+		[ "$(date +%s)" -lt "$end" ] || break
+		sleep 2
+	done
+	echo "$note"
+	if [ $rc != 0 ]; then echo "RESULT: ERROR state=$state product=$prod"; exit 2; fi
+	if [ -n "$want" ]; then [ "$state" = "$want" ] && ok=1 || ok=0; else [ "$prod" = bluejay ] && ok=1 || ok=0; fi
+	if [ $ok = 1 ]; then echo "RESULT: PASS state=$state product=$prod"; exit 0; fi
+	echo "RESULT: FAIL state=$state product=$prod"; exit 1
+}
+
+selftest() {
+	local d self fail=0; d=$(mktemp -d); self=$(readlink -f "$0"); trap 'rm -rf "$d"' RETURN
+	cat >"$d/lsusb" <<'S'
+#!/bin/bash
+[ -z "$ST_USB" ] || echo "Bus 001 Device 005: ID $ST_USB Google Inc."
+S
+	cat >"$d/adb" <<'S'
+#!/bin/bash
+[ -z "$ST_HANG" ] || sleep 100
+case "$*" in
+	devices) echo "List of devices attached"; [ -z "$ST_ADB" ] || printf 'SECRET123\t%s\n' "$ST_ADB" ;;
+	*getprop*) echo "${ST_DEV:-bluejay}"; echo "${ST_BOOT-1}" ;;
+esac
+S
+	cat >"$d/fastboot" <<'S'
+#!/bin/bash
+case "$1" in devices) printf 'SECRET123\tfastboot\n' ;; getvar) echo "product: ${ST_DEV:-bluejay}" >&2 ;; esac
+S
+	chmod +x "$d"/*
+	chk() { # name expected_rc expected_state env...
+		local n=$1 erc=$2 est=$3 out rc; shift 3
+		out=$(env PATH="$d:$PATH" PS_TMO=1 "$@" "$self" $CHK_ARGS 2>&1); rc=$?
+		if [ $rc = "$erc" ] && echo "$out" | grep -q "state=$est " && ! echo "$out" | grep -q SECRET; then echo "ok   $n"
+		else echo "FAIL $n (rc=$rc): $out"; fail=1; fi
+	}
+	chk absent        1 absent   ST_USB=
+	chk fastboot      0 fastboot ST_USB=18d1:4ee0
+	chk recovery      0 recovery ST_USB=18d1:d001 ST_ADB=recovery
+	chk android       0 android  ST_USB=18d1:4ee2 ST_ADB=device
+	chk booting       0 booting  ST_USB=18d1:4ee2 ST_ADB=device ST_BOOT=
+	chk other-adb     1 other    ST_USB=18d1:4ee2 ST_ADB=device ST_DEV=sweet
+	chk other-fb      1 other    ST_USB=18d1:4ee0 ST_DEV=sweet
+	chk hang          2 absent   ST_USB=18d1:4ee2 ST_HANG=1
+	CHK_ARGS="--expect fastboot" chk expect-mismatch 1 android ST_USB=18d1:4ee2 ST_ADB=device
+	CHK_ARGS="--expect none" chk expect-none 0 absent ST_USB=
+	[ $fail = 0 ] && echo "self-test PASS" || echo "self-test FAIL"; return $fail
+}
+
+[ "${1:-}" = --self-test ] && { selftest; exit $?; }
+main "$@"

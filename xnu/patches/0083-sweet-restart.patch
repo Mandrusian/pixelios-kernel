@@ -1,0 +1,170 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -106,5 +106,6 @@
+ bsd/dev/memdev.c			standard
+ bsd/dev/sweet_ufs.c			standard
+ bsd/dev/sweet_qr.c			standard
++bsd/dev/sweet_restart.c			standard
+ bsd/dev/sweet_qrcodegen.c		standard
+ bsd/dev/sweet_sample.c			standard
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -10,6 +10,8 @@
+ #include <IOKit/IODeviceTreeSupport.h>
+ #include <IOKit/IOLib.h>
+ 
++extern "C" void sweet_restart_start(void);   /* bsd/dev/sweet_restart.c */
++
+ class SweetPlatformExpert : public IODTPlatformExpert {
+ 	OSDeclareDefaultStructors(SweetPlatformExpert);
+ 
+@@ -29,6 +31,7 @@
+ 	if (!IODTPlatformExpert::start(provider)) {
+ 		return false;
+ 	}
++	sweet_restart_start();
+ 	registerService();
+ 	IOLog("SWEET: platform expert registered\n");
+ 	return true;
+--- /dev/null
++++ b/bsd/dev/sweet_restart.c
+@@ -0,0 +1,139 @@
++/*
++ * SWEET restart (gs101): reset the phone from software, optionally into the bootloader, and an optional
++ * boot-arg timer so test images return to a known state by themselves (docs/research/10).
++ *
++ * The PMU is only writable from EL3: the PMU SMC 0x82000504 (x1 = physical address, x2 = 1 for write, x3 = value)
++ * is what ABL itself uses (observed on hardware from the shim: write 0xfc to SYSIP_DAT0 accepted and read back).
++ * Constants come from the ADT node /sweet-reset (only bluejay has it; sweet keeps PE_halt_restart unset).
++ * Boot-arg sweetrestart=<seconds>[,bootloader]; absent = off.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/proc.h>
++#include <kern/sched_prim.h>
++#include <kern/clock.h>
++#include <mach/mach_time.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include <libkern/libkern.h>
++#include <stdint.h>
++
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_deallocate(thread_t);
++extern int hz;
++extern int (*PE_halt_restart)(unsigned int type);
++
++#define SWEET_PMU_SMC           0x82000504ULL
++#define SWEET_MODE_BOOTLOADER   0xfcULL
++#define SWEET_SWRESET           2ULL
++/* IOPlatformExpert.h enum: kPEHaltCPU 0, kPERestartCPU 1, kPEPanicRestartCPU 4, kPEPanicRestartCPUNoCallouts 9 */
++#define SWEET_PE_RESTART        1u
++#define SWEET_PE_PANIC_RESTART  4u
++#define SWEET_PE_PANIC_NOCALL   9u
++
++static uint64_t sweet_pmu_pa, sweet_mode_off, sweet_swreset_off;
++
++static uint64_t
++sweet_pmu_write(uint64_t pa, uint64_t val)
++{
++	register uint64_t x0 __asm__("x0") = SWEET_PMU_SMC;
++	register uint64_t x1 __asm__("x1") = pa;
++	register uint64_t x2 __asm__("x2") = 1;
++	register uint64_t x3 __asm__("x3") = val;
++	__asm__ volatile("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3) : :
++	    "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13",
++	    "x14", "x15", "x16", "x17", "cc", "memory");
++	return x0;
++}
++
++/* No locks, no allocation: usable from the panic path. Does not return. */
++static void __attribute__((noreturn))
++sweet_machine_reset(int to_bootloader)
++{
++	if (to_bootloader) {
++		(void)sweet_pmu_write(sweet_pmu_pa + sweet_mode_off, SWEET_MODE_BOOTLOADER);
++	}
++	(void)sweet_pmu_write(sweet_pmu_pa + sweet_swreset_off, SWEET_SWRESET);
++	for (;;) {
++		__asm__ volatile ("wfe");
++	}
++}
++
++static int
++sweet_halt_restart(unsigned int type)
++{
++	switch (type) {
++	case SWEET_PE_RESTART:
++	case SWEET_PE_PANIC_RESTART:
++	case SWEET_PE_PANIC_NOCALL:
++		sweet_machine_reset(0);
++	default:
++		return -1;      /* halt etc.: unchanged (the caller spins) */
++	}
++}
++
++static uint64_t sweet_restart_deadline;       /* mach absolute time, 0 = off */
++static int sweet_restart_bl;
++
++/*
++ * Polled from threads that are known to run (the persistent-log thread in sweet_ufs.c and the QR thread): a dedicated
++ * sleeping thread never fired on hardware in 3 of 4 runs (cause unknown), a missed reset costs a button press.
++ */
++void
++sweet_restart_poll(void)
++{
++	if (sweet_restart_deadline != 0 && mach_absolute_time() >= sweet_restart_deadline) {
++		sweet_restart_deadline = 0;
++		printf("SWEET RESTART: resetting now (bootloader=%d)\n", sweet_restart_bl);
++		sweet_machine_reset(sweet_restart_bl);
++	}
++}
++
++/* Called once from SweetPlatformExpert::start(). Silent no-op on boards without /sweet-reset. */
++void
++sweet_restart_start(void)
++{
++	static int started;
++	DTEntry node;
++	uint64_t const *reg = NULL;
++	uint32_t const *off = NULL;
++	unsigned int size = 0;
++	char arg[32];
++
++	if (started) {
++		return;
++	}
++	started = 1;
++	if (SecureDTLookupEntry(NULL, "/sweet-reset", &node) != kSuccess ||
++	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess || size < 8) {
++		printf("SWEET RESTART: no /sweet-reset node\n");
++		return;
++	}
++	sweet_pmu_pa = reg[0];
++	if (SecureDTGetProperty(node, "mode-offset", (void const **)&off, &size) != kSuccess || size < 4) {
++		return;
++	}
++	sweet_mode_off = off[0];
++	if (SecureDTGetProperty(node, "swreset-offset", (void const **)&off, &size) != kSuccess || size < 4) {
++		return;
++	}
++	sweet_swreset_off = off[0];
++	PE_halt_restart = sweet_halt_restart;
++
++	arg[0] = 0;
++	if (PE_parse_boot_arg_str("sweetrestart", arg, sizeof(arg)) && arg[0]) {
++		int secs = 0;
++		const char *p = arg;
++		while (*p >= '0' && *p <= '9') {
++			secs = secs * 10 + (*p++ - '0');
++		}
++		sweet_restart_bl = (*p == ',' && strncmp(p + 1, "bootloader", 10) == 0);
++		if (secs > 0) {
++			uint64_t d;
++			nanoseconds_to_absolutetime((uint64_t)secs * NSEC_PER_SEC, &d);
++			sweet_restart_deadline = mach_absolute_time() + d;
++			printf("SWEET RESTART: armed, reset in %d s (bootloader=%d)\n", secs, sweet_restart_bl);
++		}
++	}
++}

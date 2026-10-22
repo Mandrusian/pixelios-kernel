@@ -1,0 +1,246 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 705a695..a5edaa3 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -111,6 +111,7 @@ bsd/dev/sweet_qrcodegen.c		standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
++bsd/dev/sweet_keys_gs101.c		standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/sweet_keys_gs101.c b/bsd/dev/sweet_keys_gs101.c
+new file mode 100644
+index 0000000..15c830c
+--- /dev/null
++++ b/bsd/dev/sweet_keys_gs101.c
+@@ -0,0 +1,145 @@
++/*
++ * SWEET keys (gs101): power, volume up, volume down read as plain GPIO levels and fed to the HID event
++ * service through sweet_hid_key() (iokit/Kernel/arm/hid/SweetHID.cpp). docs/research/16-keys-gs101.md.
++ *
++ * Read-only: only the GPIO DAT word of each pin is read, nothing is configured. Linux leaves the pins in the
++ * EINT function with no pull (gs101-pixel-common.dtsi:798-853, GS101_PIN_PULL_NONE) and gpio-keys reads the
++ * level with gpiod_get_value() = samsung_gpio_get() = (readl(bank + DAT) >> pin) & 1
++ * (pinctrl-samsung.c:592-611, Linux v6.12), so the DAT read is the same access path.
++ *
++ * Every address and pin comes from the ADT node /sweet-keys (tools/mkadt.py; device/google/bluejay/board.json
++ * key_pins, soc/google/gs101/soc.json gpio_alive_dat_off):
++ *   keys       u32 triples: sweet_hid_key index (0 power, 1 vol+, 2 vol-), physical address of the DAT word, pin
++ *   active-low u32, 1 = a low level means pressed
++ * Boards without the node (sweet) get a silent no-op. Boot-args: sweetkeys=0 disables, sweetkeysdelay=<s>
++ * (default 30) is the wait before the first read.
++ *
++ * One thread sleeping in tsleep() (the form the persistent-log thread uses, which is known to wake on bluejay)
++ * samples every tick and debounces with keys_deb_step().
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/proc.h>
++#include <kern/thread.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include <libkern/libkern.h>
++#include <stdint.h>
++
++#include "sweet_keys_gs101_debounce.h"
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_deallocate(thread_t);
++extern int hz;
++extern void sweet_hid_key(int key, int down);
++
++#define KEYS_MAX        4
++#define KEYS_DEBOUNCE   3u      /* consecutive samples; one sample per tick (10 ms at hz=100) */
++#define KEYS_PAGE       0x1000UL
++
++struct gs101_key {
++	uint32_t hid;                   /* sweet_hid_key index */
++	uint64_t pa;                    /* DAT word */
++	uint32_t pin;
++	volatile uint32_t *dat;         /* mapped after the delay */
++	struct keys_deb deb;
++};
++
++static struct gs101_key keys[KEYS_MAX];
++static unsigned nkeys;
++static int keys_active_low;
++static unsigned keys_delay_s = 30;
++static char keys_chan;
++
++static void
++keys_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	unsigned i;
++	int ticks = hz >= 100 ? hz / 100 : 1;
++
++	(void)tsleep(&keys_chan, PZERO, "sweetkeys", hz * (int)keys_delay_s);
++	for (i = 0; i < nkeys; i++) {
++		vm_offset_t va = ml_io_map((vm_offset_t)(keys[i].pa & ~(KEYS_PAGE - 1)), KEYS_PAGE);
++		if (va == 0) {
++			printf("SWEET KEYS: map of %#llx failed, key %u unavailable\n", keys[i].pa, keys[i].hid);
++			continue;
++		}
++		keys[i].dat = (volatile uint32_t *)(va + (keys[i].pa & (KEYS_PAGE - 1)));
++	}
++	for (i = 0; i < nkeys; i++) {
++		if (keys[i].dat) {
++			uint32_t dat = *keys[i].dat;
++			printf("SWEET KEYS: start key=%u pa=%#llx pin=%u dat=%#x down=%d\n", keys[i].hid, keys[i].pa,
++			    keys[i].pin, dat, keys_raw_down(dat, keys[i].pin, keys_active_low));
++		}
++	}
++	for (;;) {
++		for (i = 0; i < nkeys; i++) {
++			uint32_t dat;
++			int ev;
++			if (!keys[i].dat) {
++				continue;
++			}
++			dat = *keys[i].dat;
++			ev = keys_deb_step(&keys[i].deb, keys_raw_down(dat, keys[i].pin, keys_active_low), KEYS_DEBOUNCE);
++			if (ev >= 0) {
++				printf("SWEET KEYS: key=%u down=%d dat=%#x\n", keys[i].hid, ev, dat);
++				sweet_hid_key((int)keys[i].hid, ev);
++			}
++		}
++		(void)tsleep(&keys_chan, PZERO, "sweetkeys", ticks);
++	}
++}
++
++/* Called once from sweet_ufs_init(). Silent no-op on boards without /sweet-keys. */
++void
++sweet_keys_gs101_start(void)
++{
++	static int started;
++	DTEntry node;
++	uint32_t const *map = NULL, *al = NULL;
++	unsigned int size = 0;
++	uint32_t enabled = 1;
++	thread_t thread;
++	unsigned i;
++
++	if (started) {
++		return;
++	}
++	started = 1;
++	if (SecureDTLookupEntry(NULL, "/sweet-keys", &node) != kSuccess ||
++	    SecureDTGetProperty(node, "keys", (void const **)&map, &size) != kSuccess || size < 12) {
++		return;
++	}
++	(void)PE_parse_boot_argn("sweetkeys", &enabled, sizeof(enabled));
++	if (!enabled) {
++		printf("SWEET KEYS: disabled (sweetkeys=0)\n");
++		return;
++	}
++	if (SecureDTGetProperty(node, "active-low", (void const **)&al, &size) != kSuccess || size < 4) {
++		printf("SWEET KEYS: /sweet-keys has no active-low\n");
++		return;
++	}
++	keys_active_low = al[0] != 0;
++	(void)SecureDTGetProperty(node, "keys", (void const **)&map, &size);
++	nkeys = size / 12;
++	if (nkeys > KEYS_MAX) {
++		nkeys = KEYS_MAX;
++	}
++	for (i = 0; i < nkeys; i++) {
++		keys[i].hid = map[3 * i];
++		keys[i].pa = map[3 * i + 1];
++		keys[i].pin = map[3 * i + 2];
++	}
++	(void)PE_parse_boot_argn("sweetkeysdelay", &keys_delay_s, sizeof(keys_delay_s)); if (keys_delay_s == 0) { keys_delay_s = 1; }  /* tsleep(0) sleeps forever */
++	printf("SWEET KEYS: %u keys, active-low=%d, first read in %u s\n", nkeys, keys_active_low, keys_delay_s);
++	if (kernel_thread_start(keys_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("SWEET KEYS: kernel_thread_start failed\n");
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_keys_gs101_debounce.h b/bsd/dev/sweet_keys_gs101_debounce.h
+new file mode 100644
+index 0000000..b55955b
+--- /dev/null
++++ b/bsd/dev/sweet_keys_gs101_debounce.h
+@@ -0,0 +1,57 @@
++/*
++ * Button debounce for bsd/dev/sweet_keys_gs101.c. Pure functions, no kernel headers: the host test
++ * (shim/keys_gs101_host_test.c) compiles this exact text, extracted from xnu patch 0087.
++ */
++#ifndef SWEET_KEYS_GS101_DEBOUNCE_H
++#define SWEET_KEYS_GS101_DEBOUNCE_H
++
++#include <stdint.h>
++
++struct keys_deb {
++	uint8_t init;   /* first sample seen */
++	uint8_t state;  /* reported level, 1 = down */
++	uint8_t cand;   /* level that differs from state and is being counted */
++	uint8_t cnt;    /* consecutive samples at cand */
++};
++
++/* GPIO DAT word -> 1 when the key is down. */
++static inline int
++keys_raw_down(uint32_t dat, unsigned pin, int active_low)
++{
++	return (int)((dat >> (pin & 31u)) & 1u) != (active_low != 0);
++}
++
++/*
++ * Feed one raw sample. Returns 1 = press event, 0 = release event, -1 = nothing.
++ * The first sample only sets the reported level (a key held, or a wrong polarity, at start emits nothing);
++ * a change is reported after `need` consecutive samples at the new level.
++ */
++static inline int
++keys_deb_step(struct keys_deb *d, int down, unsigned need)
++{
++	down = down != 0;
++	if (!d->init) {
++		d->init = 1;
++		d->state = d->cand = (uint8_t)down;
++		d->cnt = 0;
++		return -1;
++	}
++	if (down == d->state) {
++		d->cnt = 0;
++		return -1;
++	}
++	if (d->cnt == 0 || down != d->cand) {
++		d->cand = (uint8_t)down;
++		d->cnt = 1;
++	} else if (d->cnt < 255) {
++		d->cnt++;
++	}
++	if (d->cnt >= need) {
++		d->state = (uint8_t)down;
++		d->cnt = 0;
++		return down;
++	}
++	return -1;
++}
++
++#endif
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index c05089e..95db214 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -53,6 +53,7 @@ extern void sweet_qr_start(void);
+ extern void sweet_sample_start(void);
+ extern void sweet_restart_poll(void);   /* bsd/dev/sweet_restart.c */
+ extern void sweet_usb_probe(void);
++extern void sweet_keys_gs101_start(void);   /* bsd/dev/sweet_keys_gs101.c, no-op without ADT /sweet-keys */
+ 
+ #define REG_CAP         0x00
+ #define REG_IS          0x20
+@@ -687,6 +688,7 @@ sweet_ufs_init(void)
+ 	sweet_log_start();
+ 	sweet_sample_start();
+ 	sweet_usb_probe();
++	sweet_keys_gs101_start();
+ 	return 0;
+ }
+ 

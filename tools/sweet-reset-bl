@@ -1,0 +1,4 @@
+#!/bin/bash
+# Ask a running iOS image (boot-arg sweetremote=1, xnu patch 0100) to reset into the bootloader. Sends one UDP datagram
+# to the phone's USB-net address; no reply, so success is only visible as the phone reaching fastboot (tools/phone).
+printf 'SWEET-RESET-BL' > /dev/udp/192.168.7.2/5141

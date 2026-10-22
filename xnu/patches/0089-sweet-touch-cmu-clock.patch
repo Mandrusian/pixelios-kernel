@@ -1,0 +1,232 @@
+diff --git a/bsd/dev/sweet_touch_gs101.c b/bsd/dev/sweet_touch_gs101.c
+index 8b44f74..a7e0ade 100644
+--- a/bsd/dev/sweet_touch_gs101.c
++++ b/bsd/dev/sweet_touch_gs101.c
+@@ -10,6 +10,10 @@
+  *   sweettouchdelay=S    seconds to wait before the first register access (default 45): a bus hang then
+  *                        happens after the GUI and the persistent log got there first
+  *   sweettouchmux=1      drive the AP/AOC mux (TS_SPI_SEL) low = AP if the AP is not already driving it low
++ *   sweettouchclk=0|1|2  0 (default) only READ the CMU_PERIC1 clock registers (always printed, "SWEET TOUCH: cmu");
++ *                        1 also force the USI11 clock chain (docs/research/19 section 6 steps 1,3,4,5: user mux,
++ *                        then gates ipclk_4, pclk_4, rstnsync); 2 additionally QCH |= ENABLE|CLOCK_REQ (step 6).
++ *                        The OPTION register (step 7) and the divider are never written.
+  *
+  * Sources ("Linux" = mainline v6.12, "DS-gs" = kernel/gs android-gs-bluejay-5.10-android13-qpr3, FTM5 = the
+  * fts_touch module of the same branch, see sweet_ftm5.h):
+@@ -21,6 +25,7 @@
+  *  - Pins: Linux drivers/pinctrl/samsung/pinctrl-exynos-arm64.c (exynos850_bank_type_off :47: CON 4 bits/pin at +0,
+  *    DAT 1 bit/pin at +4, PUD at +8), DS-gs gs101-pinctrl.dtsi:1024-1036 (spi11_bus function 2, spi11_cs function 1).
+  *  - Board wiring: DS-gs gs101-common-touch.dtsi:8-17, 63-100, gs101-fts-touch.dtsi:8-39.
++ *  - CMU_PERIC1 offsets/bits: docs/research/19-gs101-usi11-clock.md, all from the ADT (soc.json cmu_peric1_*).
+  * Not verifiable here, so unverified: the CMU gate/rate of the USI11 clock (the SPI clock is clk_from_cmu), the
+  * state ABL leaves the pins/USI in, whether the S2MPG10 rails LDO25M/LDO26M are on.
+  */
+@@ -96,6 +101,14 @@ static struct {
+ 	uint32_t chip_id[2], max_x, max_y, width, height;
+ 	struct tg_pin clk, mosi, miso, cs, irq, reset, mux;
+ 	vm_offset_t spi, usi, usi_mode;
++	struct {                          /* CMU_PERIC1 (docs/research/19); ok = every property was present */
++		bool ok;
++		uint64_t base, size;
++		uint32_t option, mux_usi, mux_bus, mux_bus_auto, mux_usi_auto, div, gate_ipclk, gate_pclk, gate_rstn, qch;
++		uint32_t sel_bit, busy_bit, manual_bit, val_bit, auto_bit, qch_en_bit, qch_req_bit;
++		vm_offset_t va;
++	} cmu;
++	int clk_mode;
+ 	int mode, mux_force;
+ 	uint32_t delay_s;
+ 	int sleep_chan;
+@@ -365,6 +378,129 @@ tg_parse(DTEntry node)
+ 	       tg.width > 1 && tg.height > 1 && tg.spi_func < 16;
+ }
+ 
++/* Optional: without the cmu-* properties the driver still runs, it just cannot dump or touch the CMU. */
++static void
++tg_parse_cmu(DTEntry node)
++{
++	static const struct { const char *name; uint32_t *p; } props[] = {
++		{ "cmu-option", &tg.cmu.option }, { "cmu-mux-usi", &tg.cmu.mux_usi },
++		{ "cmu-mux-bus", &tg.cmu.mux_bus }, { "cmu-mux-bus-auto", &tg.cmu.mux_bus_auto },
++		{ "cmu-mux-usi-auto", &tg.cmu.mux_usi_auto }, { "cmu-div", &tg.cmu.div },
++		{ "cmu-gate-ipclk", &tg.cmu.gate_ipclk }, { "cmu-gate-pclk", &tg.cmu.gate_pclk },
++		{ "cmu-gate-rstn", &tg.cmu.gate_rstn }, { "cmu-qch", &tg.cmu.qch },
++		{ "cmu-mux-sel-bit", &tg.cmu.sel_bit }, { "cmu-mux-busy-bit", &tg.cmu.busy_bit },
++		{ "cmu-gate-manual-bit", &tg.cmu.manual_bit }, { "cmu-gate-val-bit", &tg.cmu.val_bit },
++		{ "cmu-gate-auto-bit", &tg.cmu.auto_bit }, { "cmu-qch-enable-bit", &tg.cmu.qch_en_bit },
++		{ "cmu-qch-req-bit", &tg.cmu.qch_req_bit },
++	};
++	uint64_t reg[2];
++
++	if (!tg_dt_u64(node, "cmu-reg", reg, 2)) {
++		return;
++	}
++	for (unsigned i = 0; i < sizeof(props) / sizeof(props[0]); i++) {
++		if (!tg_dt_u32(node, props[i].name, props[i].p, 1) || *props[i].p >= (i < 10 ? reg[1] : 32u)) {
++			return;
++		}
++	}
++	tg.cmu.base = reg[0];
++	tg.cmu.size = reg[1];
++	tg.cmu.ok = true;
++}
++
++/* ---- CMU_PERIC1 clock chain of USI11 (docs/research/19) ---- */
++
++static uint32_t
++tg_cmu_rd(uint32_t off)
++{
++	return tg_rd(tg.cmu.va, off);
++}
++
++/* Reads only. Printed in every run, before the first write of any kind. */
++static void
++tg_cmu_dump(void)
++{
++	if (!tg.cmu.ok) {
++		printf("SWEET TOUCH: cmu: no usable cmu-* properties, clock registers not read\n");
++		return;
++	}
++	printf("SWEET TOUCH: cmu base %#llx: OPTION[%#x]=%#x usi_mux[%#x]=%#x bus_mux[%#x]=%#x bus_auto[%#x]=%#x "
++	    "usi_auto[%#x]=%#x div[%#x]=%#x\n", (unsigned long long)tg.cmu.base,
++	    tg.cmu.option, tg_cmu_rd(tg.cmu.option), tg.cmu.mux_usi, tg_cmu_rd(tg.cmu.mux_usi),
++	    tg.cmu.mux_bus, tg_cmu_rd(tg.cmu.mux_bus), tg.cmu.mux_bus_auto, tg_cmu_rd(tg.cmu.mux_bus_auto),
++	    tg.cmu.mux_usi_auto, tg_cmu_rd(tg.cmu.mux_usi_auto), tg.cmu.div, tg_cmu_rd(tg.cmu.div));
++	printf("SWEET TOUCH: cmu gates: ipclk_4[%#x]=%#x pclk_4[%#x]=%#x rstnsync[%#x]=%#x QCH[%#x]=%#x\n",
++	    tg.cmu.gate_ipclk, tg_cmu_rd(tg.cmu.gate_ipclk), tg.cmu.gate_pclk, tg_cmu_rd(tg.cmu.gate_pclk),
++	    tg.cmu.gate_rstn, tg_cmu_rd(tg.cmu.gate_rstn), tg.cmu.qch, tg_cmu_rd(tg.cmu.qch));
++}
++
++/* Write val to reg, read back, print before/after. The bits in check must read back as in val. */
++static bool
++tg_cmu_write_check(const char *what, uint32_t off, uint32_t val, uint32_t check)
++{
++	uint32_t before = tg_cmu_rd(off), after;
++
++	tg_wr(tg.cmu.va, off, val);
++	after = tg_cmu_rd(off);
++	printf("SWEET TOUCH: cmu %s [%#x]: %#x -> wrote %#x -> %#x\n", what, off, before, val, after);
++	if ((after & check) != (val & check)) {
++		printf("SWEET TOUCH: cmu %s: read-back mismatch (mask %#x), clock sequence aborted\n", what, check);
++		return false;
++	}
++	return true;
++}
++
++/* Step 3/4/5: manual gate open = MANUAL 1, CG_VAL 1, automatic gating 0. */
++static bool
++tg_cmu_gate(const char *what, uint32_t off)
++{
++	uint32_t m = 1u << tg.cmu.manual_bit, v = 1u << tg.cmu.val_bit, a = 1u << tg.cmu.auto_bit;
++	uint32_t val = (tg_cmu_rd(off) | m | v) & ~a;
++
++	return tg_cmu_write_check(what, off, val, m | v | a);
++}
++
++/* sweettouchclk >= 1: docs/research/19 section 6 steps 1,3,4,5 (and 6 for 2). Returns false if aborted. */
++static bool
++tg_cmu_enable(void)
++{
++	uint32_t sel = 1u << tg.cmu.sel_bit, busy = 1u << tg.cmu.busy_bit, v;
++	uint64_t t0;
++
++	if (!tg.cmu.ok || tg.clk_mode < 1) {
++		return true;
++	}
++	v = tg_cmu_rd(tg.cmu.mux_usi);
++	printf("SWEET TOUCH: cmu: sweettouchclk=%d, forcing the USI11 clock chain\n", tg.clk_mode);
++	if (v & sel) {
++		printf("SWEET TOUCH: cmu usi mux [%#x] = %#x: already selects the TOP source, not written\n",
++		    tg.cmu.mux_usi, v);
++	} else {
++		if (!tg_cmu_write_check("usi mux", tg.cmu.mux_usi, v | sel, sel)) {
++			return false;
++		}
++		t0 = tg_now_us();
++		while ((tg_cmu_rd(tg.cmu.mux_usi) & busy) && tg_now_us() - t0 < 1000u) {
++		}
++		if (tg_cmu_rd(tg.cmu.mux_usi) & busy) {
++			printf("SWEET TOUCH: cmu usi mux still BUSY after 1 ms, clock sequence aborted\n");
++			return false;
++		}
++	}
++	if (!tg_cmu_gate("ipclk_4 gate", tg.cmu.gate_ipclk) || !tg_cmu_gate("pclk_4 gate", tg.cmu.gate_pclk) ||
++	    !tg_cmu_gate("rstnsync gate", tg.cmu.gate_rstn)) {
++		return false;
++	}
++	if (tg.clk_mode >= 2) {
++		uint32_t q = (1u << tg.cmu.qch_en_bit) | (1u << tg.cmu.qch_req_bit);
++		if (!tg_cmu_write_check("QCH", tg.cmu.qch, tg_cmu_rd(tg.cmu.qch) | q, q)) {
++			return false;
++		}
++	}
++	printf("SWEET TOUCH: cmu: clock sequence done\n");
++	return true;
++}
++
+ /* ---- bring-up ---- */
+ 
+ static bool
+@@ -373,6 +509,13 @@ tg_map_all(void)
+ 	tg.spi = tg_map(tg.spi_pa, tg.spi_size);
+ 	tg.usi_mode = tg_map(tg.usi_mode_pa, 4);
+ 	tg.usi = tg.spi ? tg.spi + (vm_offset_t)tg.usi_off : 0;
++	if (tg.cmu.ok) {
++		tg.cmu.va = tg_map(tg.cmu.base, tg.cmu.size);
++		if (!tg.cmu.va) {
++			printf("SWEET TOUCH: cmu mapping failed, CMU not used\n");
++			tg.cmu.ok = false;
++		}
++	}
+ 	return tg.spi && tg.usi_mode && tg_pin_map(&tg.clk) && tg_pin_map(&tg.mosi) && tg_pin_map(&tg.miso) &&
+ 	       tg_pin_map(&tg.cs) && tg_pin_map(&tg.irq) && tg_pin_map(&tg.reset) && tg_pin_map(&tg.mux);
+ }
+@@ -466,6 +609,9 @@ tg_identify(void)
+ 	(void)ftm5_hwreg_read_cmd(cmd, FTM5_ADDR_DCHIP_ID);
+ 	if (tg_read(cmd, sizeof(cmd), id, sizeof(id))) {
+ 		printf("SWEET TOUCH: identify: SPI transfer timed out (no clock, or the pads are not the SPI function)\n");
++		printf("SWEET TOUCH: identify timeout: SPI status=%#x ch=%#x clk=%#x\n", tg_rd(tg.spi, SPI_STATUS),
++		    tg_rd(tg.spi, SPI_CH_CFG), tg_rd(tg.spi, SPI_CLK_CFG));
++		tg_cmu_dump();
+ 		return false;
+ 	}
+ 	match = ftm5_chip_id_match(id, want);
+@@ -614,7 +760,12 @@ tg_run(void)
+ 		printf("SWEET TOUCH: MMIO mapping failed\n");
+ 		return;
+ 	}
+-	if (!tg_report_and_check_mux() || !tg_spi_setup()) {
++	tg_cmu_dump();    /* reads only, before any write below */
++	if (!tg_report_and_check_mux()) {
++		return;
++	}
++	(void)tg_cmu_enable();    /* an aborted sequence is reported; the identify below shows whether it mattered */
++	if (!tg_spi_setup()) {
+ 		return;
+ 	}
+ 	if (!tg_identify()) {
+@@ -667,7 +818,7 @@ sweet_touch_gs101_init(void)
+ 	DTEntry node;
+ 	char const *compat = NULL;
+ 	unsigned int csize = 0;
+-	int mode = 2, delay_s = 45, mux = 0;
++	int mode = 2, delay_s = 45, mux = 0, clk = 0;
+ 	thread_t thread;
+ 
+ 	if (started) {
+@@ -689,6 +840,7 @@ sweet_touch_gs101_init(void)
+ 	}
+ 	(void)PE_parse_boot_argn("sweettouchdelay", &delay_s, sizeof(delay_s));
+ 	(void)PE_parse_boot_argn("sweettouchmux", &mux, sizeof(mux));
++	(void)PE_parse_boot_argn("sweettouchclk", &clk, sizeof(clk));
+ 	if (delay_s < 0 || delay_s > 3600) {
+ 		delay_s = 45;
+ 	}
+@@ -696,6 +848,8 @@ sweet_touch_gs101_init(void)
+ 		printf("SWEET TOUCH: /sweet-touch is incomplete, driver not started\n");
+ 		return;
+ 	}
++	tg_parse_cmu(node);
++	tg.clk_mode = clk < 0 ? 0 : clk > 2 ? 2 : clk;
+ 	tg.mode = mode;
+ 	tg.delay_s = (uint32_t)delay_s;
+ 	tg.mux_force = mux == 1;

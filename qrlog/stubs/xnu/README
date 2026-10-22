@@ -1,0 +1,2 @@
+Minimal stand-ins for the XNU headers the generated QR sources include (bsd/dev/sweet_qr*.c). Only what the code uses, with the real
+signatures; tools/test_qrl2.py syntax-checks the files of patches 0081/0086/0094 against them (clang -fsyntax-only -Wall -Wextra -Werror).

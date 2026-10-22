@@ -1,0 +1,278 @@
+diff --git a/bsd/dev/sweet_touch_gs101.c b/bsd/dev/sweet_touch_gs101.c
+index a7e0ade..6683693 100644
+--- a/bsd/dev/sweet_touch_gs101.c
++++ b/bsd/dev/sweet_touch_gs101.c
+@@ -14,6 +14,28 @@
+  *                        1 also force the USI11 clock chain (docs/research/19 section 6 steps 1,3,4,5: user mux,
+  *                        then gates ipclk_4, pclk_4, rstnsync); 2 additionally QCH |= ENABLE|CLOCK_REQ (step 6).
+  *                        The OPTION register (step 7) and the divider are never written.
++ *   sweettouchvar=0|1    1: if the first identify times out, try up to 5 SPI/USI variants (A..E below) and stop at the
++ *                        first whose burst completes, then identify again (default 0: only the register dump runs)
++ *
++ * Variants (patch 0090). Linux = master of git.kernel.org torvalds/linux.git fetched 2026-10-22 (line numbers of that copy):
++ *   A  CLK_CFG |= ENCLK (bit 8), PSR (bits 7:0) = 3: spi-s3c64xx.c S3C64XX_SPI_ENCLK_ENABLE :52, PSR_MASK :53, set in
++ *      s3c64xx_spi_config :758-:766. Linux does this only if !clk_from_cmu; gs101_spi_port_config :1597-:1608 has
++ *      clk_from_cmu = true, so mainline never sets ENCLK/PSR on gs101 (A is a guess, harmless).
++ *   B  channel enable (CH_CFG TXCH_ON|RXCH_ON) BEFORE the TX FIFO load. Linux s3c64xx_enable_datapath :490-:557 loads the
++ *      FIFO first (s3c64xx_iowrite_rep :523, PIO) and writes CH_CFG with TXCH_ON last (:555), the order the normal
++ *      path here already uses; B is the reverse.
++ *   C  USI_CON reset released, then USI_OPTION (usi + 0x08) CLKREQ_ON (bit 1) set, CLKSTOP_ON (bit 2) clear:
++ *      exynos-usi.c USI_OPTION :42, bits :46-:47, exynos_usi_enable :173-:197. Linux does the OPTION write only with the
++ *      DT property samsung,clkreq-on (:264); the gs101 usi11 node (gs101.dtsi :1469-:1481) lacks it. That node is
++ *      reg = <0x10d400c0 0x20> = SPI base 0x10d40000 + 0xc0, so the USI block position is confirmed, not a guess.
++ *   D  USI_CON reset set, then cleared (exynos_usi_unconfigure :218-:243, enable :183-:185), then SW_CONF written again
++ *      (exynos_usi_set_sw_conf :141-:158; USIv2 SPI = BIT(1), :35).
++ *   E  CS_REG = CS_AUTO (bit 1) | NSC_CNT_2 (2 << 4), exactly what s3c64xx_spi_set_cs :355-:377 writes per transfer for
++ *      QUIRK_CS_AUTO (:369-:371, bits :70-:71), which gs101_spi_port_config has (:1607). The cs GPIO is NOT driven around the
++ *      burst, and the cs pad is switched to the SPI function for this variant only (DS-gs gs101-pinctrl.dtsi:1036-1041
++ *      spi11_cs_func = function 2 on gpp23-3; spi11_cs, function 1, is the GPIO output the other variants use), printed,
++ *      and put back to GPIO output / high afterwards.
++ *   Engine reset before every variant = hwinit + s3c64xx_flush_fifo (spi-s3c64xx.c :1118-:1155, :229).
+  *
+  * Sources ("Linux" = mainline v6.12, "DS-gs" = kernel/gs android-gs-bluejay-5.10-android13-qpr3, FTM5 = the
+  * fts_touch module of the same branch, see sweet_ftm5.h):
+@@ -83,11 +105,18 @@ void sweet_touch_gs101_init(void);
+ #define ST_TX_LVL(v)     (((v) >> 6) & 0x1ffu)   /* S3C64XX_SPI_ST_TX_FIFO_RDY_V2 = GENMASK(14, 6) */
+ #define MODE_TRAILCNT    (0x3ffu << 19)          /* S3C64XX_SPI_MAX_TRAILCNT << S3C64XX_SPI_TRAILCNT_OFF */
+ #define PND_ERR_CLR      0x1eu                   /* RX/TX over/underrun clear bits 4:1, spi_hwinit :1141 */
++#define CLK_ENCLK        (1u << 8)               /* S3C64XX_SPI_ENCLK_ENABLE */
++#define CLK_PSR_MASK     0xffu                   /* S3C64XX_SPI_PSR_MASK */
++#define CS_AUTO          (1u << 1)               /* S3C64XX_SPI_CS_AUTO */
++#define CS_NSC_CNT_2     (2u << 4)               /* S3C64XX_SPI_CS_NSC_CNT_2 */
+ #define SPI_FIFO_BYTES   64u                     /* gs101_spi_port_config.fifo_depth */
+ 
+ /* USI (exynos-usi.c) */
+ #define USI_CON          0x04u
+ #define USI_CON_RESET    (1u << 0)
++#define USI_OPTION       0x08u
++#define USI_OPT_CLKREQ   (1u << 1)               /* USI_OPTION_CLKREQ_ON */
++#define USI_OPT_CLKSTOP  (1u << 2)               /* USI_OPTION_CLKSTOP_ON */
+ 
+ struct tg_pin {
+ 	uint64_t bank_pa;    /* physical address of the bank's CON register */
+@@ -108,7 +137,8 @@ static struct {
+ 		uint32_t sel_bit, busy_bit, manual_bit, val_bit, auto_bit, qch_en_bit, qch_req_bit;
+ 		vm_offset_t va;
+ 	} cmu;
+-	int clk_mode;
++	int clk_mode, var;
++	uint32_t last_st, last_ch;   /* STATUS / CH_CFG at the last burst timeout */
+ 	int mode, mux_force;
+ 	uint32_t delay_s;
+ 	int sleep_chan;
+@@ -231,7 +261,7 @@ tg_spi_flush(void)
+ /* One burst of len bytes (len <= 64) with the chip select already low. tx may be NULL (zeros are clocked out),
+  * rx may be NULL (the received bytes are dropped). Returns 0 or -1 on timeout. */
+ static int
+-tg_spi_burst(const uint8_t *tx, uint8_t *rx, unsigned len)
++tg_spi_burst_ex(const uint8_t *tx, uint8_t *rx, unsigned len, bool chan_first)
+ {
+ 	uint32_t chcfg;
+ 	uint64_t t0;
+@@ -243,13 +273,20 @@ tg_spi_burst(const uint8_t *tx, uint8_t *rx, unsigned len)
+ 	tg_spi_flush();
+ 	chcfg = (tg_rd(tg.spi, SPI_CH_CFG) & ~CH_TXCH_ON) | CH_RXCH_ON;
+ 	tg_wr(tg.spi, SPI_PACKET_CNT, len | PKT_CNT_EN);
++	if (chan_first) {   /* variant B: the reverse of Linux (FIFO first, CH_CFG last) */
++		tg_wr(tg.spi, SPI_CH_CFG, chcfg | CH_TXCH_ON);
++	}
+ 	for (i = 0; i < len; i++) {
+ 		tg_wr(tg.spi, SPI_TX_DATA, tx ? tx[i] : 0u);   /* byte per 32-bit write: use_32bit_io */
+ 	}
+-	tg_wr(tg.spi, SPI_CH_CFG, chcfg | CH_TXCH_ON);
++	if (!chan_first) {
++		tg_wr(tg.spi, SPI_CH_CFG, chcfg | CH_TXCH_ON);
++	}
+ 	t0 = tg_now_us();
+ 	while (ST_RX_LVL(tg_rd(tg.spi, SPI_STATUS)) < len) {
+ 		if (tg_now_us() - t0 > 20000u) {   /* 64 bytes at even 100 kHz take 5 ms */
++			tg.last_st = tg_rd(tg.spi, SPI_STATUS);
++			tg.last_ch = tg_rd(tg.spi, SPI_CH_CFG);
+ 			tg_wr(tg.spi, SPI_CH_CFG, tg_rd(tg.spi, SPI_CH_CFG) & ~(CH_RXCH_ON | CH_TXCH_ON));
+ 			return -1;
+ 		}
+@@ -264,6 +301,12 @@ tg_spi_burst(const uint8_t *tx, uint8_t *rx, unsigned len)
+ 	return 0;
+ }
+ 
++static int
++tg_spi_burst(const uint8_t *tx, uint8_t *rx, unsigned len)
++{
++	return tg_spi_burst_ex(tx, rx, len, false);
++}
++
+ /* The FTM5 transaction shape of fts_lib/ftsIO.c:174-262: write ncmd bytes, then read nrd bytes, one chip-select
+  * assertion (two spi_transfers in one spi_message). nrd = 0 is a plain write (ftsIO.c:264). */
+ static int
+@@ -554,6 +597,21 @@ tg_report_and_check_mux(void)
+ 	return true;
+ }
+ 
++/* s3c64xx_spi_hwinit + flush (CS_REG and CLK_CFG are not touched). Also the reset in front of every variant. */
++static void
++tg_spi_engine_init(void)
++{
++	tg_wr(tg.spi, SPI_INT_EN, 0);
++	tg_wr(tg.spi, SPI_MODE_CFG, 0);
++	tg_wr(tg.spi, SPI_PACKET_CNT, 0);
++	tg_wr(tg.spi, SPI_PENDING_CLR, PND_ERR_CLR);
++	tg_wr(tg.spi, SPI_PENDING_CLR, 0);
++	tg_wr(tg.spi, SPI_SWAP_CFG, 0);
++	tg_wr(tg.spi, SPI_CH_CFG, 0);              /* CPOL = 0, CPHA = 0 (no spi-cpol/cpha in the DT), master */
++	tg_wr(tg.spi, SPI_FB_CLK, 1);              /* samsung,spi-feedback-delay = <1>, gs101-fts-touch.dtsi:35 */
++	tg_spi_flush();
++}
++
+ /* Phase 1a: USI to SPI mode, SPI pads, SPI engine init (exynos_usi_set_sw_conf + exynos_usi_enable +
+  * s3c64xx_spi_hwinit). Returns false if the engine does not look alive. */
+ static bool
+@@ -581,15 +639,7 @@ tg_spi_setup(void)
+ 	printf("SWEET TOUCH: SPI regs before init: ch=%#x clk=%#x mode=%#x status=%#x fb=%#x\n",
+ 	    tg_rd(tg.spi, SPI_CH_CFG), tg_rd(tg.spi, SPI_CLK_CFG), tg_rd(tg.spi, SPI_MODE_CFG),
+ 	    tg_rd(tg.spi, SPI_STATUS), tg_rd(tg.spi, SPI_FB_CLK));
+-	tg_wr(tg.spi, SPI_INT_EN, 0);
+-	tg_wr(tg.spi, SPI_MODE_CFG, 0);
+-	tg_wr(tg.spi, SPI_PACKET_CNT, 0);
+-	tg_wr(tg.spi, SPI_PENDING_CLR, PND_ERR_CLR);
+-	tg_wr(tg.spi, SPI_PENDING_CLR, 0);
+-	tg_wr(tg.spi, SPI_SWAP_CFG, 0);
+-	tg_wr(tg.spi, SPI_CH_CFG, 0);              /* CPOL = 0, CPHA = 0 (no spi-cpol/cpha in the DT), master */
+-	tg_wr(tg.spi, SPI_FB_CLK, 1);              /* samsung,spi-feedback-delay = <1>, gs101-fts-touch.dtsi:35 */
+-	tg_spi_flush();
++	tg_spi_engine_init();
+ 	printf("SWEET TOUCH: SPI regs after init:  ch=%#x clk=%#x mode=%#x status=%#x fb=%#x (max %u Hz; the\n"
+ 	    "SWEET TOUCH: actual SCK = CMU ipclk / 4 and is unverified)\n",
+ 	    tg_rd(tg.spi, SPI_CH_CFG), tg_rd(tg.spi, SPI_CLK_CFG), tg_rd(tg.spi, SPI_MODE_CFG),
+@@ -597,6 +647,80 @@ tg_spi_setup(void)
+ 	return true;
+ }
+ 
++/* Item 1 of 0090: reads only. USI block, all 12 SPI registers, the SPI pads. */
++static void
++tg_spi_diag(const char *when)
++{
++	printf("SWEET TOUCH: diag %s: USI_CON=%#x USI_OPTION=%#x USI mode=%#x\n", when, tg_rd(tg.usi, USI_CON),
++	    tg_rd(tg.usi, USI_OPTION), tg_rd(tg.usi_mode, 0));
++	printf("SWEET TOUCH: diag %s: ch=%#x clk=%#x mode=%#x cs=%#x inten=%#x status=%#x\n", when,
++	    tg_rd(tg.spi, SPI_CH_CFG), tg_rd(tg.spi, SPI_CLK_CFG), tg_rd(tg.spi, SPI_MODE_CFG),
++	    tg_rd(tg.spi, SPI_CS_REG), tg_rd(tg.spi, SPI_INT_EN), tg_rd(tg.spi, SPI_STATUS));
++	printf("SWEET TOUCH: diag %s: pktcnt=%#x pend=%#x swap=%#x fb=%#x (TX/RX data not read)\n", when,
++	    tg_rd(tg.spi, SPI_PACKET_CNT), tg_rd(tg.spi, SPI_PENDING_CLR), tg_rd(tg.spi, SPI_SWAP_CFG),
++	    tg_rd(tg.spi, SPI_FB_CLK));
++	tg_pin_report("clk", &tg.clk);
++	tg_pin_report("mosi", &tg.mosi);
++	tg_pin_report("miso", &tg.miso);
++	tg_pin_report("cs", &tg.cs);
++}
++
++/* Variants A..E (sweettouchvar=1, header comment). Returns true when the 5-byte burst of the chip-id read completed. */
++static bool
++tg_variant(unsigned n)
++{
++	uint8_t cmd[5];
++	uint32_t v;
++	int err;
++
++	switch (n) {
++	case 0:   /* A */
++		v = tg_rd(tg.spi, SPI_CLK_CFG);
++		tg_wr(tg.spi, SPI_CLK_CFG, (v & ~CLK_PSR_MASK) | 3u | CLK_ENCLK);
++		break;
++	case 2:   /* C */
++		tg_wr(tg.usi, USI_CON, tg_rd(tg.usi, USI_CON) & ~USI_CON_RESET);
++		delay(1);
++		v = tg_rd(tg.usi, USI_OPTION);
++		tg_wr(tg.usi, USI_OPTION, (v & ~USI_OPT_CLKSTOP) | USI_OPT_CLKREQ);
++		break;
++	case 3:   /* D */
++		tg_wr(tg.usi, USI_CON, tg_rd(tg.usi, USI_CON) | USI_CON_RESET);
++		delay(1);
++		tg_wr(tg.usi, USI_CON, tg_rd(tg.usi, USI_CON) & ~USI_CON_RESET);
++		delay(1);
++		v = tg_rd(tg.usi_mode, 0);
++		tg_wr(tg.usi_mode, 0, (v & ~tg.usi_mode_mask) | tg.usi_mode_spi);
++		break;
++	case 4:   /* E: engine-driven chip select */
++		tg_wr(tg.spi, SPI_CS_REG, CS_AUTO | CS_NSC_CNT_2);
++		tg_pin_set_func(&tg.cs, tg.spi_func);
++		tg_pin_report("cs(E)", &tg.cs);
++		break;
++	default:  /* B: nothing but the order in the burst */
++		break;
++	}
++	tg_spi_engine_init();   /* the engine reset of tg_spi_setup, after the USI/clock change (a USI reset clears it) */
++	cmd[0] = 0;
++	(void)ftm5_hwreg_read_cmd(cmd, FTM5_ADDR_DCHIP_ID);
++	if (n != 4) {
++		tg_pin_put(&tg.cs, 0);
++		delay(1);
++	}
++	tg.last_st = tg.last_ch = 0;
++	err = tg_spi_burst_ex(cmd, NULL, sizeof(cmd), n == 1);
++	delay(FTM5_SPI_DELAY_CS_US);
++	tg_pin_put(&tg.cs, 1);
++	if (n == 4) {   /* back to the GPIO chip select of tg_xfer */
++		tg_pin_set_func(&tg.cs, PIN_FUNC_OUTPUT);
++	}
++	delay(2);
++	printf("SWEET TOUCH: VARIANT %c: %s, status=%#x ch=%#x (at timeout: status=%#x ch=%#x) clk=%#x\n", (char)('A' + n),
++	    err ? "timeout" : "completed", tg_rd(tg.spi, SPI_STATUS), tg_rd(tg.spi, SPI_CH_CFG), tg.last_st, tg.last_ch,
++	    tg_rd(tg.spi, SPI_CLK_CFG));
++	return err == 0;
++}
++
+ static bool
+ tg_identify(void)
+ {
+@@ -751,6 +875,7 @@ static void
+ tg_run(void)
+ {
+ 	unsigned logged = 0, errors = 0;
++	bool ok;
+ 
+ 	printf("SWEET TOUCH: gs101 FTM5 driver, mode %d, starting in %u s\n", tg.mode, tg.delay_s);
+ 	tg_sleep_ms(tg.delay_s * 1000u);
+@@ -768,7 +893,17 @@ tg_run(void)
+ 	if (!tg_spi_setup()) {
+ 		return;
+ 	}
+-	if (!tg_identify()) {
++	tg_spi_diag("after setup");
++	ok = tg_identify();
++	for (unsigned n = 0; !ok && tg.var && n < 5; n++) {
++		if (tg_variant(n)) {
++			printf("SWEET TOUCH: VARIANT %c completes, identifying again\n", (char)('A' + n));
++			tg_spi_diag("after variant");
++			ok = tg_identify();
++			break;
++		}
++	}
++	if (!ok) {
+ 		printf("SWEET TOUCH: phase 1 result: chip did not answer; nothing else is touched\n");
+ 		return;
+ 	}
+@@ -818,7 +953,7 @@ sweet_touch_gs101_init(void)
+ 	DTEntry node;
+ 	char const *compat = NULL;
+ 	unsigned int csize = 0;
+-	int mode = 2, delay_s = 45, mux = 0, clk = 0;
++	int mode = 2, delay_s = 45, mux = 0, clk = 0, var = 0;
+ 	thread_t thread;
+ 
+ 	if (started) {
+@@ -841,6 +976,7 @@ sweet_touch_gs101_init(void)
+ 	(void)PE_parse_boot_argn("sweettouchdelay", &delay_s, sizeof(delay_s));
+ 	(void)PE_parse_boot_argn("sweettouchmux", &mux, sizeof(mux));
+ 	(void)PE_parse_boot_argn("sweettouchclk", &clk, sizeof(clk));
++	(void)PE_parse_boot_argn("sweettouchvar", &var, sizeof(var));
+ 	if (delay_s < 0 || delay_s > 3600) {
+ 		delay_s = 45;
+ 	}
+@@ -849,6 +985,7 @@ sweet_touch_gs101_init(void)
+ 		return;
+ 	}
+ 	tg_parse_cmu(node);
++	tg.var = var == 1;
+ 	tg.clk_mode = clk < 0 ? 0 : clk > 2 ? 2 : clk;
+ 	tg.mode = mode;
+ 	tg.delay_s = (uint32_t)delay_s;

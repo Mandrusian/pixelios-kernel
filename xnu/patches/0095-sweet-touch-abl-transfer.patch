@@ -1,0 +1,193 @@
+From: PixeliOS <noreply@example.invalid>
+Subject: [PATCH] sweet: gs101 touch ABL-exact transfer (sweettouchcs=1)
+
+Observed working in the shim probe run touch1 (docs/HANDOFF.md session 12): rails on + oscillator clock + ABL spi_xfer + reset pulse before the identify gave 36 48.
+
+---
+diff --git a/bsd/dev/sweet_touch_gs101.c b/bsd/dev/sweet_touch_gs101.c
+--- a/bsd/dev/sweet_touch_gs101.c
++++ b/bsd/dev/sweet_touch_gs101.c
+@@ -9,6 +9,11 @@
+  *   sweettouch=0|1|2     0 off; 1 identify only (phase 1); 2 identify, then enable and poll (phase 2, default)
+  *   sweettouchdelay=S    seconds to wait before the first register access (default 45): a bus hang then
+  *                        happens after the GUI and the persistent log got there first
++ *   sweettouchcs=1       ABL-exact transfer (patch 0095, observed to work in the shim probe run touch1, docs/HANDOFF.md session 12):
++ *                        USI_CON reset + USI_OPTION CLKREQ + FB_CLK instead of the engine init, CS_REG &= ~1 around each transaction,
++ *                        the ABL's burst (no MODE_CFG/INT_EN/SWAP_CFG writes), PUD := 0 on the five pads, and the reset pulse +
++ *                        controller-ready wait BEFORE the identify. Needs the rails on (shim --touch-probe=rails) and the oscillator
++ *                        clock: sweettouchpoke="m:10c00640=0=10;d:100;m:10c0180c=5=f;" (USI mux bit4 := 0, divider := 5).
+  *   sweettouchmux=1      drive the AP/AOC mux (TS_SPI_SEL) low = AP if the AP is not already driving it low
+  *   sweettouchclk=0|1|2  0 (default) only READ the CMU_PERIC1 clock registers (always printed, "SWEET TOUCH: cmu");
+  *                        1 also force the USI11 clock chain (docs/research/19 section 6 steps 1,3,4,5: user mux,
+@@ -157,7 +162,8 @@
+ 		uint32_t mux, div, gate, gate_bit;
+ 		vm_offset_t va;
+ 	} top;
+-	int clk_mode, var;
++	int clk_mode, var, cs_abl;
++	bool reset_done;   /* tg_reset_and_ready already ran (sweettouchcs=1 does it before the identify) */
+ 	char poke[POKE_MAX_LEN + 16];   /* sweettouchpoke boot-arg (empty = none) */
+ 	uint32_t last_st, last_ch;   /* STATUS / CH_CFG at the last burst timeout */
+ 	int mode, mux_force;
+@@ -248,6 +254,13 @@
+ }
+ 
+ static void
++tg_pin_set_pud(const struct tg_pin *p, uint32_t pud)
++{
++	uint32_t sh = p->pin * 4u, v = tg_rd(p->va, PIN_PUD);
++	tg_wr(p->va, PIN_PUD, (v & ~(0xfu << sh)) | ((pud & 0xfu) << sh));
++}
++
++static void
+ tg_pin_report(const char *name, const struct tg_pin *p)
+ {
+ 	printf("SWEET TOUCH: pin %-5s bank %#llx[%u] func=%#x dat=%d pud=%#x\n", name,
+@@ -322,10 +335,59 @@
+ 	return 0;
+ }
+ 
++/* sweettouchcs=1: the ABL's spi_xfer chunk (docs/research/21 section 1.2, ABL 0xc5e4-0xc6ec), the same sequence as
++ * shim/touchprobe.c abl_burst (observed working, run touch1): no MODE_CFG / INT_EN / SWAP_CFG writes. PACKET_CNT = n | EN, TX bytes,
++ * CH_CFG |= TX|RX, poll RX level >= n, read RX, poll TX level 0, CH_CFG &= ~(TX|RX), PACKET_CNT = 0, SW_RST pulse + drain. */
++static int
++tg_abl_burst(const uint8_t *tx, uint8_t *rx, unsigned len)
++{
++	uint64_t t0;
++	unsigned i;
++	int err = 0;
++
++	if (len == 0 || len > SPI_FIFO_BYTES) {
++		return -1;
++	}
++	tg_wr(tg.spi, SPI_CH_CFG, tg_rd(tg.spi, SPI_CH_CFG) & ~CH_SW_RST);
++	tg_wr(tg.spi, SPI_PACKET_CNT, len | PKT_CNT_EN);
++	for (i = 0; i < len; i++) {
++		tg_wr(tg.spi, SPI_TX_DATA, tx ? tx[i] : 0u);
++	}
++	tg_wr(tg.spi, SPI_CH_CFG, tg_rd(tg.spi, SPI_CH_CFG) | CH_RXCH_ON | CH_TXCH_ON);
++	t0 = tg_now_us();
++	while (ST_RX_LVL(tg_rd(tg.spi, SPI_STATUS)) < len) {
++		if (tg_now_us() - t0 > 20000u) {
++			tg.last_st = tg_rd(tg.spi, SPI_STATUS);
++			tg.last_ch = tg_rd(tg.spi, SPI_CH_CFG);
++			err = -1;
++			break;
++		}
++	}
++	if (!err) {
++		for (i = 0; i < len; i++) {
++			uint32_t d = tg_rd(tg.spi, SPI_RX_DATA);
++			if (rx) {
++				rx[i] = (uint8_t)d;
++			}
++		}
++		t0 = tg_now_us();
++		while (ST_TX_LVL(tg_rd(tg.spi, SPI_STATUS)) && tg_now_us() - t0 < 1000u) {
++		}
++	}
++	tg_wr(tg.spi, SPI_CH_CFG, tg_rd(tg.spi, SPI_CH_CFG) & ~(CH_RXCH_ON | CH_TXCH_ON));
++	tg_wr(tg.spi, SPI_PACKET_CNT, 0);
++	tg_wr(tg.spi, SPI_CH_CFG, tg_rd(tg.spi, SPI_CH_CFG) | CH_SW_RST);
++	t0 = tg_now_us();
++	while (ST_RX_LVL(tg_rd(tg.spi, SPI_STATUS)) && tg_now_us() - t0 < 1000u) {
++		(void)tg_rd(tg.spi, SPI_RX_DATA);
++	}
++	return err;
++}
++
+ static int
+ tg_spi_burst(const uint8_t *tx, uint8_t *rx, unsigned len)
+ {
+-	return tg_spi_burst_ex(tx, rx, len, false);
++	return tg.cs_abl ? tg_abl_burst(tx, rx, len) : tg_spi_burst_ex(tx, rx, len, false);
+ }
+ 
+ /* The FTM5 transaction shape of fts_lib/ftsIO.c:174-262: write ncmd bytes, then read nrd bytes, one chip-select
+@@ -336,6 +398,9 @@
+ 	int err;
+ 
+ 	tg_pin_put(&tg.cs, 0);                 /* chip select is active low (spi mode 0, no spi-cs-high) */
++	if (tg.cs_abl) {
++		tg_wr(tg.spi, SPI_CS_REG, tg_rd(tg.spi, SPI_CS_REG) & ~1u);   /* ABL: NSSOUT active */
++	}
+ 	delay(1);
+ 	err = tg_spi_burst(cmd, NULL, ncmd);
+ 	if (!err && nrd) {
+@@ -343,6 +408,9 @@
+ 	}
+ 	delay(FTM5_SPI_DELAY_CS_US);
+ 	tg_pin_put(&tg.cs, 1);
++	if (tg.cs_abl) {
++		tg_wr(tg.spi, SPI_CS_REG, tg_rd(tg.spi, SPI_CS_REG) | 1u);
++	}
+ 	delay(2);
+ 	return err;
+ }
+@@ -770,7 +838,14 @@
+ 	printf("SWEET TOUCH: SPI regs before init: ch=%#x clk=%#x mode=%#x status=%#x fb=%#x\n",
+ 	    tg_rd(tg.spi, SPI_CH_CFG), tg_rd(tg.spi, SPI_CLK_CFG), tg_rd(tg.spi, SPI_MODE_CFG),
+ 	    tg_rd(tg.spi, SPI_STATUS), tg_rd(tg.spi, SPI_FB_CLK));
+-	tg_spi_engine_init();
++	if (tg.cs_abl) {   /* shim/touchprobe.c spi_setup with the cs option: no engine init */
++		tg_wr(tg.usi, USI_CON, tg_rd(tg.usi, USI_CON) | USI_CON_RESET);
++		tg_wr(tg.usi, USI_OPTION, tg_rd(tg.usi, USI_OPTION) | USI_OPT_CLKREQ);
++		tg_wr(tg.spi, SPI_FB_CLK, (tg_rd(tg.spi, SPI_FB_CLK) & ~3u) | 1u);
++		tg_wr(tg.usi, USI_CON, tg_rd(tg.usi, USI_CON) & ~USI_CON_RESET);
++	} else {
++		tg_spi_engine_init();
++	}
+ 	printf("SWEET TOUCH: SPI regs after init:  ch=%#x clk=%#x mode=%#x status=%#x fb=%#x (max %u Hz; the\n"
+ 	    "SWEET TOUCH: actual SCK = CMU ipclk / 4 and is unverified)\n",
+ 	    tg_rd(tg.spi, SPI_CH_CFG), tg_rd(tg.spi, SPI_CLK_CFG), tg_rd(tg.spi, SPI_MODE_CFG),
+@@ -1029,6 +1104,16 @@
+ 		return;
+ 	}
+ 	tg_spi_diag("after setup");
++	if (tg.cs_abl) {   /* run touch1: the chip answered after PUD := 0 and the reset pulse, so that comes first */
++		tg_pin_set_pud(&tg.clk, 0);
++		tg_pin_set_pud(&tg.mosi, 0);
++		tg_pin_set_pud(&tg.miso, 0);
++		tg_pin_set_pud(&tg.cs, 0);
++		tg_pin_set_pud(&tg.reset, 0);
++		printf("SWEET TOUCH: sweettouchcs=1: pads PUD := 0, reset pulse before the identify\n");
++		tg.reset_done = tg_reset_and_ready(&logged);
++		printf("SWEET TOUCH: reset before identify: %s\n", tg.reset_done ? "controller-ready event seen" : "no ready event");
++	}
+ 	ok = tg_identify();
+ 	for (unsigned n = 0; !ok && tg.var && n < 5; n++) {
+ 		if (tg_variant(n)) {
+@@ -1047,7 +1132,7 @@
+ 		return;
+ 	}
+ 	printf("SWEET TOUCH: phase 2: reset pulse, scan enable, poll\n");
+-	if (!tg_reset_and_ready(&logged)) {
++	if (!tg.reset_done && !tg_reset_and_ready(&logged)) {
+ 		printf("SWEET TOUCH: no controller-ready event after the reset pulse (GUESS: continuing)\n");
+ 	}
+ 	if (!tg_enable_scan()) {
+@@ -1088,7 +1173,7 @@
+ 	DTEntry node;
+ 	char const *compat = NULL;
+ 	unsigned int csize = 0;
+-	int mode = 2, delay_s = 45, mux = 0, clk = 0, var = 0;
++	int mode = 2, delay_s = 45, mux = 0, clk = 0, var = 0, cs = 0;
+ 	thread_t thread;
+ 
+ 	if (started) {
+@@ -1112,6 +1197,7 @@
+ 	(void)PE_parse_boot_argn("sweettouchmux", &mux, sizeof(mux));
+ 	(void)PE_parse_boot_argn("sweettouchclk", &clk, sizeof(clk));
+ 	(void)PE_parse_boot_argn("sweettouchvar", &var, sizeof(var));
++	(void)PE_parse_boot_argn("sweettouchcs", &cs, sizeof(cs));
+ 	(void)PE_parse_boot_argn("sweettouchpoke", tg.poke, sizeof(tg.poke));   /* longer values are cut: poke_parse then sees > 240 chars */
+ 	if (delay_s < 0 || delay_s > 3600) {
+ 		delay_s = 45;
+@@ -1122,6 +1208,7 @@
+ 	}
+ 	tg_parse_cmu(node);
+ 	tg.var = var == 1;
++	tg.cs_abl = cs == 1;
+ 	tg.clk_mode = clk < 0 ? 0 : clk > 3 ? 3 : clk;
+ 	tg.mode = mode;
+ 	tg.delay_s = (uint32_t)delay_s;
