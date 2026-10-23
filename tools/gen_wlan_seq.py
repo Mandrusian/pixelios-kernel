@@ -28,7 +28,10 @@ DT_PINCTRL, DT_WLAN, DT_PINH = REFS / "dts-gs101-gs101-pinctrl.dtsi", REFS / "dt
 SAMSUNG_H, DHD = REFS / "linux-samsung.h", REFS / "dhd_custom_google.c"
 SOC = ROOT / "soc/google/gs101/soc.json"
 
-SRC_NAMES = {CAL: "cal.c", RC: "rc.c", RCH: "rc.h", COM: "common.h", DT_PCIE: "pcie.dtsi", DT_COMMON: "common.dtsi", DT_PINCTRL: "pinctrl.dtsi", DT_WLAN: "wlan.dtsi", DHD: "dhd_cg.c"}
+# the Broadcom DHD tree (research 32 s.5b, fetched 2026-10-23, GPLv2 reference, not in git): chip-side config register names; absent refs make the generator fail like any other missing source
+REFS2 = Path(os.environ.get("WLAN_REFS2", str(REFS.parent / "wlan-stage2")))
+PCICFG = REFS2 / "include_pcicfg.h"
+SRC_NAMES = {PCICFG: "bcm4389/include_pcicfg.h", CAL: "cal.c", RC: "rc.c", RCH: "rc.h", COM: "common.h", DT_PCIE: "pcie.dtsi", DT_COMMON: "common.dtsi", DT_PINCTRL: "pinctrl.dtsi", DT_WLAN: "wlan.dtsi", DHD: "dhd_cg.c"}
 KINDS = ("gpio_dat", "gpio_con", "mmio_rmw", "mmio_write", "smc_iso", "delay", "wait_eq", "wait_mask", "read_only")
 BLOCKS = ("GPP14", "GPH2", "PMA", "PCS", "ELBI", "IA", "DBI", "PMU", "ATU", "CFG")
 FULL = 0xFFFFFFFF
@@ -270,6 +273,7 @@ STEP_NAMES = {
     21: "L1 / Q-channel / NAK options", 22: "RC setup (dw_pcie_setup_rc + exynos_pcie_setup_rc)  DELIBERATELY SKIPPED (one 0 us delay row; was UNKNOWN)", 23: "LTSSM enable and wait for L0",
     24: "READ-ONLY link report: negotiated link + capability chain of the RC, from its own DBI space (explicit --wlan-link=24 only; no writes)",
     25: "READ-ONLY iATU layout (doc 31 Q2): DBI header/version/viewport words + the unrolled outbound region 0 registers at DBI+0x300000 (explicit --wlan-link=25 only; no writes)",
+    27: "READ-ONLY dump of the endpoint config space (36 dwords of bus 1 dev 0 fn 0 through the CFG window left enabled by S26) + the iATU outbound region 1 reset values (7 reads); explicit --wlan-link=27 only; no write",
     26: "iATU outbound region 0 = CFG0 -> bus 1 (7 DBI-window writes at ATU 0x14B00000, each read back, CR2 re-checked once) and 4 reads of the CFG window 0x60FFE000 (explicit --wlan-link=26 only; ATU torn down FIRST)",
 }
 
@@ -567,6 +571,41 @@ def build():
     for o, what in ((0x00, "vendor (low half) / device (high half); vendor 0x14E4 expected (guess)"), (0x04, "command (low) / status (high)"), (0x08, "revision (low byte) / class code (high 24 bits)"), (0x0C, "cache line / latency / header type (bits 23:16) / BIST")):
         add(26, "read_only", "CFG", o, cite=f"{cfg_dt}; window offset = config register offset (rc.c:1524 va_cfg_base + where; standard PCI type-1 header layout); doc 31 s.2.3 step 4", tag=TAG_GUESS, note=f"CFG window +{o:#x}: {what}", **log)
 
+    # ---- S27: READ-ONLY endpoint config dump (research 32 s.4.2 "step A") through the CFG window S26 left enabled (block already probed in S26), then iATU outbound region 1 reset values (ATU probed in S25).
+    # Every row is a 32-bit read printed as `LINK R27 row=<i> rd=0x..`; no write, no restore, no teardown row (S26's ATU teardown covers the run). An offset whose source cannot be cited is NOT a row. ----
+    PCIP = Path(PCI_REGS)
+    pcr = lambda nm: gc(PCIP, r"define " + nm + r"\s")
+    pcg = lambda rx: anchor(PCICFG, find_line(PCICFG, rx), rx)
+    rcw = lambda nm: gc(RCH, r"define " + nm + r"\s+0x")
+    ss = "research 32 s.4.2 step A"
+    capw = f"{ss}: capability walk, id at +0 ({pcr('PCI_CAP_LIST_ID')}), next at +1 ({pcr('PCI_CAP_LIST_NEXT')}); whether this dword is a capability header is read off the dump, not assumed"
+    cfg27 = [  # (offset, cite, tag, note)
+        *[(0x10 + 4 * n, f"{pcr(f'PCI_BASE_ADDRESS_{n}')}; {ss}", TAG_SRC, f"BAR{n} as left by the chip (unsized, original value to restore later)") for n in range(6)],
+        (0x28, f"{pcr('PCI_CARDBUS_CIS')}; {ss}", TAG_SRC, "CardBus CIS pointer (0 expected on PCIe: guess)"),
+        (0x2C, f"{pcr('PCI_SUBSYSTEM_VENDOR_ID')}; {ss}", TAG_SRC, "subsystem vendor (low) / subsystem id (high)"),
+        (0x34, f"{pcr('PCI_CAPABILITY_LIST')}; {pcg(r'define PCI_CFG_CAPPTR\s+0x34')}; {ss}", TAG_SRC, "capability pointer (low byte): head of the capability chain"),
+        (0x3C, f"{pcr('PCI_INTERRUPT_LINE')}; {ss}", TAG_SRC, "interrupt line / pin (low half), min_gnt / max_lat (high half)"),
+        *[(o, capw, TAG_GUESS, f"config dword {o:#x} (capability area 0x40..0x7C)") for o in range(0x40, 0x80, 4)],
+        (0x80, f"{pcg(r'define\s+PCI_BAR0_WIN\s+0x80')}; {ss}", TAG_SRC, "PCI_BAR0_WIN: backplane address seen through BAR0 (reset value decides whether step C needs a write)"),
+        (0x88, f"{pcg(r'define\s+PCI_SPROM_CONTROL\s+0x88')}; {ss}", TAG_SRC, "PCI_SPROM_CONTROL (the attach code reads it; 0xFFFFFFFF aborts attach)"),
+        (0xAC, f"{pcg(r'define\s+PCI_BAR0_WIN2\s+0xac')}; {ss} (research 32 s.1.1 item 5 guessed the PCIe capability here: the dump decides)", TAG_SRC, "PCI_BAR0_WIN2 (2nd 4 KiB BAR0 window) or the PCIe capability header"),
+        (0xBC, f"{rcw('WIFI_L1SS_LINKCTRL')} (link status 0xBE = high half, {rcw('WIFI_LINK_STATUS')}); {ss}", TAG_SRC, "EP link control (low) / link status (high: speed [3:0], width [9:4])"),
+        (0xD4, f"{rcw('WIFI_PCI_EXP_DEVCTL2')}; {ss}", TAG_SRC, "EP device control 2 (completion timeout range)"),
+        (0x100, f"{pcg(r'define PCIE_EXTCFG_OFFSET\s+0x100')}, {pcg(r'define PCI_ADV_ERR_CAP\s+0x100')}; {ss}", TAG_SRC, "first extended capability header (AER expected)"),
+        *[(0x240 + 4 * n, f"{rcw(nm)}; {ss}", TAG_SRC, f"L1SS {what}") for n, (nm, what) in enumerate((("WIFI_L1SS_CAPID", "capability header"), ("WIFI_L1SS_CAP", "capabilities"), ("WIFI_L1SS_CONTROL", "control 1"), ("WIFI_L1SS_CONTROL2", "control 2")))],
+    ]
+    extra = {0x48: f"{ss}: PM capability guessed at 0x48 from {rcw('WIFI_PM_MNG_STATUS_CON')} (PM CSR = cap + 4; research 32 s.1.1 item 5)",
+             0x4C: f"{rcw('WIFI_PM_MNG_STATUS_CON')}; {pcg(r'define\s+PCIE_CFG_PMCSR\s+0x4C')}; {ss}",
+             0x70: f"{pcg(r'define PCIE2_BAR0_WIN2\s+0x70')}; {ss}", 0x74: f"{pcg(r'define PCIE2_BAR0_CORE2_WIN\s+0x74')}; {ss}", 0x78: f"{pcg(r'define PCIE2_BAR0_CORE2_WIN2\s+0x78')}; {ss}"}
+    note_x = {0x48: "PM capability header? (guess)", 0x4C: "PM control/status (D-state in the low bits)", 0x70: "PCIE2_BAR0_WIN2 (config register mapping the 2nd 4 KiB of BAR0)", 0x74: "PCIE2_BAR0_CORE2_WIN", 0x78: "PCIE2_BAR0_CORE2_WIN2"}
+    for o, c, tg, nt in cfg27:
+        if o in extra:
+            c, tg, nt = extra[o], (TAG_GUESS if o == 0x48 else TAG_SRC), note_x[o]
+        add(27, "read_only", "CFG", o, cite=c, tag=tg, note=f"CFG window +{o:#x}: {nt}", **log)
+    for n, what in (("CR1", "CR1 (type)"), ("CR2", "CR2 (bit 31 = enable)"), ("LOWER_BASE", "LOWER_BASE"), ("UPPER_BASE", "UPPER_BASE"), ("LIMIT", "LIMIT"), ("LOWER_TARGET", "LOWER_TARGET"), ("UPPER_TARGET", "UPPER_TARGET")):
+        mac = f"PCIE_ATU_{n}_OUTBOUND1"
+        add(27, "read_only", "ATU", ev(mac) - 0x300000, cite=f"{gc(RCH, 'define ' + mac + r'\s+0x3002')} (DBI + 0x300000 + off; unroll stride 0x200: region 1 = +0x200); {ss}; research 32 s.2e", tag=TAG_SRC, note=f"outbound region 1 {what}: reset value (needed for the later restore rows; unobserved so far)", **log)
+
     # ---- teardown (Linux rc_poweroff order, rc.c:3622-3669; PERST low, LTSSM off first; the isolation LAST) ----
     # ATU region 0 FIRST (before PERST low): disable it (CR2 := 0, as Linux's poweroff resets atu_ok and re-programs: rc.c:3647), then the reset values observed in run w3a-n25 (CR1 0, bases 0, LIMIT 0xFFF, targets 0)
     cr2 = anchor(RC, find_line(RC, r"CR2_OUTBOUND0, 4, EXYNOS_PCIE_ATU_ENABLE", vp), r"EXYNOS_PCIE_ATU_ENABLE")
@@ -605,7 +644,7 @@ def finish():
     core = {"rows": rows, "teardown": tear}
     sha = hashlib.sha256(json.dumps(core, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     doc = {"_doc": "GENERATED by tools/gen_wlan_seq.py from ~/pixelios-artifacts/refs/wlan-stage1 (docs/research/29 sections 2 and 14); do not edit. sha256 covers rows + teardown and is pinned in tools/test-bluejay-boot.py.",
-           "table_sha256": sha, "sources_sha256_16": srcs, "default_last_step": 19, "last_step": 26, "steps": meta["steps"], "unknown": meta["unknown"],
+           "table_sha256": sha, "sources_sha256_16": srcs, "default_last_step": 19, "last_step": 27, "steps": meta["steps"], "unknown": meta["unknown"],
            "kinds": list(KINDS), "blocks": list(BLOCKS), "rows": rows, "teardown": tear}
     return doc
 

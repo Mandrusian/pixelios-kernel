@@ -2,7 +2,7 @@
  * level), plain register files for PMA / PCS / ELBI / I/A / DBI that read back what was written, lock bits that appear after k polls, the PMU isolation word behind a fake of the two EL3 steps
  * (wlan_link_iso_set / _clear), and fault / timeout / ignored-write injection. Built once per N (-DWLAN_LINK_N=7|8|10|19|20|21|22|23|24), see build.sh. Checks: the default run (N = 19) never raises PERST,
  * never enables the LTSSM and ends with the pins, the isolation and the PHY back where they were; N = 20 / 21 add the PERST release and the options; N = 22 adds the documented S22 skip (one 0 us delay row, no write); N = 23 enables the LTSSM and waits for L0 (fake: ELBI 0x2C8 == 0x11
- * after k polls, never, or a read fault), with a fault injected at EVERY forward write row and the teardown checked against the table order; N = 26 adds S26 (iATU region 0 programmed with the 7 allowlisted writes, each read back, then the CFG window probe + 4 reads; the ATU is torn down FIRST); N = 25 adds S25 (read-only iATU layout: DBI words + the ATU block probe + ATU region 0 + ELBI, `LINK R25` lines); N = 24 adds S24, read-only rows whose `log` flag prints `LINK R24 row=<i> rd=0x..` (the link report), no write, teardown unchanged; every failure branch (unreadable probe, lock timeout, write fault, refused / failed isolation, failed restore) stops, tears down in the table order with the isolation clear LAST and is
+ * after k polls, never, or a read fault), with a fault injected at EVERY forward write row and the teardown checked against the table order; N = 27 adds S27 (READ-ONLY endpoint config dump: 36 CFG window dwords + the 7 iATU region 1 registers, `LINK R27` lines, no write of any kind); N = 26 adds S26 (iATU region 0 programmed with the 7 allowlisted writes, each read back, then the CFG window probe + 4 reads; the ATU is torn down FIRST); N = 25 adds S25 (read-only iATU layout: DBI words + the ATU block probe + ATU region 0 + ELBI, `LINK R25` lines); N = 24 adds S24, read-only rows whose `log` flag prints `LINK R24 row=<i> rd=0x..` (the link report), no write, teardown unchanged; every failure branch (unreadable probe, lock timeout, write fault, refused / failed isolation, failed restore) stops, tears down in the table order with the isolation clear LAST and is
  * loud; the writer's independent allowlist refuses every other register. Uses the REAL generated board macros and out/wlan_seq.h. Build (also run by build.sh):
  *   gcc -O1 -Wall -Wextra -Werror -DWLAN_LINK_RUN -DWLAN_LINK_N=19 -I. -Iout -include out/board_config.h -o out/wlanlink_host_test19 wlanlink_host_test.c */
 #include <assert.h>
@@ -22,6 +22,12 @@
 #define L0X 1u
 #else
 #define L0X 0u
+#endif
+/* S27 reads 36 dwords of the CFG window (and 7 ATU region 1 registers) */
+#if WLAN_LINK_N >= 27
+#define CFG27 36u
+#else
+#define CFG27 0u
 #endif
 #define WLAN_LINK_N_STR WLAN_STR(WLAN_LINK_N)
 #include "wlanlink.c"
@@ -337,7 +343,7 @@ int main(void)
 {
 	struct wlan_row r;
 
-	EXPECT(WLAN_SEQ_LAST == 26 && WLAN_SEQ_DEFAULT_N == 19 && WLAN_SEQ_NROWS > 200 && WLAN_LINK_N <= WLAN_SEQ_LAST);
+	EXPECT(WLAN_SEQ_LAST == 27 && WLAN_SEQ_DEFAULT_N == 19 && WLAN_SEQ_NROWS > 200 && WLAN_LINK_N <= WLAN_SEQ_LAST);
 	/* the independent allowlist refuses every other register (a corrupted table / index cannot reach them) */
 	EXPECT(!w32_allowed(WLAN_GPP14 + 4, 1u << 3, 0, 0) && !w32_allowed(WLAN_GPP14 + 4, 1u << 2, 0, 1u << 3) && w32_allowed(WLAN_GPP14 + 4, 1u << 2, 0, 1u << 2));
 	EXPECT(!w32_allowed(WLAN_GPH2 + 4, 1u << 2, 0, 0) && w32_allowed(WLAN_GPH2 + 4, 3u, 0, 1) && !w32_allowed(WLAN_GPH2, 0xf00u, 0, 0) && !w32_allowed(WLAN_GPP14 + 0x18, 1, 0, 0));
@@ -578,7 +584,7 @@ int main(void)
 				wrow[nrow++] = i;
 			}
 		EXPECT(k == 7 && nrow == 20 && nprobe == 1 && nwait == 1);
-		EXPECT(wlan_link_run() == 0 && has("LINK S26 ok rows=20") && !has("!!!") && cfg_reads == 5u && cfg_reads_unconfigured == 0);	/* all 5 CFG reads after the region was enabled */
+		EXPECT(wlan_link_run() == 0 && has("LINK S26 ok rows=20") && !has("!!!") && cfg_reads == 5u + CFG27 && cfg_reads_unconfigured == 0);	/* all CFG reads (S26: 5, S27: 36) after the region was enabled */
 		for (unsigned i = 0; i < nev; i++)
 			if (ev[i].t == EV_W && ev[i].pa >= WLAN_ATU && ev[i].pa < WLAN_ATU + 0x1000) {
 				EXPECT(iw < 14);
@@ -644,6 +650,61 @@ int main(void)
 		world(); ignore_pa_set = 1; ignore_pa = WLAN_ATU + 4;	/* the enable write does not take: the one-shot CR2 check REFUSES before any CFG access (review 7 finding 2), same teardown */
 		EXPECT(wlan_link_run() == 1 && has("LINK S26 refused") && has("stopped=refused at=S26") && cfg_reads == 0u && cfg_reads_unconfigured == 0u && has("restore=ok") && !has("!!!"));
 		teardown_tail_is_table_order(26);
+		baseline_restored();
+	}
+#endif
+
+#if WLAN_LINK_N >= 27
+	{	/* S27: READ-ONLY endpoint config dump: 36 CFG window dwords then ATU region 1 CR1..UPPER_TARGET (7), every row a logged read (a == 2, never a probe); not one write beyond S26's own */
+		static const uint32_t cfg_offs[36] = { 0x10, 0x14, 0x18, 0x1C, 0x20, 0x24, 0x28, 0x2C, 0x34, 0x3C, 0x40, 0x44, 0x48, 0x4C, 0x50, 0x54, 0x58, 0x5C, 0x60, 0x64, 0x68, 0x6C, 0x70, 0x74, 0x78, 0x7C,
+						       0x80, 0x88, 0xAC, 0xBC, 0xD4, 0x100, 0x240, 0x244, 0x248, 0x24C };
+		unsigned n27 = 0, nR = 0, wid[64];
+		uint32_t want[64];
+		char b[96];
+
+		world();
+		for (unsigned i = 0; i < 36; i++)
+			cfgspace[cfg_offs[i] / 4] = 0xC0DE0000u | cfg_offs[i];
+		for (unsigned i = 0; i < 7; i++)
+			atu[(0x200 + 4 * i) / 4] = 0xA7000000u | (0x200 + 4 * i);	/* region 1 "reset" words, distinguishable from region 0 */
+		for (unsigned i = 0; i < WLAN_SEQ_NROWS; i++)
+			if (get_row(i, 0, &r) && r.step == 27) {
+				EXPECT(r.kind == WLK_READ_ONLY && r.a == 2u && r.mask == FULL_MASK_T && n27 < 43);
+				EXPECT(n27 < 36 ? (r.blk == WLB_CFG && r.off == cfg_offs[n27]) : (r.blk == WLB_ATU && r.off == 0x200u + 4u * (n27 - 36u)));
+				want[n27] = r.blk == WLB_CFG ? cfgspace[r.off / 4] : atu[r.off / 4];
+				wid[n27++] = i;
+			}
+		EXPECT(n27 == 43);
+		for (unsigned i = 0; i < n27; i++) {			/* nothing in S27 can be written: the writer refuses every one of its rows */
+			EXPECT(w32(wid[i], 0) == -2);
+			EXPECT(nwrites == 0);
+		}
+		EXPECT(wlan_link_run() == 0 && has("LINK S27 ok rows=43") && !has("!!!") && cfg_reads == 5u + 36u && cfg_reads_unconfigured == 0);
+		for (unsigned j = 0; j < n27; j++) {
+			snprintf(b, sizeof b, "LINK R27 row=%u rd=0x%08X", wid[j], (unsigned)want[j]);
+			EXPECT(has(b));
+		}
+		for (unsigned i = 0; i < nl; i++)
+			nR += strstr(lines[i], "LINK R27 ") != NULL;
+		EXPECT(nR == n27);
+		/* S27 adds no write: the ATU writes are S26's 7 + the 7 teardown rows, none at region 1 (+0x200..), none to the CFG window */
+		EXPECT(last_ev(EV_W, WLAN_ATU + 0x200, WLAN_ATU + 0x1000) == 0 && last_ev(EV_W, WLAN_CFG, WLAN_CFG + 0x2000) == 0);
+		for (unsigned i = 0, nat = 0; i < nev; i++)
+			if (ev[i].t == EV_W && ev[i].pa >= WLAN_ATU && ev[i].pa < WLAN_ATU + 0x1000)
+				EXPECT(++nat <= 14);
+		EXPECT(atu[0x204 / 4] == 0xA7000204u && cfgspace[0x100 / 4] == 0xC0DE0100u);	/* the fake's region 1 / config words are untouched */
+		teardown_tail_is_table_order(WLAN_LINK_N);
+		baseline_restored();
+		world(); fault_read_pa = WLAN_CFG + 0x100;		/* an unreadable config dword stops S27 at that row: the rows before it printed, the ones after did not, ATU torn down (CR2 first), restore ok */
+		EXPECT(wlan_link_run() == 1 && has("stopped=fault at=S27") && has("restore=ok") && !has("!!!"));
+		snprintf(b, sizeof b, "LINK R27 row=%u ", wid[30]);	/* 0xD4, the dword before 0x100 */
+		EXPECT(has(b));
+		snprintf(b, sizeof b, "LINK R27 row=%u ", wid[32]);	/* 0x240, after it */
+		EXPECT(!has(b));
+		teardown_tail_is_table_order(27);
+		baseline_restored();
+		world(); unreadable_blk = 5;				/* the ATU window unreadable: S25 already stops at its probe, S27 never starts */
+		EXPECT(wlan_link_run() == 1 && has("stopped=fault at=S25") && !has("LINK R27 "));
 		baseline_restored();
 	}
 #endif
