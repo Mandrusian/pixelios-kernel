@@ -362,7 +362,7 @@ static void snap(const struct acpm_chan *h, struct acpm_xfer *x)
 }
 
 /* Transaction kinds. XM_PMIC: cmd[0] = REG | TYPE (pmic_addr) << 8 | CHANNEL (speedy) << 12 | seq << 16, cmd[1] = w1, reply RETURN [31:24]
- * (doc 23). XM_DGET: DVFS FREQ_GET, value = reply word 1, reply word 3 must be 0 (acpm_dvfs.c:173-196 [src]). XM_DREQ (TOUCH_DVFS_WRITE
+ * (doc 23). XM_DGET: DVFS FREQ_GET, value = reply word 1, reply word 3 must be 0 (acpm_dvfs.c:173-196 [src]). XM_DREQ (TOUCH_DVFS_WRITE or GPU_CLK
  * images only): DVFS FREQ_REQ. The APM replies to EVERY request, also the ones Linux sends with response=false: Linux sets the request's
  * sequence bit in send_data (acpm_ipc.c:756) and clears it for response=false only when that reply arrives (check_response, :446-448); a
  * firmware that did not reply would hang Linux after 63 requests (:747-750) [src, review dvfs-client-review-1 H2]. So all three wait for
@@ -515,6 +515,139 @@ int acpm_pmic_read(const struct acpm_cfg *c, uint32_t reg, uint32_t *val, struct
 	return read1(c, reg, val, t, &t->a);
 }
 
+/* S2MPG11 (sub PMIC, speedy channel 1, GPU rails) READ for --gpu-rails (docs/research/27): the same transaction as the S2MPG10 read above
+ * (same IPC channel, same xfer(), FUNC_READ only, no PMIC write is expressible here), with CHANNEL = soc.json acpm.s2mpg11.speedy_ch and
+ * TYPE = pmic_addr, and only for the registers listed there. Unknown (null) config: the macros are absent and every call refuses. */
+#if defined(ACPM_S11_KNOWN) && ACPM_S11_KNOWN && defined(ACPM_S11_NREG)
+static const uint32_t s11_regs[ACPM_S11_NREG] = { ACPM_S11_REGS };
+
+int acpm_s11_read(const struct acpm_cfg *c, uint32_t reg, uint32_t *val, struct acpm_trace *t)
+{
+	unsigned k;
+	int e;
+
+	t->n = 1;
+	for (k = 0; k < ACPM_S11_NREG; k++)
+		if (s11_regs[k] == reg)
+			break;
+	if (k == ACPM_S11_NREG)
+		return refuse(&t->a, ACPM_E_ARG, ACPM_W_ARG);
+	e = xfer(c, XM_PMIC, (reg & 0xffu) | ((uint32_t)ACPM_S11_PMIC_ADDR << 8) | ((uint32_t)ACPM_S11_SPEEDY << 12), FUNC_READ, 0, 0, t, &t->a);
+	if (!e)
+		*val = t->a.value;
+	return e;
+}
+#else
+int acpm_s11_read(const struct acpm_cfg *c, uint32_t reg, uint32_t *val, struct acpm_trace *t)
+{
+	(void)c; (void)reg; (void)val;
+	t->n = 1;
+	return refuse(&t->a, ACPM_E_UNSURE, ACPM_W_ARG);
+}
+#endif
+
+/* S2MPG10 (main PMIC, speedy channel c->speedy) READ for --wlan-rails (docs/research/29 section 4): the same transaction as acpm_pmic_read above (same IPC channel, same
+ * xfer(), FUNC_READ only, no PMIC write is expressible here), but for the four LDO control registers of soc.json wlan (s10_l16m..l19m_ctrl = 0x53..0x56, the PCIe0 / PCIe1
+ * PHY supplies; s2mpg10-register.h:99-103) instead of the touch rails. A register not listed there, or a config without the macros, is refused. */
+#if defined(WLAN_S10_L16M_CTRL) && defined(WLAN_S10_L17M_CTRL) && defined(WLAN_S10_L18M_CTRL) && defined(WLAN_S10_L19M_CTRL)
+static const uint32_t s10w_regs[4] = { WLAN_S10_L16M_CTRL, WLAN_S10_L17M_CTRL, WLAN_S10_L18M_CTRL, WLAN_S10_L19M_CTRL };
+
+int acpm_s10_read(const struct acpm_cfg *c, uint32_t reg, uint32_t *val, struct acpm_trace *t)
+{
+	unsigned k;
+	int e;
+
+	t->n = 1;
+	for (k = 0; k < 4; k++)
+		if (s10w_regs[k] == reg)
+			break;
+	if (k == 4)
+		return refuse(&t->a, ACPM_E_ARG, ACPM_W_ARG);
+	e = xfer(c, XM_PMIC, pmic_w0(c, reg), FUNC_READ, 0, 0, t, &t->a);
+	if (!e)
+		*val = t->a.value;
+	return e;
+}
+#else
+int acpm_s10_read(const struct acpm_cfg *c, uint32_t reg, uint32_t *val, struct acpm_trace *t)
+{
+	(void)c; (void)reg; (void)val;
+	return refuse(&t->a, ACPM_E_ARG, ACPM_W_ARG);
+}
+#endif
+
+/* S2MPG11 BUCK2S_CTRL mode switch for --gpu-rail-on (docs/research/27): the ONLY S2MPG11 write expressible here. Twin of acpm_pmic_update above
+ * (same xfer(), same FUNC_UPDATE framing cmd[1] = 2 | val << 8 | mask << 16, read-modify-write done by the APM); it exists only in GPU_RAIL_ON images
+ * and only for the pair soc.json acpm.s2mpg11.rail_on: reg 0x15, mask 0xC0, val 0x40 (mode 1, as Linux) or 0x00 (off).
+ *   on:  t->a = pre-read of the CTRL register, which must be EXACTLY mode 0 (off) under the mask, else ACPM_E_ON and nothing is written;
+ *        value VAL_ON = 0x40 = mode 1 (SUSPEND), what Linux writes for this rail (soc.json note);
+ *        then OUT1 is read (*out1) and must decode inside [VSEL_MIN, VSEL_MAX] (the voltage is never written), else ACPM_E_RAIL, nothing written;
+ *        t->b = the update.
+ *   off: t->a = pre-read; if the mode is already 0 there is nothing to restore (ACPM_E_ON, nothing written); else t->b = the update.
+ * One request per write, no retry; a failure after the front write leaves the queue as it is (xfer's rule). */
+#if defined(GPU_RAIL_ON) && defined(ACPM_S11_ON_KNOWN) && ACPM_S11_ON_KNOWN && defined(ACPM_S11_KNOWN) && ACPM_S11_KNOWN
+static void xcopy(struct acpm_xfer *d, const struct acpm_xfer *s)
+{
+	unsigned i;
+
+	d->seq = s->seq;
+	d->err = s->err;
+	d->why = s->why;
+	d->ret = s->ret;
+	d->value = s->value;
+	d->n = s->n;
+	d->published = s->published;
+	d->had_reply = s->had_reply;
+	d->t_bell = s->t_bell;
+	d->t_end = s->t_end;
+	for (i = 0; i < 4; i++) {
+		d->req[i] = s->req[i];
+		d->rep[i] = s->rep[i];
+		d->state[i] = s->state[i];
+	}
+}
+
+static uint32_t s11_w0(uint32_t reg)
+{
+	return (reg & 0xffu) | ((uint32_t)ACPM_S11_PMIC_ADDR << 8) | ((uint32_t)ACPM_S11_SPEEDY << 12);
+}
+
+int acpm_s11_rail_set(const struct acpm_cfg *c, int on, struct acpm_trace *t, uint32_t *out1)
+{
+	struct acpm_xfer xo;
+	uint32_t cur, val = on ? ACPM_S11_ON_VAL_ON : ACPM_S11_ON_VAL_OFF;
+	int e;
+
+	t->n = 0;
+	acpm_xfer_zero(&t->a);
+	acpm_xfer_zero(&t->b);
+	acpm_xfer_zero(&xo);
+	t->n = 1;
+	e = xfer(c, XM_PMIC, s11_w0(ACPM_S11_ON_REG), FUNC_READ, 0, 0, t, &t->a);	/* pre-read */
+	if (e)
+		return e;
+	cur = t->a.value;
+	t->n = 2;
+	if (on) {
+		if ((cur & ACPM_S11_ON_MASK) != 0)			/* not exactly "off": already on, or another mode: leave it alone */
+			return refuse(&t->b, ACPM_E_ON, ACPM_W_ON);
+		e = xfer(c, XM_PMIC, s11_w0(ACPM_S11_ON_OUT1), FUNC_READ, 0, 0, t, &xo);
+		if (e) {
+			xcopy(&t->b, &xo);
+			return e;
+		}
+		if (out1)
+			*out1 = xo.value;
+		if (xo.value < ACPM_S11_ON_VSEL_MIN || xo.value > ACPM_S11_ON_VSEL_MAX)
+			return refuse(&t->b, ACPM_E_RAIL, ACPM_W_VSELOUT);
+	} else if ((cur & ACPM_S11_ON_MASK) == 0) {
+		return refuse(&t->b, ACPM_E_ON, ACPM_W_ON);		/* already off: nothing to restore */
+	}
+	t->n = 3;							/* from here on an UPDATE is (about to be) published: callers tell it from the two reads by t->n == 3 */
+	return xfer(c, XM_PMIC, s11_w0(ACPM_S11_ON_REG), FUNC_UPDATE | (val << 8) | ((uint32_t)ACPM_S11_ON_MASK << 16), 0, 0, t, &t->b);
+}
+#endif
+
 #ifdef TOUCH_RAILS_WRITE	/* a railsr (read-only) image must not contain code that can build an UPDATE */
 int acpm_pmic_update(const struct acpm_cfg *c, uint32_t reg, uint32_t val, uint32_t mask, struct acpm_trace *t)
 {
@@ -549,10 +682,15 @@ int acpm_pmic_update(const struct acpm_cfg *c, uint32_t reg, uint32_t val, uint3
  * management exists). Plain const arrays, no pointer tables. */
 #define FREQ_REQ	0u	/* acpm_dvfs.h:22 [src] */
 #define FREQ_GET	1u	/* acpm_dvfs.h:23 [src] */
-static const uint32_t dvfs_idx[ACPM_DVFS_N] = { ACPM_DVFS_IDXS };
-static const uint32_t dvfs_ceil[ACPM_DVFS_N] = { ACPM_DVFS_CEILS };
-static const uint32_t dvfs_nr[ACPM_DVFS_N] = { ACPM_DVFS_NRS };
-static const uint32_t dvfs_rate[ACPM_DVFS_N][ACPM_DVFS_MAXLV] = { ACPM_DVFS_ROWS };
+#ifndef ACPM_DVFS_NALL
+#define ACPM_DVFS_NALL	ACPM_DVFS_N
+#endif
+/* ACPM_DVFS_N = the CPU clusters (what the touch probe iterates, acpm_dvfs_ndom/dom); the tables hold ALL configured domains (CPU + the two GPU
+ * clocks G3D = 5 / G3DL2 = 6, whose ceiling is their init level: only --gpu-clk asks them for a rate). */
+static const uint32_t dvfs_idx[ACPM_DVFS_NALL] = { ACPM_DVFS_IDXS };
+static const uint32_t dvfs_ceil[ACPM_DVFS_NALL] = { ACPM_DVFS_CEILS };
+static const uint32_t dvfs_nr[ACPM_DVFS_NALL] = { ACPM_DVFS_NRS };
+static const uint32_t dvfs_rate[ACPM_DVFS_NALL][ACPM_DVFS_MAXLV] = { ACPM_DVFS_ROWS };
 
 int acpm_dvfs_ndom(void)
 {
@@ -571,7 +709,7 @@ static int dvfs_find(uint32_t dom)
 {
 	int i;
 
-	for (i = 0; i < ACPM_DVFS_N; i++)
+	for (i = 0; i < ACPM_DVFS_NALL; i++)
 		if (dvfs_idx[i] == dom)
 			return i;
 	return -1;
@@ -631,7 +769,7 @@ int acpm_dvfs_get(const struct acpm_cfg *c, uint32_t dom, uint32_t *khz, struct 
 	return e;
 }
 
-#ifdef TOUCH_DVFS_WRITE	/* a dvfsr (read-only) image must not contain code that can build a FREQ_REQ */
+#if defined(TOUCH_DVFS_WRITE) || defined(GPU_CLK)	/* a read-only image must not contain code that can build a FREQ_REQ */
 static int dvfs_rate_ok(int i, uint32_t khz)
 {
 	uint32_t k;
@@ -644,7 +782,11 @@ static int dvfs_rate_ok(int i, uint32_t khz)
 	return 0;
 }
 
-int acpm_dvfs_set(const struct acpm_cfg *c, uint32_t dom, uint32_t khz, struct acpm_trace *t)
+/* same_ok: send the request even when the pre-read already shows khz (GPU clocks only: Linux re-sends the init rate at every probe, and the
+ * point of --gpu-clk is to make the firmware act on a rate it already reports). Everything else (table row, ceiling, pre-read, channel
+ * gates, reply handling) is the same code path for both callers. */
+/* OPEN (review L1): acpm_dvfs_set also finds the GPU domains (dvfs_find loops over NALL); only its caller keeps them out. */
+static int dvfs_set(const struct acpm_cfg *c, uint32_t dom, uint32_t khz, struct acpm_trace *t, int same_ok)
 {
 	struct acpm_cfg d;
 	uint32_t cur = 0;
@@ -662,11 +804,34 @@ int acpm_dvfs_set(const struct acpm_cfg *c, uint32_t dom, uint32_t khz, struct a
 	if (e)
 		return e;
 	t->n++;
-	if (cur == khz)				/* already there: nothing to ask for */
+	if (cur == khz && !same_ok)		/* already there: nothing to ask for */
 		return refuse(&t->b, ACPM_E_ON, ACPM_W_ON);
 	cfg_chan(c, &d, c->dvfs_ch);
 	return xfer(&d, XM_DREQ, dvfs_idx[i], khz, FREQ_REQ, dvfs_ms(), t, &t->b);
 }
+
+#ifdef TOUCH_DVFS_WRITE
+int acpm_dvfs_set(const struct acpm_cfg *c, uint32_t dom, uint32_t khz, struct acpm_trace *t)
+{
+	return dvfs_set(c, dom, khz, t, 0);
+}
+#endif
+
+#ifdef GPU_CLK
+/* --gpu-clk: FREQ_REQ for G3D / G3DL2 only (a CPU domain is refused before anything is sent), the same rate allowed as the current one. */
+int acpm_dvfs_reassert(const struct acpm_cfg *c, uint32_t dom, uint32_t khz, struct acpm_trace *t)
+{
+	static const uint32_t gpu[] = { ACPM_DVFS_GPU_IDXS };
+	unsigned k;
+
+	for (k = 0; k < sizeof(gpu) / sizeof(gpu[0]); k++)
+		if (gpu[k] == dom)
+			return dvfs_set(c, dom, khz, t, 1);
+	t->n = 1;
+	acpm_xfer_zero(&t->a);
+	return refuse(&t->a, ACPM_E_ARG, ACPM_W_DOM);
+}
+#endif
 #endif
 
 #else	/* no DVFS block in soc.json */
@@ -713,6 +878,18 @@ int acpm_pmic_read(const struct acpm_cfg *c, uint32_t reg, uint32_t *val, struct
 int acpm_pmic_update(const struct acpm_cfg *c, uint32_t reg, uint32_t val, uint32_t mask, struct acpm_trace *t)
 {
 	(void)c; (void)reg; (void)val; (void)mask; (void)t;
+	return ACPM_E_UNSURE;
+}
+
+int acpm_s11_read(const struct acpm_cfg *c, uint32_t reg, uint32_t *val, struct acpm_trace *t)
+{
+	(void)c; (void)reg; (void)val; (void)t;
+	return ACPM_E_UNSURE;
+}
+
+int acpm_s10_read(const struct acpm_cfg *c, uint32_t reg, uint32_t *val, struct acpm_trace *t)
+{
+	(void)c; (void)reg; (void)val; (void)t;
 	return ACPM_E_UNSURE;
 }
 

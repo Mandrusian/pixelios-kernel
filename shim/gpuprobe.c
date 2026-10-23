@@ -15,6 +15,15 @@
  *    Linux reads these with readl (pmucal_rae.c:131,145), so AP reads are allowed.
  *  - CMU_G3D (0x1C400000) PLL_CON0_MUX_CLKCMU_EMBEDDED_G3D_{COREGROUP,STACKS,TOP}_USER at
  *    +0x600/+0x610/+0x620, PLL_CON0_PLL_G3D +0x140, PLL_CON0_PLL_G3D_L2 +0x180: same file.
+ *  - Extra CMU_G3D words (read-only, same gate as the CMU reads above): the sequence tables embedded_g3d_on / embedded_g3d_off / g3d_save of
+ *    ~/pixelios-artifacts/refs/kbase-bluejay/flexpmu_local.h (copy of soc-gs flexpmu_cal_local_gs101.h): PLL_LOCKTIME 0x4 (:494-495),
+ *    PLL_CON0..CON4 of PLL_G3D 0x140/144/148/14C/150 (:449,448,496,500,498) and of PLL_G3D_L2 0x180/184/188/18C/190 (:451,450,497,501,499),
+ *    MUX_CLKCMU_EMBEDDED_G3D_{COREGROUP,STACKS,TOP}_USER 0x600/610/620 (:452-454), MUX_CLKCMU_G3D_{BUSD,GLB,SWITCH}_USER 0x630/640/650 (:493,492,491),
+ *    CLK_CON_DIV ADD_CH_CLK/BUSP/L2_GLB/STACKS/TOP 0x1800/1804/1808/180C/1810 (:490,489,488,487,486). Table: docs/research/27.
+ *  - ACPM fvmap (APM SRAM, read-only, not gated: the APM SRAM is always on, acpm.c reads it too): layout from xnu/patches/0097-sweet-fvmap-dump.patch
+ *    (struct fvmap_header, 24 bytes per ACPM_DVFS index: type @0, num_of_lv @1, num_of_members @2, init_lv @8, o_ratevolt u16 @20; the rate/volt
+ *    table at fvmap base + o_ratevolt, 8 bytes per level: u32 rate kHz, u32 volt uV), base PA and the G3D/G3DL2 indices from soc.json "gpu"
+ *    (observed: run fvmap1, docs/research/25 and 27).
  *  - GPU registers (0x1C500000, JM layout): gpu/mali_kbase hw_access/regmap/
  *    mali_kbase_regmap_jm_enums.h (GPU_CONTROL__* offsets in the comments),
  *    mali_kbase_regmap_jm.c:1814-1825 (MMU at 0x2000).
@@ -44,6 +53,20 @@ static unsigned put_hex(char *dst, unsigned cap, unsigned pos, uint64_t v, unsig
 	static const char hex[] = "0123456789ABCDEF";
 	for (unsigned i = 0; i < digits && pos + 1 < cap; i++)
 		dst[pos++] = hex[(v >> (4 * (digits - 1 - i))) & 0xf];
+	return pos;
+}
+
+static unsigned put_dec(char *dst, unsigned cap, unsigned pos, uint32_t v)
+{
+	char t[10];
+	unsigned n = 0;
+
+	do {
+		t[n++] = (char)('0' + v % 10u);
+		v /= 10u;
+	} while (v && n < sizeof(t));
+	while (n && pos + 1 < cap)
+		dst[pos++] = t[--n];
 	return pos;
 }
 
@@ -91,6 +114,125 @@ static void summary(enum gpu_gate gate, int id_ok, uint32_t id, unsigned cores)
 	emit(line, p);
 }
 
+/* All CMU_G3D words of the probe (muxes, PLLs, dividers); returns whether the three user muxes were readable (outputs for the gate).
+ * Caller has checked that the top domain is on. */
+static int cmu_dump(uint32_t *mt, uint32_t *mc, uint32_t *ms)
+{
+	uint32_t v;
+	int mux_ok;
+
+	int a = rd("CMU_MUX_TOP", GPU_CMU_G3D + CMU_MUX_TOP, mt);
+	int b = rd("CMU_MUX_CORE", GPU_CMU_G3D + CMU_MUX_COREGROUP, mc);
+	int c = rd("CMU_MUX_STACK", GPU_CMU_G3D + CMU_MUX_STACKS, ms);
+	mux_ok = a && b && c;
+	rd("CMU_PLL_G3D", GPU_CMU_G3D + CMU_PLL_G3D, &v);
+	rd("CMU_PLL_G3D_L2", GPU_CMU_G3D + CMU_PLL_G3D_L2, &v);
+	/* more CMU_G3D words (same gate): PLL lock time + CON1..CON4 of both PLLs, the other user muxes, the dividers */
+	rd("CMU_PLL_LOCKTIME", GPU_CMU_G3D + 0x004u, &v);
+	for (unsigned k = 1; k < 5; k++) {
+		char nm[] = "CMU_PLL_G3D_CON0";
+		char n2[] = "CMU_PLL_G3D_L2_CON0";
+
+		nm[15] = (char)('0' + k);
+		n2[18] = (char)('0' + k);
+		rd(nm, GPU_CMU_G3D + CMU_PLL_G3D + 4u * k, &v);
+		rd(n2, GPU_CMU_G3D + CMU_PLL_G3D_L2 + 4u * k, &v);
+	}
+	rd("CMU_MUX_BUSD", GPU_CMU_G3D + 0x630u, &v);
+	rd("CMU_MUX_GLB", GPU_CMU_G3D + 0x640u, &v);
+	rd("CMU_MUX_SWITCH", GPU_CMU_G3D + 0x650u, &v);
+	rd("CMU_DIV_ADD_CH", GPU_CMU_G3D + 0x1800u, &v);
+	rd("CMU_DIV_BUSP", GPU_CMU_G3D + 0x1804u, &v);
+	rd("CMU_DIV_L2_GLB", GPU_CMU_G3D + 0x1808u, &v);
+	rd("CMU_DIV_STACKS", GPU_CMU_G3D + 0x180cu, &v);
+	rd("CMU_DIV_TOP", GPU_CMU_G3D + 0x1810u, &v);
+
+	return mux_ok;
+}
+
+#ifdef GPU_FVMAP_SRAM
+#define FVMAP_HDR	24u		/* bytes per domain header (0097 patch) */
+#define FVMAP_BYTES	0x2000u		/* the patch's bound for o_ratevolt + levels */
+#define FVMAP_MAX_LV	32u
+
+/* "FVMAP<idx> ..." lines for one ACPM_DVFS domain; every read is fault-guarded and an unreadable word is printed, not guessed. */
+static void fvmap_dom(unsigned idx)
+{
+	char line[RAMLOG_LINE_MAX];
+	uintptr_t h = GPU_FVMAP_SRAM + FVMAP_HDR * idx;
+	uint32_t w0, w2, w5, rate, volt;
+	unsigned p, nlv, init, orv;
+
+	p = put_txt(line, sizeof(line), 0, "FVMAP");
+	p = put_dec(line, sizeof(line), p, idx);
+	if (!try_read32(h, &w0) || !try_read32(h + 8u, &w2) || !try_read32(h + 20u, &w5)) {
+		p = put_txt(line, sizeof(line), p, " header unreadable");
+		emit(line, p);
+		return;
+	}
+	nlv = (w0 >> 8) & 0xffu;
+	init = w2 & 0xffu;
+	orv = w5 & 0xffffu;
+	p = put_txt(line, sizeof(line), p, " type=");
+	p = put_dec(line, sizeof(line), p, w0 & 0xffu);
+	p = put_txt(line, sizeof(line), p, " nlv=");
+	p = put_dec(line, sizeof(line), p, nlv);
+	p = put_txt(line, sizeof(line), p, " members=");
+	p = put_dec(line, sizeof(line), p, (w0 >> 16) & 0xffu);
+	p = put_txt(line, sizeof(line), p, " init_lv=");
+	p = put_dec(line, sizeof(line), p, init);
+	p = put_txt(line, sizeof(line), p, " o_ratevolt=0x");
+	p = put_hex(line, sizeof(line), p, orv, 4);
+	if (nlv == 0 || nlv > FVMAP_MAX_LV || orv + 8u * nlv > FVMAP_BYTES || (orv & 3u)) {
+		p = put_txt(line, sizeof(line), p, " REJECTED");	/* the 0097 patch's own range check */
+		emit(line, p);
+		return;
+	}
+	emit(line, p);
+	for (unsigned l = 0; l < nlv; l++) {
+		uintptr_t e = GPU_FVMAP_SRAM + orv + 8u * l;
+
+		p = put_txt(line, sizeof(line), 0, "FVMAP");
+		p = put_dec(line, sizeof(line), p, idx);
+		p = put_txt(line, sizeof(line), p, " lv=");
+		p = put_dec(line, sizeof(line), p, l);
+		if (!try_read32(e, &rate) || !try_read32(e + 4u, &volt)) {
+			p = put_txt(line, sizeof(line), p, " unreadable");
+		} else {
+			p = put_txt(line, sizeof(line), p, " kHz=");
+			p = put_dec(line, sizeof(line), p, rate);
+			p = put_txt(line, sizeof(line), p, " uV=");
+			p = put_dec(line, sizeof(line), p, volt);
+		}
+		if (l == init)
+			p = put_txt(line, sizeof(line), p, " <- init_lv");
+		emit(line, p);
+	}
+}
+#endif
+
+/* Re-reads the always-on PMU word and, if the top domain is on, prints the whole CMU_G3D dump again (gpuclk.c: before / after a clock request). */
+void gpu_probe_cmu(void)
+{
+	uint32_t top = 0, mt = 0, mc = 0, ms = 0;
+
+	if (rd("PMU_G3D_STAT", GPU_PMU_G3D_STAT, &top) && (top & 1u))
+		(void)cmu_dump(&mt, &mc, &ms);
+}
+
+/* Read-only state of the shader cores for --gpu-rail-on, printed right before the rail is restored: only when both PMU domains read as on. */
+void gpu_probe_shaders(void)
+{
+	uint32_t top = 0, emb = 0, v;
+
+	if (!rd("PMU_G3D_STAT", GPU_PMU_G3D_STAT, &top) || !rd("PMU_EMB_STAT", GPU_PMU_EMB_STAT, &emb) || !(top & 1u) || !(emb & 1u))
+		return;
+	rd("RESTORE_SHADER_READY", GPU_MALI + 0x140, &v);
+	rd("RESTORE_SHADER_PWRTRANS", GPU_MALI + 0x200, &v);
+	rd("RESTORE_TILER_READY", GPU_MALI + 0x150, &v);
+	rd("RESTORE_L2_READY", GPU_MALI + 0x160, &v);
+}
+
 void gpu_probe(void)
 {
 	uint32_t v, top = 0, emb = 0, mt = 0, mc = 0, ms = 0, id = 0, sh = 0;
@@ -104,14 +246,12 @@ void gpu_probe(void)
 	emb_ok = rd("PMU_EMB_STAT", GPU_PMU_EMB_STAT, &emb);
 
 	/* CMU_G3D lives in the top domain: touch it only when that is powered. */
-	if (top_ok && (top & 1u)) {
-		int a = rd("CMU_MUX_TOP", GPU_CMU_G3D + CMU_MUX_TOP, &mt);
-		int b = rd("CMU_MUX_CORE", GPU_CMU_G3D + CMU_MUX_COREGROUP, &mc);
-		int c = rd("CMU_MUX_STACK", GPU_CMU_G3D + CMU_MUX_STACKS, &ms);
-		mux_ok = a && b && c;
-		rd("CMU_PLL_G3D", GPU_CMU_G3D + CMU_PLL_G3D, &v);
-		rd("CMU_PLL_G3D_L2", GPU_CMU_G3D + CMU_PLL_G3D_L2, &v);
-	}
+	if (top_ok && (top & 1u))
+		mux_ok = cmu_dump(&mt, &mc, &ms);
+#ifdef GPU_FVMAP_SRAM
+	fvmap_dom(GPU_FVMAP_IDX_G3D);
+	fvmap_dom(GPU_FVMAP_IDX_G3DL2);
+#endif
 
 	gate = gpu_gate(top_ok, top, emb_ok, emb, mux_ok, mt, mc, ms);
 	if (gate != GPU_GATE_OPEN) {
@@ -149,5 +289,7 @@ void gpu_probe(void)
 #else	/* not gs101 (or no GPU addresses): empty stub */
 
 void gpu_probe(void) {}
+void gpu_probe_cmu(void) {}
+void gpu_probe_shaders(void) {}
 
 #endif

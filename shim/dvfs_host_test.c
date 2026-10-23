@@ -72,8 +72,10 @@ static int in_table(uint32_t dom, uint32_t khz)
 	static const uint32_t cl0[] = { 2196000, 2098000, 2024000, 1950000, 1803000, 1704000, 1598000, 1401000, 1328000, 1197000 };
 	static const uint32_t cl1[] = { 2466000, 2393000, 1836000, 1197000 };
 	static const uint32_t cl2[] = { 3195000, 1826000, 1106000 };
-	const uint32_t *t = dom == 2 ? cl0 : dom == 3 ? cl1 : cl2;
-	unsigned n = dom == 2 ? 10 : dom == 3 ? 4 : 3, i;
+	static const uint32_t g3d[] = { 848000, 762000, 701000, 572000, 510000, 471000, 400000, 351000, 302000, 251000, 202000, 151000 };	/* run g0b */
+	static const uint32_t g3dl2[] = { 996000, 885000, 750000, 603000, 434000, 302000, 151000 };
+	const uint32_t *t = dom == 2 ? cl0 : dom == 3 ? cl1 : dom == 5 ? g3d : dom == 6 ? g3dl2 : cl2;
+	unsigned n = dom == 2 ? 10 : dom == 3 ? 4 : dom == 5 ? 12 : dom == 6 ? 7 : 3, i;
 
 	for (i = 0; i < n; i++)
 		if (t[i] == khz)
@@ -180,6 +182,7 @@ static void setup(uint32_t q_elem_size)
 	cur[2] = 1197000;
 	cur[3] = 1197000;
 	cur[4] = 1106000;
+	cur[5] = cur[6] = 151000;	/* G3D / G3DL2 at the firmware's init level (run g0b) */
 	setS(INIT_O + 0x08, TAB_O);
 	setS(INIT_O + 0x0C, 3);
 	setS(INIT_O + 0x18, 3);		/* ipc_ap_max: channels 0, 1, 2 */
@@ -284,7 +287,7 @@ static void test_get(void)
 	/* an unknown domain: refused, nothing written */
 	setup(ESZ);
 	t = trace();
-	assert(acpm_dvfs_get(&cfg, 5, &khz, &t) == ACPM_E_ARG && t.a.why == ACPM_W_DOM && nw == 0 && nbell == 0);
+	assert(acpm_dvfs_get(&cfg, 7, &khz, &t) == ACPM_E_ARG && t.a.why == ACPM_W_DOM && nw == 0 && nbell == 0);
 	assert(acpm_dvfs_get(&cfg, 0, &khz, &t) == ACPM_E_ARG && nw == 0);
 	/* an error code in reply word 3 is a failure, and the channel is drained */
 	setup(ESZ);
@@ -398,7 +401,7 @@ static void test_set_refusals(void)
 	assert(acpm_dvfs_set(&cfg, 3, 2466000, &t) == ACPM_E_ARG && nw == 0);
 	assert(acpm_dvfs_set(&cfg, 4, 3195000, &t) == ACPM_E_ARG && nw == 0);
 	assert(acpm_dvfs_set(&cfg, 2, 0, &t) == ACPM_E_ARG && nw == 0);
-	assert(acpm_dvfs_set(&cfg, 5, 1197000, &t) == ACPM_E_ARG && nw == 0);
+	assert(acpm_dvfs_set(&cfg, 7, 1197000, &t) == ACPM_E_ARG && nw == 0);
 	assert(acpm_dvfs_set(&cfg, 3, 1803000, &t) == ACPM_E_ARG && nw == 0);	/* CL0's row asked of CL1 (1803000 is not in CL1's table) */
 	assert(acpm_dvfs_set(&cfg, 2, 1826000, &t) == ACPM_E_ARG && nw == 0);	/* CL2's ceiling asked of CL0 */
 	assert(nbell == 0 && nreq == 0 && cur[2] == 1197000);

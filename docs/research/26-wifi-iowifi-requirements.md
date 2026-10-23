@@ -1,0 +1,107 @@
+# 26 - What iOS 16 `wifid`/configd/Settings need to see a Wi-Fi interface, and what ios-flame's `wland` does (task W0)
+
+Desk research, read-only. Nothing was run on a phone, no adb/fastboot, no kernel patch. Builds on doc 12 (D12) and doc 20 (D20).
+Date 2026-10-23. Nothing below is an observation on our hardware: every row is read from a file or is a guess.
+
+Tags (AGENTS.md rule 5): **[read from source]** = I saw it in the cited file/line this session; **[guess]** = inference, not seen.
+Where a fact is a second-hand statement of ios-flame's own notes (they decompiled iOS 16.5 `IO80211.framework`/`wifid`/`configd`), the row says
+"per flame notes": we have not re-verified it with `tools/rea` (open item O1). Licence: ios-flame is MIT (`LICENSE`, "Copyright (c) 2026 dipa-studio"),
+ideas only, no code is copied.
+
+## Where the references are
+
+- **ios-flame is present** at `~/pixelios-artifacts/refs/ios-flame` (there is no `refs/` in the repo root). Short names used below:
+  `FW/` = `~/pixelios-artifacts/refs/ios-flame/phone/wifi/`; `P0123:N` = line N of
+  `~/pixelios-artifacts/refs/ios-flame/xnu/patches/0123-flame-en0-apple80211-wifid-over-wland.patch`; `FH:N` = `ios-flame/HANDOFF.md:N`;
+  `FMK:N` = `ios-flame/tools/mkadt.py:N`.
+- **The topaz gap of D20 section 1.3 is closed.** D20 could not find the layer between `wifid` and the radio. It is in `P0123`: files
+  `bsd/dev/redwood_apple80211.c` (P0123:713), `redwood_net.c` (:1458), `redwood_sta.c` (:1840), `iokit/Kernel/arm/RedwoodWLAN.cpp` (:2675),
+  `MiniIONetworkStack.cpp` (:2555). They are ios-topaz "0900-en0-Apple80211-for-wifid" (FH:12-17), applied by flame unchanged. [read from source]
+- Our repo today: `tools/mkadt.py` has no `wlan`, `wifi` or `mac-address` text (grep, empty); patch `0099-sweet-ionetworkstack.patch` already has an
+  `IONetworkStack` stand-in (its comment: configd InterfaceNamer, `xnu/patches/0099...:1-30`; HANDOFF.md:28-30). [read from source]
+
+## 1. Requirements table (what must exist for `wifid` to see an interface)
+
+Order = the order iOS userland needs them at boot. "Consumer" = who reads it.
+
+| # | What must exist | Consumer | Source (file:line) | Tag |
+|---|---|---|---|---|
+| 1 | ADT node named `wlan` under `/arm-io` (flame: `device_type="wlan"`, `compatible="flame,wcn3990"`, a `ph()` phandle). Without it launchd never starts `wifid` (`com.apple.wifid` has `_LimitLoadToDeviceTree` = `wlan`, `marconi-wifi`). The `compatible` string is flame's own choice, nothing matches on it in userland. | launchd, then `wifid` | `FMK:193-203` (comment and node); same in ios-topaz `tools/mkadt.py:184-188` (D20 cites it); `FH:27` | [read from source] (that the plist key exists: per flame notes, plist not opened by us: O1) |
+| 2 | `/chosen` property `mac-address-wifi0` (6 bytes; flame uses a locally administered `02:50:49:58:45:4c`, later the real firmware MAC). Without it MobileGestalt `WifiAddress` waits 5 s for an `IONetworkController` (`sdio`/`wlan`/`marconi-wifi`) on every call; installd took 5 s per bundle. Also `mac-address-bluetooth0`, `mac-address-ethernet0`. Our ADT has none today. | MobileGestalt (`WifiAddress`, old-style `UniqueDeviceID`), installd, Settings > About | `FMK:124-132`; `FH:589-591`; our `tools/mkadt.py` has no `mac-address` (grep) | [read from source] |
+| 3 | `/product` `wifi-chipset` string. Ours is `4357` copied from D22AP (D12 2.1). Whether any iOS consumer needs it to match the real chip is not shown anywhere. | MobileGestalt (`WifiChipset`-style keys) | D12 2.1 (`docs/research/12-wifi-bluejay.md:~66-70`) | [guess] that a wrong value is harmless |
+| 4 | MobileGestalt keys named `WiFiAddress`, `WifiVendor` (task text): no file I read mentions `WifiVendor`; `WifiAddress` is the only key shown to read `/chosen/mac-address-wifi0` (row 2). Capability key `wifi` and its dependency on the ADT: D12 left it `TODO(verify)`. | MobileGestalt | `FH:589-591` (WifiAddress only); D12 2.2 "MobileGestalt" paragraph | [guess] for `WifiVendor`/capability keys; open item O2 |
+| 5 | `IONetworkStack` service in the IORegistry that configd's InterfaceNamer can open (a stand-in whose user client refuses naming requests). Until it is opened, configd never publishes `Plugin:InterfaceNamer` `*QUIET*`; `SCNetworkInterfaceCopyAll()` (called by wifid at start, Settings > About) blocks up to the 300 s timeout. **We have this already** (patch 0099). Flame ships the same idea as `MiniIONetworkStack.cpp` (service `IONetworkStack` under `IOResources`, user client opens, `setProperties` returns unsupported). | configd InterfaceNamer, `SCNetworkInterfaceCopyAll` -> wifid, Preferences | `P0123:2555-2674`; ours `xnu/patches/0099...:1-30`, `docs/HANDOFF.md:28-30` (configd disassembly: flag `0x100071b38`) | [read from source] |
+| 6 | IOKit registry must go quiet: flame also removes the "wait for kextd" busy hold (`iokitDaemonLaunched`, `StartIOKitMatching`) because no IOKit daemon ever reports in; otherwise `wifid` (and SpringBoard behind it) waits at boot. Ours: HANDOFF.md:30 says busy state was ruled out as the cause (root busy=0, run busy1) and 0099 alone was the fix, so we may not need the flame hold. | wifid, configd | `P0123:2520-2554`; `FH:199-202`; ours `docs/HANDOFF.md:30` | [read from source] (that we need it: [guess], probably not) |
+| 7 | A BSD interface named `en0`, `IFT_ETHER`, created with `ifnet_allocate_extended` + `ifnet_attach` + `ifnet_set_lladdr` + `bpfattach`, flags BROADCAST/MULTICAST/SIMPLEX, MTU 1500, with its own `ioctl` callback. Link state is announced with a `KEV_NETWORK_CLASS`/`KEV_DL_SUBCLASS` event. | configd (interface events), IP stack, DHCP | `P0123:1458` (file head), `redwood_net.c` attach at `P0123:~1757-1830`, `net_link_event` at `P0123:1703-1718` | [read from source] |
+| 8 | `SIOCGIFMEDIA` on `en0` must report `IFM_IEEE80211 | IFM_AUTO` (not `IFM_ETHER`). This is how `Apple80211` decides an interface is Wi-Fi when it enumerates `getifaddrs`. D12 had "nothing found says wifid requires it": flame's code and notes say it does. | `Apple80211`/IO80211.framework in wifid | `P0123:1648` (`net_link->wireless ? IFM_IEEE80211 : IFM_ETHER`), `:1672`; `FH:203-205` | [read from source] (flame notes for the consumer side) |
+| 9 | IORegistry object, class chain `IO80211Controller` (parent, child of the platform, property `IOMACAddress` = 6 bytes, `IOBuiltin`=true) and below it an `IONetworkInterface`-class object with properties `IOInterfaceName`="en0", `BSD Name`="en0", `IOInterfaceNamePrefix`="en", `IOInterfaceType`=6 (IFT_ETHER), `IOInterfaceUnit`=0, `IOBuiltin`, `IOPrimaryInterface`, `IO80211InterfaceRole`="Infrastructure". The classes are empty stand-ins named like Apple's (`IO80211Controller`, `IONetworkInterface`), subclass `RedwoodWLAN`. `wifid` binds to the service with `IO80211InterfaceRole`=Infrastructure and `IOInterfaceName`=en0; configd calls an `IONetworkInterface` whose parent conforms to `IO80211Controller` a Wi-Fi service (matches D12 2.2's reading of `SCNetworkInterface.c:1780-1790,1887-1927`). | wifid/IO80211.framework (binding), configd `SCNetworkInterfaceCopyAll` | `P0123:2675-2817` (esp. 2687-2700 comment, 2787, 2795-2810) ; D12 2.2 | [read from source] |
+| 10 | The IOKit service for the interface has **no user client** (`newUserClient` returns `kIOReturnUnsupported`). `IO80211.framework` tries `IOServiceOpen` type 0, fails, logs "Falling back to IOCTL path" and uses ioctls plus kernel events from then on. This is a deliberate shortcut: it avoids implementing the 0x3C30-byte user-client ioctl wrapper and the event ring. | wifid | `P0123:2700-2715` (class), `:2680-2700` (rationale); `FH:13-16`; `FH:207-215` (user-client structure, selectors, mapped event ring) | [read from source] (framework behaviour per flame notes, iOS 16.5) |
+| 11 | `SIOCSA80211 = 0x802869c8` and `SIOCGA80211 = 0xc02869c9` on any socket, payload `struct apple80211req { char ifname[16]; int32 type; int32 val; uint32 len; user_addr_t data; }` (0x28 bytes). XNU routes unknown interface ioctls to the ifnet's `ioctl` callback (D12 2.2); flame's `net_ioctl` hands them to `redwood_apple80211_ioctl()` when the link is wireless. | wifid (all operations) | `P0123:765-766, 773-779, 1698`; D12 2.2 | [read from source] |
+| 12 | The request types that flame answers, i.e. the minimum that got Settings to list networks and join (type number, name): GET 43/44 driver/hardware version (256-byte string, first call), 12 card capabilities (13 bytes; must set the WPA2 bit or the framework builds no join: "Unable to join"), 19 power (`{version,radios,state[4]}`; counts as on until the station attaches), 15 op mode (=1, station), 27/254 supported channels (4824-byte struct), 207 channels info (10016 bytes), 11 scan result (one BSS per GET, `EIO` = end), 21 associate result (1 ok, 21 bad PMK, 9 timeout, 2 other), 13 state (0 init, 1 scan, 2 auth, 4 run), 1 SSID, 9 BSSID, 4 channel, 16 RSSI, 103 current network, 2 auth type; SET 10 scan request (5456 bytes), 20 associate (592 bytes; cipher 10 = passphrase as typed, 6 = PMK), 22 disassociate, 19 power. All others return `EOPNOTSUPP` and were "harmless so far" (flame: wifid sets 383 and 419, gets 96/97 RATE/MCS/NOISE refused). Struct layouts are `_Static_assert`-ed against iOS 16.5 sizes. | wifid | `P0123:786-815` (names), `:1013-1186` (GET), `:1286-1305` (SET), `:866-916` (layouts), `:921-930` (asserts); `FH:40-41` | [read from source] (that 16.7 matches 16.5 layouts: [guess]) |
+| 13 | Kernel events posted to wifid on `KEV_VENDOR_APPLE`, class `KEV_IEEE80211_CLASS` (6), subclass 1, `event_code` = Apple80211 event number, `dv[0]` = 16-byte ifname, `dv[1]` = payload. Events used: 1 POWER_CHANGED, 2 SSID_CHANGED, 3 BSSID_CHANGED, 4 LINK_CHANGED (payload `struct apple80211_link_changed`, exactly 32 bytes or the framework drops it), 9 ASSOC_DONE, 10 SCAN_DONE. Ordering: on a link change post SSID, BSSID, then LINK. | wifid (IO80211.framework reads them from a PF_SYSTEM socket) | `P0123:1318-1332` (`post`), `:1336-1380` (event mapping), `:843-860` (events enum and link struct) | [read from source] |
+| 14 | A station backend with the calls: power, scan, heard-list, join (SSID, optional BSSID, passphrase or 32-byte PMK), leave, state, channel list, transmit/receive of Ethernet frames, link up/down callback. Flame's `redwood_sta_ops` has exactly these seven callbacks; a worker thread serialises them because scans and joins take seconds and the ioctl must return at once (completion is delivered as an event). | row 12/13 code | `P0123:190-198` (ops), `:1840-1900` (redwood_sta.c design comment), `:2392-2519` (header) | [read from source] |
+| 15 | `configd` must have a network service for `en0`. Flame found `preferences.plist` held host names only, so they moved it aside and let configd regenerate defaults with a Wi-Fi service for en0; wifid waits for the joined interface to become "routable", which needs that service. Our image state for this is unknown. | configd (DHCP service, primary interface), wifid after join | `FH:33-34`; `P0123:2689-2699` (routable remark) | [read from source] (our preferences.plist: unchecked, O3) |
+| 16 | Entitlements/daemons: no kernel-side entitlement check is implemented by flame (relaxed AMFI, plus a `SweetAMFI` stand-in at their 0103). Client side: Settings/SpringBoard reach wifid through `MobileWiFi` with `com.apple.wifi.manager-access` (D12 2.2, citing a Levin article about iOS 8, not 16). `wifid` itself needs root and the ADT node (row 1). Which daemons beyond wifid must run (`wifianalyticsd`, `WirelessRadioManagerd` already runs per D20 1.1) is not shown as required by any file. | launchd, AMFI | `FH:589-600` (SweetAMFI); D12 2.2; D20 1.1 | [read from source] for flame's no-check approach; [guess] that nothing else is required |
+| 17 | Skywalk: flame's notes say wifid matches IOKit class `IO80211SkywalkInterface` and waits for `APPLE80211_M_DRIVER_AVAILABLE`, yet flame's *working* implementation provides neither (no Skywalk object, ioctl fallback, event 1 only). So on 16.5 the ioctl path is enough in practice. D20's open question "does wifid insist on a Skywalk interface" is answered **no, on 16.5**, by flame's result. | wifid | `FH:8-10` (Settings works), `FH:203-205`; `P0123:2675-2817` (no Skywalk class) | [read from source] for flame's result; [guess] that it carries over to our 16.7 root |
+
+## 2. What ios-flame's `wland` front end does
+
+`wland` is a **userland daemon** (`FW/wland.c`, 26 kB, launchd job `org.iosonpixel.wland`) that brings up the Pixel 4's radio (WCN3990, firmware hosted on the
+modem DSP) and then talks to a thin **kernel station** over a character device. The Wi-Fi *radio* part is Qualcomm-specific and irrelevant to us; the
+*boundary* is the useful idea. [read from source]
+
+| Part | What it does | Where | Do we reimplement? |
+|---|---|---|---|
+| Boot job | `wland auto`: one run per phone boot (stamp = `kern.boottime`), raises its jetsam limit, log in `/var/local/wland.log`, off with `/var/local/wland.off` or boot-arg `sweetwifi=0` | `FW/wland.c:23-24` (usage), `:707-745` | Idea only: a once-per-boot stamp and an off switch are cheap; our bring-up is in the kernel/shim, so no daemon needed at first. |
+| Power and boot of the radio | RPMh votes, 4 LDOs + `rfclka2` + QMP message, PAS boot of the modem, SMP2P, GLINK/QRTR/QMI to the WLFW service, rmtfs/pd-mapper/tftp services, copy engines and WMI | `FW/wland.c:128-148, 392-520, 649-700`; `FW/{glink,qmi,wlfw,rmtfs,pdmapper,tftp,radio,smem,pmem}.c` | **No.** Qualcomm only. Our equivalent is D20 stages 1-2 (PCIe link, BCM4389 msgbuf), which share nothing with it. |
+| `/dev/wlan` message protocol (`flamewlan.h`) | One message per `read()`/`write()`, 4-byte header (`type`,`len`). Kernel->radio: `SCAN`, `JOIN{ssid,bssid,any_bssid,key_kind(none/passphrase/PMK),key[64]}`, `LEAVE`, `TX frame`. Radio->kernel: `HELLO{mac}`, `BSS_BEGIN`, `BSS{bssid,ssid,freq,rssi,beacon_interval,capability,age_ms,IEs[768]}`, `SCAN_DONE{errno}`, `JOIN_DONE{errno}`, `LEFT`, `LINK{up,ssid,bssid}`, `RX frame` | `FW/flamewlan.h:13-67`; kernel side `P0123:265-712` (queue of 64 messages, blocking requests with timeouts scan 20 s / join 40 s: `FH:19-20`) | **Yes, the shape**, if our radio core ends up outside the kernel. If the BCM driver lives in the kernel (D20 stage 3, `bsd/dev/sweet_bcmpcie.c`), skip the device and call the `redwood_sta_ops` directly. Either way we write our own struct definitions. |
+| Bridge | After the radio starts opens `/dev/wlan`; sends `HELLO` after the **first scan** so the kernel only makes `en0` once a radio exists; answers SCAN (a "background scan" while joined: at most every 15 s, else cached list of the last 2 min), JOIN (PMK or passphrase), LEAVE, TX/RX frames | `FW/bridge.c:1-120`; `FH:21-26` | **Yes, the sequencing idea:** create `en0` and the IORegistry objects only after the firmware is up and has a MAC (row 7/9); until then wifid has nothing to bind to. |
+| wlan.conf fallback | `/var/local/wlan.conf` (`ssid=`, `psk=`) auto-joins until wifid asks for a network (`bridge_joins` flag) | `FW/wland.c:560-576`, `FW/bridge.c:23` | Optional, useful for bring-up before Settings works (no password typing); keep out of git (rule 4). |
+| IP side | Old mode: `ipnet.c` made a utun with its own DHCP. New mode: `wland` makes no IP, iOS's own DHCP runs on `en0` | `FW/bridge.c:1-8`; `FH:21-22` | **No** utun; use en0 and configd. |
+| Kernel station (`flame_sta.c`, `flame_wlan.c`) | Glue from `redwood_sta_ops` onto the `/dev/wlan` queue; when `HELLO` arrives it spawns a thread that calls `redwood_net_attach()` (makes en0, calls `RedwoodWLANStart`) then `redwood_sta_attach()` | `P0123:17-264, 265-712` | **Yes, the pattern** (idea): ops table in, ifnet + registry objects out. |
+
+Flame's own summary of the result: Settings lists networks, joins, shows the status bar icon, DHCP on en0, from cold boot (`FH:8-10`). [read from source]
+That is flame's claim on a Pixel 4; it is not our result.
+
+## 3. What is Qualcomm-specific vs reusable
+
+- **Reusable ideas (ours to rewrite, with our own code and layouts):** rows 1, 2, 5, 7-14 of section 1 (ADT node, MAC in `/chosen`, `IONetworkStack`, en0 via
+  ifnet KPI with `IFM_IEEE80211`, `IO80211Controller`/`IONetworkInterface` stand-ins with the listed properties, no user client, `SIOC[GS]A80211` dispatcher, kernel
+  events class 6, station-ops boundary).
+- **Not reusable:** everything in `FW/` except `flamewlan.h`'s idea and `bridge.c`'s sequencing. The ioctl type numbers and struct layouts are Apple's
+  (flame reads them from iOS 16.5 `IO80211.framework`); we must re-derive them from our own 16.7 binaries with `tools/rea` before relying on them (AGENTS.md
+  rule 7), not copy flame's constants.
+- **Licence:** MIT; keep a credit line in the eventual patch header per flame's `CREDITS.md` practice if we port expressions closely (unchecked: `CREDITS.md` not
+  read). We write fresh code regardless.
+
+## 4. Minimum steps from "nothing" to "Settings lists a network" (ranked, 8)
+
+Hardware dependence column: **SW** = software only (QEMU/host/any phone boot, no radio), **HW-PCIe** = needs the gs101 PCIe link,
+**HW-FW** = needs the BCM4389 firmware running, **HW-user** = needs the user to pull vendor files.
+
+| # | Step | Depends on | Hardware dependence |
+|---|---|---|---|
+| 1 | `tools/mkadt.py`: add `/arm-io/wlan` node (device_type `wlan`) and `/chosen` `mac-address-wifi0/bluetooth0/ethernet0` from a generator table. Immediate side effects: ends the 5 s MobileGestalt waits (row 2) and makes launchd start `wifid` (row 1), which will then log the failures and tell us what else it needs. | none | SW. Observable on the next normal GUI boot. |
+| 2 | Confirm the client side with `tools/rea`: open the mounted iOS root (user stages the root mount command, D20 1.1), read `com.apple.wifid` launchd plist (`_LimitLoadToDeviceTree`), and decompile `wifid`/`IO80211.framework` for 16.7: ioctl types asked at start, `IO80211InterfaceRole`/`IOInterfaceName` matching, MobileGestalt Wi-Fi keys (closes O1, O2, `WifiVendor`). | none | SW (host; the root mount needs the user). |
+| 3 | Kernel patch family `0102+-sweet-wlan-*`: `en0` ifnet (IFT_ETHER, `IFM_IEEE80211` media) + `SIOC[GS]A80211` dispatcher logging every request (type, get/set, length, never the payload) and returning `EOPNOTSUPP`; `IO80211Controller` + `IONetworkInterface` stand-ins with the row-9 properties and no user client. Boot-arg `sweetwlan=0` to disable. | 1, 2 | SW. Test in QEMU (D20 section 6) and on the phone with a fake radio core. Success = `wifid` runs and the log lists its first ioctl types (the request set). |
+| 4 | Fake station backend: static channel list, canned scan results, fake "join succeeded" and link events (rows 12-14). Goal: Settings > Wi-Fi shows a switch, a network list and a joined row **without any radio**. This isolates iOS-side bugs from hardware bugs. | 3 | SW. |
+| 5 | `--wlan-probe` (W1): fix D1-D4 (D20 section 3), run on the phone, record the register dump. | none (parallel to 1-4) | HW read-only; hits the PCIe/EL3 unknowns, no radio yet. |
+| 6 | Stage 1: power and PCIe link training to L0 (D20 stage 1; includes the EL3 SMC test of PMU `0x17463EC4` and a possible ACPM client for the radio rails, doc 23). | 5 | **HW-PCIe** (blocker 1 and 2 of D20 section 5). |
+| 7 | Stage 2: config space, BAR window, vendor firmware download, msgbuf control rings; firmware files pulled by the user, never in git. | 6 | **HW-PCIe + HW-FW + HW-user.** |
+| 8 | Replace the fake backend of step 4 with the real BCM4389 station (scan, join WPA2-PSK, frames); create `en0` only after firmware answers (flame's HELLO-after-first-scan idea); then Settings lists real networks. | 4, 7 | **HW-PCIe + HW-FW.** |
+
+Steps 1-4 are software only and can finish before any radio work: the credible first Wi-Fi milestone is "Settings shows a Wi-Fi row with a fake network"
+(step 4), then real hardware (steps 6-8). [guess] for effort: D20 estimates 25-40 agent-days in total, most in 6-7.
+
+## 5. Open items and what I could not verify
+
+- **O1**: the `com.apple.wifid` launchd key `_LimitLoadToDeviceTree` = `wlan`, `marconi-wifi`, and everything attributed to "flame notes" (IO80211.framework
+  user-client selectors, ioctl type numbers) are second-hand from ios-flame's comments (`FH:199-215`, `FMK:193-198`). Our iOS root is not mounted (needs root;
+  stage the command for the user) and the 16.7 binaries have not been opened by us. Flame decompiled **16.5** (`P0123` header comment), ours is 16.7.
+- **O2**: MobileGestalt keys `WifiVendor` and the Wi-Fi capability key: not found in any file I read. Needs `ipsw dyld str` on our shared cache
+  (`~/pixelios-artifacts/work/dsc/cache/dyld_shared_cache_arm64`) as done for QuartzCore.
+- **O3**: whether our image's `configd` preferences contain a Wi-Fi network service for `en0` (flame had to regenerate it, `FH:33-34`). Needs the root mount.
+- **O4**: whether `ifnet` `ioctl` dispatch of the `'i',200/201` 0x28-byte requests collides with xnu's `ifreq`-sized ioctls was marked [guess] in D12; flame's
+  working result (`P0123:1698`) is evidence it works on their xnu-8796 build, same version as ours, but not a test on ours.
+- **O5**: I did not read `redwood_net.c` `net_ioctl` fully (only the cited lines) nor flame's `CREDITS.md`.
+- No hardware was touched. No tool proposal written: `tools/rea` + `tools/mkadt.py` unit tests (D20 section 6) cover the steps, nothing new needed.

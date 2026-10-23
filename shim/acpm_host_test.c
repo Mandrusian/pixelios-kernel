@@ -40,6 +40,7 @@
 static uint32_t sram[SRAMSZ / 4];
 static uint32_t mbox[MBOXSZ / 4];
 static uint32_t pmic[256];
+static int fail_upd, ignore_upd, bump_out1, fail_r16;	/* gpurailon_host_test: UPDATE answers with an error (not applied) / is acknowledged but not applied / also changes register 0x16 */
 static struct { uintptr_t pa; uint32_t v; } wlog[256];
 static unsigned nw, stray, nbell;
 static uintptr_t bad_rpa, bad_wpa;	/* a read of / the next write to this address faults */
@@ -82,9 +83,11 @@ static void apm_complete(void)	/* the APM finishes its transaction: only now doe
 	val = (apm_w[1] >> 8) & 0xff;
 	mask = (apm_w[1] >> 16) & 0xff;
 	r0 = apm_w[0] + (mode == M_BADSEQ ? (1u << 16) : 0);
-	if (fn == 2)
+	if (fn == 2 && !fail_upd && !ignore_upd)
 		pmic[reg] = (pmic[reg] & ~mask) | (val & mask);
-	r1 = (fn == 0 ? pmic[reg] << 8 : 0) | (mode == M_RET ? 2u << 24 : 0);
+	if (fn == 2 && bump_out1)
+		pmic[0x16]++;
+	r1 = (fn == 0 ? pmic[reg] << 8 : 0) | (mode == M_RET || (fn == 2 && fail_upd) || (fn == 0 && reg == 0x16 && fail_r16) ? 2u << 24 : 0);
 	setS(RSP_BASE_O + ESZ * sf + 0, r0);
 	setS(RSP_BASE_O + ESZ * sf + 4, r1);
 	setS(RSP_FRONT_O, (sf + 1) % QLEN);
@@ -165,6 +168,7 @@ static void setup(uint32_t q_elem_size)	/* the descriptor's q_elem_size as the A
 	memset(mbox, 0, sizeof(mbox));
 	memset(wlog, 0, sizeof(wlog));
 	nw = stray = nbell = 0;
+	fail_upd = ignore_upd = bump_out1 = fail_r16 = 0;
 	bad_rpa = bad_wpa = 0;
 	wfaults = poll_fault = time_frozen = 0;
 	mode = M_OK;

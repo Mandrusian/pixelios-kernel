@@ -1,0 +1,297 @@
+#!/usr/bin/env python3
+"""MobileGestalt question -> value source, offline (TP-013). Reads libMobileGestalt out of an iOS dyld shared cache; no phone.
+  tools/mg-key NAME... [--dsc CACHE] [--dylib EXTRACTED] [--out DIR]
+NAME = a plain question (SerialNumber) or an obfuscated 22-char key. Per key: obfuscated key, table entry, compute function,
+the first-level source (C strings / syscfg fourccs the compute function loads, helper calls), precache index, protected-key hook.
+The perfect-hash tables, the bound and the entry stride are NOT hard-coded: they are read from the code of the name lookup
+(the function that does `cmp w1,#0x16`, called from _MGCopyAnswer), by symbolic execution of its first straight-line block.
+The entry field offsets (+0 key, +8 compute fn, +0x18 protect hook, +0x9a precache index) are from the iOS 16.7 (20H392) analysis
+(scratch/reports/about-identity.md); the tool FAILs if the key string at the entry does not match, which catches layout drift.
+Helpers that the compute function calls (IORegistry/syscfg/EDT readers) are listed, not followed: look at them by hand.
+RESULT: PASS|FAIL|ERROR keys=N   exit 0 / 1 / 2.   Details + the extracted dylib (Apple binary, gitignored) go to --out (default logs/mg-key)."""
+import argparse, base64, hashlib, os, re, shutil, struct, subprocess, sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ART = os.path.expanduser("~/pixelios-artifacts")
+DSC = os.path.join(ART, "work/dsc/cache/dyld_shared_cache_arm64")
+ENT_KEY, ENT_FN, ENT_PROT, ENT_PRE = 0, 8, 0x18, 0x9a
+
+
+def obfuscate(name):
+    """22-char names are already keys (the lookup code compares the length with 0x16); else base64(md5("MGCopyAnswer"+name))[:22]."""
+    if len(name) == 22:
+        return name
+    return base64.b64encode(hashlib.md5(("MGCopyAnswer" + name).encode()).digest()).decode()[:22]
+
+
+class Image:
+    """Mapped segments of a Mach-O: [(name, vmaddr, vmsize, bytes)]."""
+    def __init__(self, segs):
+        self.segs = segs
+
+    @classmethod
+    def from_macho(cls, path):
+        data = open(path, "rb").read()
+        if struct.unpack_from("<I", data, 0)[0] != 0xfeedfacf:
+            raise ValueError("not a 64-bit little-endian Mach-O")
+        n, off, segs = struct.unpack_from("<I", data, 16)[0], 32, []
+        for _ in range(n):
+            cmd, sz = struct.unpack_from("<II", data, off)
+            if cmd == 0x19:
+                nm = data[off + 8:off + 24].rstrip(b"\0").decode()
+                va, vs, fo, fs = struct.unpack_from("<QQQQ", data, off + 24)
+                segs.append((nm, va, vs, data[fo:fo + min(fs, vs)]))
+            off += sz
+        return cls(segs)
+
+    def seg(self, name):
+        return next(s for s in self.segs if s[0] == name)
+
+    def read(self, va, n):
+        for _, base, size, buf in self.segs:
+            if base <= va and va + n <= base + len(buf):
+                return buf[va - base:va - base + n]
+        raise KeyError(hex(va))
+
+    def u16(self, va): return struct.unpack("<H", self.read(va, 2))[0]
+    def u64(self, va): return struct.unpack("<Q", self.read(va, 8))[0]
+
+    def cstr(self, va, maxn=96):
+        try:
+            b = self.read(va, 1)
+            out = b""
+            while len(out) < maxn:
+                b = self.read(va + len(out), 1)
+                if b == b"\0":
+                    return out.decode("ascii") if out else None
+                if not 32 <= b[0] < 127:
+                    return None
+                out += b
+        except (KeyError, UnicodeDecodeError):
+            return None
+
+
+def capstone():
+    try:
+        from capstone import Cs, CS_ARCH_ARM64, CS_MODE_ARM
+    except ImportError:
+        raise RuntimeError("python3 capstone missing (pip install capstone)")
+    return Cs(CS_ARCH_ARM64, CS_MODE_ARM)
+
+
+def _r(s):  # "w9"/"x9" -> 9, "wzr"/"xzr"/"sp" -> None
+    m = re.fullmatch(r"[wx](\d+)", s)
+    return int(m.group(1)) if m else None
+
+
+def _imm(s): return int(s.lstrip("#"), 0)
+
+
+def find_lookup(img, md):
+    """Locate the name->entry function and read its hash parameters from its code. -> dict(terms, const, bound, stride, table, func)."""
+    _, tb, ts, tdata = img.seg("__TEXT")
+    hits = [i for i in range(0, len(tdata) - 3, 4) if tdata[i:i + 4] == struct.pack("<I", 0x7100583f)]  # cmp w1,#0x16
+    for h in hits:
+        start = tb + h
+        ins = list(md.disasm(img.read(start, 4 * 70), start))
+        r = _exec_lookup(ins)
+        if r:
+            r["func"] = start
+            return r
+    raise RuntimeError("no name-lookup function found (cmp w1,#0x16 ... madd) in __TEXT")
+
+
+def _exec_lookup(ins):
+    regs = {0: ("arg", 0)}
+    bound, out = None, None
+    for i in ins:
+        m, ops = i.mnemonic, [o.strip() for o in i.op_str.replace("!", "").split(",")]
+        raw = i.op_str
+        try:
+            if m == "ret":
+                break
+            if m == "adrp":
+                regs[_r(ops[0])] = int(ops[1].lstrip("#"), 0)
+            elif m == "mov" and ops[1].startswith("#"):
+                regs[_r(ops[0])] = _imm(ops[1])
+            elif m == "mov":
+                regs[_r(ops[0])] = regs.get(_r(ops[1]))
+            elif m == "ldrb":
+                mm = re.match(r"(\w+), \[(x\d+)(?:, #(\w+))?\](!?)", raw)
+                base = regs.get(_r(mm.group(2)))
+                if isinstance(base, tuple) and base[0] == "arg":
+                    off = base[1] + (int(mm.group(3), 0) if mm.group(3) else 0)
+                    regs[_r(mm.group(1))] = ("chr", off)
+                    if mm.group(4):
+                        regs[_r(mm.group(2))] = ("arg", off)
+            elif m == "add" and len(ops) == 3 and ops[2].startswith("#"):
+                a = regs.get(_r(ops[1]))
+                if isinstance(a, int):
+                    regs[_r(ops[0])] = a + _imm(ops[2])
+                elif isinstance(a, tuple) and a[0] == "sum":
+                    regs[_r(ops[0])] = ("sum", a[1], a[2] + _imm(ops[2]))
+            elif m == "add" and len(ops) == 4:  # add xd, xbase, xchr, lsl #1
+                a, b = regs.get(_r(ops[1])), regs.get(_r(ops[2]))
+                if isinstance(a, int) and isinstance(b, tuple) and b[0] == "chr" and ops[3] == "lsl #1":
+                    regs[_r(ops[0])] = ("scaled", a, b[1])
+            elif m == "add" and len(ops) == 3:  # add xd, xa, xb : sum of terms
+                a, b = regs.get(_r(ops[1])), regs.get(_r(ops[2]))
+                if isinstance(a, tuple) and isinstance(b, tuple) and a[0] == b[0] == "sum":
+                    regs[_r(ops[0])] = ("sum", a[1] + b[1], a[2] + b[2])
+            elif m == "ldrh":
+                mm = re.match(r"(w\d+), \[(x\d+)(?:, (#\w+|x\d+)(?:, lsl #1)?)?\]", raw)
+                a = regs.get(_r(mm.group(2)))
+                third = mm.group(3)
+                if isinstance(a, tuple) and a[0] == "scaled" and (third is None or third.startswith("#")):
+                    t = (a[2], a[1] + (_imm(third) if third else 0))
+                elif isinstance(a, int) and third and third.startswith("x") and isinstance(regs.get(_r(third)), tuple) and regs[_r(third)][0] == "chr":
+                    t = (regs[_r(third)][1], a)
+                else:
+                    continue
+                regs[_r(mm.group(1))] = ("sum", (t,), 0)
+            elif m == "cmp" and ops[1].startswith("#"):
+                a = regs.get(_r(ops[0]))
+                if isinstance(a, tuple) and a[0] == "sum" and bound is None and a[1]:
+                    bound = _imm(ops[1])
+            elif m == "madd":
+                a, sz, tb = regs.get(_r(ops[1])), regs.get(_r(ops[2])), regs.get(_r(ops[3]))
+                if isinstance(a, tuple) and a[0] == "sum" and isinstance(sz, int) and isinstance(tb, int) and bound is not None:
+                    out = {"terms": sorted(a[1]), "const": a[2], "bound": bound, "stride": sz, "table": tb}
+                    break
+        except (AttributeError, TypeError, KeyError):
+            continue
+    if out and len(out["terms"]) == 3 and len({t[0] for t in out["terms"]}) == 3:
+        return out
+    return None
+
+
+def slot(img, params, key):
+    """Hash a 22-char key with the extracted parameters. -> entry address or None."""
+    s = key.encode()
+    idx = params["const"] + sum(img.u16(addr + 2 * s[pos]) for pos, addr in params["terms"])
+    return None if idx > params["bound"] else params["table"] + idx * params["stride"], idx
+
+
+def analyse_fn(img, md, fn, limit=300):
+    """Straight-line scan of a compute function: C strings and CFString constants (adrp+add), fourcc immediates, helper calls with
+    their w2. Ends at a `ret` with no later branch target, or at a tail-call `b` (target before fn or > 0x400 away)."""
+    ins = list(md.disasm(img.read(fn, 4 * limit), fn))
+    regs, strs, fcc, calls, maxfwd = {}, [], [], [], 0
+    for i in ins:
+        m, ops = i.mnemonic, [o.strip() for o in i.op_str.split(",")]
+        tgt = int(ops[-1].lstrip("#"), 0) if (m in ("b", "bl") or m.startswith("b.") or m in ("cbz", "cbnz", "tbz", "tbnz")) and ops[-1].startswith("#") else None
+        if tgt is not None and m != "bl":
+            if m == "b" and (tgt <= fn or tgt - i.address > 0x400):
+                calls.append((tgt, regs.get(2)))
+                break
+            maxfwd = max(maxfwd, tgt)
+        if m == "ret" and maxfwd <= i.address:
+            break
+        try:
+            if m == "adrp":
+                regs[_r(ops[0])] = int(ops[1].lstrip("#"), 0)
+            elif m == "add" and len(ops) == 3 and ops[2].startswith("#") and isinstance(regs.get(_r(ops[1])), int):
+                a = regs[_r(ops[1])] + _imm(ops[2])
+                regs[_r(ops[0])] = a
+                s = img.cstr(a)
+                if s is None:  # CFString constant: {isa, flags, char *bytes, length}
+                    try:
+                        s = img.cstr(img.u64(a + 16))
+                    except KeyError:
+                        s = None
+                if s and len(s) >= 3 and s not in strs:
+                    strs.append(s)
+            elif m == "mov" and ops[1].startswith("#"):
+                regs[_r(ops[0])] = _imm(ops[1])
+            elif m == "movk":
+                v = regs.get(_r(ops[0]))
+                sh = int(ops[2].split("#")[1], 0) if len(ops) > 2 else 0
+                if isinstance(v, int):
+                    v = (v & ~(0xffff << sh)) | (_imm(ops[1]) << sh)
+                    regs[_r(ops[0])] = v
+                    b = v.to_bytes(4, "big") if v < 1 << 32 else b""
+                    if len(b) == 4 and all(32 <= c < 127 for c in b) and b.decode() not in fcc:
+                        fcc.append(b.decode())
+            elif m == "bl":
+                calls.append((tgt, regs.get(2)))
+                for k in range(18):  # caller-saved registers are dead after a call
+                    regs.pop(k, None)
+        except (ValueError, TypeError):
+            pass
+    return strs, fcc, calls
+
+
+def resolve(img, md, params, name):
+    key = obfuscate(name)
+    ent, idx = slot(img, params, key)
+    if ent is None:
+        return {"name": name, "key": key, "ok": False, "why": "hash index %#x beyond bound %#x: not in the table" % (idx, params["bound"])}
+    try:
+        kp = img.u64(ent + ENT_KEY)
+        found = img.cstr(kp) if kp else None
+    except KeyError:
+        found = None
+    if found != key:
+        return {"name": name, "key": key, "ok": False, "idx": idx, "entry": ent, "why": "entry key string %r != %s: not in the table (or layout differs)" % (found, key)}
+    fn, prot, pre = img.u64(ent + ENT_FN), img.u64(ent + ENT_PROT), img.u16(ent + ENT_PRE)
+    r = {"name": name, "key": key, "ok": True, "idx": idx, "entry": ent, "fn": fn, "protected": prot, "precache": pre}
+    r["strs"], r["fcc"], r["calls"] = analyse_fn(img, md, fn)
+    return r
+
+
+def line(r):
+    if not r["ok"]:
+        return "%s %s NOT-FOUND %s" % (r["name"], r["key"], r["why"])
+    return "%s %s idx=%#x entry=%#x fn=%#x src=%s fourcc=%s calls=%s precache=%s protected=%s" % (
+        r["name"], r["key"], r["idx"], r["entry"], r["fn"], r["strs"] or "-", r["fcc"] or "-",
+        ",".join("%#x(w2=%s)" % (c, hex(w) if isinstance(w, int) and w < 0x1000 else "?") for c, w in r["calls"][:4]) or "-",
+        "never" if r["precache"] == 0xffff else hex(r["precache"]),
+        "yes(%#x)" % r["protected"] if r["protected"] else "no")
+
+
+def extract(dsc, out, ipsw):
+    dst = os.path.join(out, "libMobileGestalt.dylib")
+    if not os.path.exists(dst):
+        subprocess.run([ipsw, "dyld", "extract", dsc, "/usr/lib/libMobileGestalt.dylib", "--slide", "-o", out],
+                       check=True, capture_output=True, timeout=600)
+    return dst
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("names", nargs="+")
+    ap.add_argument("--dsc", default=os.environ.get("MG_DSC", DSC))
+    ap.add_argument("--dylib", help="already extracted (slid) libMobileGestalt, skips ipsw")
+    ap.add_argument("--out", default=os.path.join(ROOT, "logs/mg-key"))
+    a = ap.parse_args()
+    try:
+        os.makedirs(a.out, exist_ok=True)
+        md = capstone()
+        dylib = a.dylib
+        if not dylib:
+            ipsw = os.environ.get("MG_IPSW") or shutil.which("ipsw") or os.path.join(ART, "tools/ipsw")
+            if not os.path.exists(a.dsc) or not os.path.exists(ipsw):
+                raise RuntimeError("need a dyld shared cache (--dsc, have %s) and the ipsw tool (have %s)" % (a.dsc, ipsw))
+            dylib = extract(a.dsc, a.out, ipsw)
+        img = Image.from_macho(dylib)
+        params = find_lookup(img, md)
+    except (RuntimeError, OSError, ValueError, subprocess.SubprocessError, StopIteration) as e:
+        print("RESULT: ERROR %s keys=0" % e)
+        return 2
+    res = [resolve(img, md, params, n) for n in a.names]
+    lines = [line(r) for r in res]
+    with open(os.path.join(a.out, "report.txt"), "w") as f:
+        f.write("hash params: %s\n" % params + "\n".join(lines) + "\n")
+    print("hash terms (char pos, u16 table) %s const=%#x bound=%#x stride=%#x table=%#x (read from code at %#x)" % (
+        [(p, hex(t)) for p, t in params["terms"]], params["const"], params["bound"], params["stride"], params["table"], params["func"]))
+    for l in lines[:4]:
+        print(l[:400])
+    if len(lines) > 4:
+        print("... %d more in %s/report.txt" % (len(lines) - 4, a.out))
+    bad = sum(not r["ok"] for r in res)
+    print("RESULT: %s keys=%d notfound=%d" % ("FAIL" if bad else "PASS", len(res), bad))
+    return 1 if bad else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

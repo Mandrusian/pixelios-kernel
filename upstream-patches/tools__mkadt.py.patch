@@ -16,12 +16,19 @@
  
  # Kernel-managed RAM: above every Qualcomm XPU carve-out (see NOTES.md)
  PHYS_BASE = 0xb0000000
-@@ -68,10 +70,15 @@
+@@ -68,10 +70,22 @@
      return n
  
  
 -def build(seed=None, qemu=False, highmem=False):
-+def build(seed=None, qemu=False, highmem=False, board='sweet', no_ufs=False):
++def fake_mac(kind):
++    """Locally administered unicast MAC (02:xx...) derived from the synthetic ECID; kind 0/1/2 = wifi0/bluetooth0/ethernet0.
++    Placeholder until the radio's own address is read from its firmware (docs/research/26 rows 2 and 7)."""
++    e = struct.pack('<Q', SWEET_ECID)
++    return bytes([0x02, e[0], e[1], e[2], e[3], (e[4] + kind) & 0xff])
++
++
++def build(seed=None, qemu=False, highmem=False, board='sweet', no_ufs=False, wlan_node=False):
      """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
 -    phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
 -    gicd, gicr, timebase = (QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE) if qemu else (GICD, GICR, TIMEBASE)
@@ -35,7 +42,19 @@
      seed = seed if seed is not None else os.urandom(64)
      phandle = iter(range(1, 1000))
      ph = lambda: ('AAPL,phandle', u32(next(phandle)))
-@@ -124,17 +131,25 @@
+@@ -111,6 +125,11 @@
+         ('effective-production-status-ap', u32(0)),
+         ('certificate-security-mode', u32(1)),
+         ('effective-security-mode-sep', u32(1)),
++        # MobileGestalt WifiAddress/BluetoothAddress read these; without them each call waits 5 s for an
++        # IONetworkController (docs/research/26 row 2, per ios-flame notes: installd took 5 s per bundle).
++        ('mac-address-wifi0', fake_mac(0)),
++        ('mac-address-bluetooth0', fake_mac(1)),
++        ('mac-address-ethernet0', fake_mac(2)),
+     ], [node('memory-map', [ph()]),
+         # Local boot policy (kern_csr.c): SIP relaxed like `csrutil disable`
+         # (lp-sip0: untrusted kexts, unrestricted FS, task_for_pid, kernel
+@@ -124,17 +143,25 @@
      # and uses cpus=N to select an initial prefix (N <= 8).
      # QEMU retains its original single-CPU tree: its MPIDRs differ from sweet.
      cpu_nodes = []
@@ -68,7 +87,7 @@
              ('l2-cache-id', u32(core)),  # distinct per-core L2 nodes in live FDT
              ('l3-cache-id', u32(0)),     # shared L3
              ('state', cstr('running' if core == 0 else 'stopped')),
-@@ -152,8 +167,8 @@
+@@ -152,8 +179,8 @@
          ph(),
          ('compatible', cstr('arm,gic-v3')),
          ('interrupt-controller', b''),
@@ -79,7 +98,15 @@
      ])
      arm_io = node('arm-io', [
          ph(),
-@@ -181,17 +196,17 @@
+@@ -177,21 +204,24 @@
+             ('compatible', cstr('sweet,display')),
+             ('canvas-width', u32(1125)),
+             ('canvas-height', u32(2436)),
+-        ])])
++        ])] + ([
++        # Makes launchd start wifid (com.apple.wifid is limited to the 'wlan' device tree node, per ios-flame notes,
++        # docs/research/26 row 1). Off by default: no IO80211 stand-in exists yet, so wifid would only fail and burn CPU.
++        node('wlan', [ph(), ('device_type', cstr('wlan')), ('compatible', cstr('sweet,wlan'))])] if wlan_node else []))
  
      fbcon = node('sweet-fbcon', [
          ph(),
@@ -103,7 +130,7 @@
      ])
  
      # pmap_compute_max_asids requires the node even when no overrides are set.
-@@ -210,8 +225,91 @@
+@@ -210,8 +240,91 @@
      ])
  
      product_props = d22ap_product()
@@ -195,7 +222,7 @@
      # Identity of the iPhone X whose userland runs here: compatible[0] is
      # hw.model/hw.target (D22AP), model is hw.machine/hw.product
      # (iPhone10,3). 'xiaomi,sweet' stays for SweetPlatformExpert matching.
-@@ -219,18 +317,30 @@
+@@ -219,18 +332,30 @@
          ph(),
          ('compatible', cstr('D22AP') + cstr('iPhone10,3') + cstr('xiaomi,sweet') + cstr('qcom,sm7150') + cstr('AppleARM')),
          ('model', cstr('iPhone10,3')),

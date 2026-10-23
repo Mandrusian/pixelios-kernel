@@ -160,7 +160,15 @@ What the first run answers: (a) are the domains on after ABL (probably not), (b)
 the top domain is on (only if (a) is "on"). **[guess] Expected on a stock ABL boot: gate closed, `pd_g3d-off`.** That is still a result: it confirms the PMU read path and the
 "off" state. Reading the GPU ID needs stage 1 (power).
 
----
+### 2.4 Stage 1 (built): `shim --gpu-power`
+
+`cd shim && ./build.sh --board bluejay --avb --pstore-fast --gpu-probe --gpu-power`; usage, output lines and the exact write allowlist: `docs/AUTOMATION.md` ("shim --gpu-power"). Source `shim/gpupower.c/.h`, host test `shim/gpupower_host_test.c`.
+Scope is only the GPU's own power registers (G0 showed ABL already powers the PMU domains and clocks, doc 27): *read from source* (kbase JM `pm_driver.c`, local copy; table and omitted steps in the doc 27 addendum) the shim writes `TILER_PWRON` (which also powers the L2),
+waits for `TILER_READY`/`L2_READY`, writes `SHADER_PWRON`, waits for `SHADER_READY`, reports, then always powers off (per block: drain PWRTRANS, write only if READY != 0: `SHADER_PWROFF`, then `L2_PWROFF`) back to the state ABL left. *Observed* in G0: `SHADER_READY` = `L2_READY` = 0
+(`TILER_READY` and the three `*_PWRTRANS` were NOT read in G0; the precheck reads them live and refuses unless they are 0). It refuses with zero writes unless `GPU_ID`/`*_PRESENT` equal the G0 values, all `*_READY`/`*_PWRTRANS` are 0 and `GPU_STATUS`/`FAULTSTATUS` = 0 and `GPU_IRQ_RAWSTAT` = 0x100 (the G0 state;
+bit 8 = RESET_COMPLETED, *read from source*, kbase macros.h:276). No SMC/PMU/CMU/ACPM write, no reset (`GPU_COMMAND`), no `STACK_*` write: `MALI_CORESTACK` is `default n` in kbase's Mconfig, but the Pixel build's setting is *unknown (guess)*, so `STACK_READY`/`STACK_PWRTRANS` are dumped read-only first.
+The shim writes the LO word of each 64-bit register only; kbase uses `kbase_reg_write64` (both words, pm_driver.c:661); equivalent because the HI words of PRESENT are required to be 0.
+Waits are bounded by 100000 reads and by 1 s of CNTPCT each (kbase's own bound is `PM_TIMEOUT_MS` = 5000, pm_driver.c:3244; the 1 s is our choice, *guess* that it is enough; the summary prints the measured ticks). Not yet run on hardware; writes need the user's go-ahead (section 4 stage 1).
 
 ## 3. What sailfish did, and what transfers
 

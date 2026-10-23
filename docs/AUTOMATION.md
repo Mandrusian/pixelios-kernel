@@ -125,7 +125,7 @@ reset half of TP-006 is not built (open for the user's decision). Verified with 
 ## tools/check-all.sh: the quality gate
 
 `tools/check-all.sh` (full) is what must print `GATE PASS <hash>` before a push. Output is one line; `shim/out/gate.log` has the
-full log plus a per-step timing table. Two lanes run in parallel (cap of 2 jobs): lane A = the six bluejay shim builds (they share
+full log plus a per-step timing table. Two lanes run in parallel (cap of 2 jobs): lane A = the seven bluejay shim builds (they share
 `shim/out`, so they stay serial) + host-tests + boot-safety, lane B = unit, rootless, validate. The log is merged A then B, so it is
 deterministic. Measured on the dev machine (*observed*, 2026-10-22, 01a978f): 50 s serial -> 37 s with lanes; the builds
 (6 x ~6 s) dominate.
@@ -140,8 +140,188 @@ full PASS on a clean tree) and runs only the needed steps, selected by `tools/ga
 | `tools/`, `soc/`, `device/` | unit, phone-state, probe-run, rootless |
 | anything (docs, other `xnu/` patches) | validate (patch numbering/header format, script syntax), always |
 
-No stamp, or a stamp that is not an ancestor of HEAD: the full gate runs. A quick PASS line says `quick: ran N of 15 steps`;
+No stamp, or a stamp that is not an ancestor of HEAD: the full gate runs. A quick PASS line says `quick: ran N of 17 steps`;
 it is not a substitute for the full gate before a push.
+
+## shim --gpu-power: Mali-G78 power on/off cycle (G2 stage 1, opt-in)
+
+```
+cd shim && ./build.sh --board bluejay --avb --pstore-fast --gpu-probe --gpu-power     # --gpu-power implies --gpu-probe
+tools/probe-run --build-args "--pstore-fast --gpu-probe --gpu-power" --expect "GPU POWER up=" --label g2   # only with the user's go-ahead (writes hardware)
+```
+Source `shim/gpupower.c/.h`, host test `shim/gpupower_host_test.c` (run by `build.sh`), constants from `soc.json` key `gpu` (`mali`, `id_expect`, `shader_present`,
+`tiler_present`, `l2_present`, pinned by `tools/boards.py _GPU_PINS`). `gpupower.o` is compiled and audited on every build (source audit with 26 mutation self-tests, object audit with 3, in
+`tools/test-bluejay-boot.py`) and linked only with the flag; the default image is unchanged. The call runs after the read-only probe output (section `GPU`). *Read from source*: sequence = Google kbase JM
+(`docs/research/27-gpu-g0-result.md` addendum has the file:line table and the steps deliberately omitted). *Not yet run on hardware.*
+- **Refusal (zero writes)** unless the gate is open, the timer works, `GPU_ID` and `SHADER/TILER/L2_PRESENT` equal the soc.json values, their HI words and all `*_READY` / `*_PWRTRANS` (LO and HI) are 0,
+  `GPU_STATUS` = 0, `GPU_FAULTSTATUS` = 0 and `GPU_IRQ_RAWSTAT` = 0x100 exactly:
+  `GPU POWER refused: <pd_g3d-off|pd_embedded_g3d-off|cmu-mux-off|pmu-unreadable|cmu-unreadable|no-timer|id-unreadable|id-mismatch|present-unreadable|present-mismatch|present-hi-nonzero|core-state-unreadable|cores-not-off|gpu-state-unreadable|gpu-status-nonzero|gpu-fault|rawstat-unexpected>`.
+- Read-only pre-state lines `GPU PRE_<STACK_READY|STACK_PWRTRANS|L2_CONFIG|COHERENCY_ENABLE|GPU_IRQ_MASK> pa=... v=...`.
+- ON: `TILER_PWRON` (also powers the L2), wait tiler+L2 ready, `SHADER_PWRON`, wait shaders ready. Then `GPU <NAME> pa=... v=...` for `SHADER/TILER/L2_READY`, the three
+  `*_PWRTRANS`, `GPU_IRQ_RAWSTAT`, `GPU_FAULTSTATUS`, `GPU_STATUS`. OFF, always (also after an ON failure), per block as kbase: wait PWRTRANS 0, **write only if READY != 0**, refuse a partial READY, wait;
+  shaders (`SHADER_PWROFF`) then L2 (`L2_PWROFF`, takes the tiler too); the same dump with the prefix `OFF_`. Each wait is bounded by 100000 reads and 1 s of CNTPCT; no write is retried.
+  If the shaders do not power off, `L2_PWROFF` is not written.
+- Summary: `GPU POWER up=<what> down=<what> ticks=<ON phase>/<OFF phase> freq=<Hz>` (hex, CNTPCT ticks). `up`: `ok|timeout:tiler|timeout:l2|timeout:shader|fault:tiler|fault:shader|refused:tiler|refused:shader`;
+  `down`: `ok|timeout:shader|timeout:l2|timeout:tiler|partial:shader|partial:l2|fault:shader|fault:l2|refused:shader|refused:l2` (`fault:` = the write faulted on the bus, `refused:` = our allowlist refused it,
+  `partial:` = READY is not the full present mask, nothing written). Success means `up=ok down=ok` and every `OFF_*_READY` = 00000000.
+- Writes (the whole allowlist, LO words only): `0x1C500180` SHADER_PWRON, `0x1C500190` TILER_PWRON, `0x1C5001C0` SHADER_PWROFF, `0x1C5001E0` L2_PWROFF, each only with its present mask.
+  Never: `L2_PWRON`, `TILER_PWROFF`, `STACK_*`, `GPU_COMMAND`, reset, MMU/job registers, IRQ masks, PMU/CMU/SMC/ACPM.
+
+### `--gpu-power=stack`: corestack variant (opt-in experiment, after the first run)
+
+`./build.sh ... --gpu-probe --gpu-power=stack` (implies `--gpu-power`; plain `--gpu-power` is unchanged). Reason: in the first hardware run `SHADER_PWRON` left `SHADER_PWRTRANS` stuck
+(docs/research/27 last section); kbase's `corestack_driver_control=true` path powers the core stacks first. *Read from source*: pm_driver.c:2593-2597 (`stacks_avail` = present),
+2646-2649 (`STACK_PWRON`), 2656-2657 (wait `!stacks_trans && stacks_ready == avail`), 2658-2660 (then `SHADER_PWRON`); off 2846-2847, 2855-2859 (`STACK_PWROFF` after the shaders are off), 2866 (wait); registers
+enums.h:727-731, selection pm_driver.c:408-424. Whether the Pixel build enables it is unknown (*guess*); this variant is the test.
+- Object `shim/out/gpupower_stack.o` (`-DGPU_POWER_STACK`) is built and audited on every build; only this flag links it. Both objects have their own exact allowlist audit; the plain one must not contain the stack registers.
+- Extra precheck (refusals, zero writes): `stack-present-mismatch` (`STACK_PRESENT` LO != soc.json `stack_present` 0x7F or HI != 0), `stack-not-off` (`STACK_READY` != 0), `stack-unreadable`.
+- Order: `TILER_PWRON` -> wait tiler+L2 -> **`STACK_PWRON` (0x1C500E20) = 0x7F** -> wait `STACK_READY` (0xE10) == 0x7F and `STACK_PWRTRANS` (0xE40) == 0 -> `SHADER_PWRON` -> wait. OFF: `SHADER_PWROFF` -> **`STACK_PWROFF` (0x1C500E30) = 0x7F** (only if `STACK_READY` != 0) -> drain tiler PWRTRANS -> `L2_PWROFF`. A failure at any OFF step stops the later ones (no stack-off under ready shaders, no L2-off under a ready stack).
+- New result words: `up=timeout:stack|fault:stack|refused:stack`, `down=timeout:stack|partial:stack|fault:stack|refused:stack`. The dump (`dump_all`, both variants) now includes `STACK_READY` / `STACK_PWRTRANS` (also `OFF_`).
+- Allowlist of this variant: the four of plain `--gpu-power` plus exactly `0x1C500E20` and `0x1C500E30`, each only with 0x7F (6 pairs).
+
+## shim --gpu-clk: ask the ACPM for the GPU clocks (G3DL2 / G3D), opt-in, before the power cycle (BUILT, UNRUN; hypothesis refuted by the PLL_CON3 decode, docs/research/27)
+
+```
+cd shim && ./build.sh --board bluejay --avb --pstore-fast --gpu-probe --gpu-clk [--gpu-power]     # implies --gpu-probe; works without --gpu-power
+tools/probe-run --build-args "--pstore-fast --gpu-probe --gpu-clk --gpu-power" --expect "GPU CLK result" --label g2clk    # only with the user's go-ahead (writes hardware)
+```
+Status: **built, unrun, premise refuted.** It was written because run `g0b` seemed to show both GPU PLLs off; the correct decode of `PLL_CON3` = 0xA0620402 (ENABLE + LOCK set, 150.5 MHz = the 151000 kHz init level, docs/research/27) says they are already running, so a clock request is not expected to change anything. Kept as an opt-in experiment; open review findings (rate 302000/151000 as Linux, a meaningful result check, PMU gate, no power cycle after a failed request) are listed in doc 27. Original idea: the ACPM starts the PLLs when the kernel calls `exynos_acpm_set_rate(G3DL2/G3D)` (*guess*). Source `shim/gpuclk.c/.h`, host test `shim/gpuclk_host_test.c` (reuses the fake APM of `dvfs_host_test.c`; two more
+builds force one ACPM gate to 0), constants from soc.json (`acpm.dvfs.domains` G3D idx 5 / G3DL2 idx 6 with the fvmap rows of run g0b and `ceiling_khz` = 151000 = the firmware's own init level; `gpu.clk_khz` = 151000),
+checked by `tools/boards.py` (`tools/test_boards_gpuclk.py`). The CPU `--dvfs` requests and the touch probe still see only the three CPU clusters (`ACPM_DVFS_N` = 3; the acpm.c tables hold 5).
+- **No new writer.** `gpuclk.c` has no MMIO access of its own (audited: no `try_write32`/`try_read32` reference, stack-only stores, 14 source mutations + 3 object mutations). Its only requests go through `acpm_dvfs_reassert()` in
+  `acpm.c` (compiled only in `--gpu-clk` images), a thin wrapper of the existing DVFS path (`dvfs_set`, the same `xfer()` and writer allowlist as the CPU client): it refuses every domain but 5/6 and every rate but a table row at or
+  below the ceiling, i.e. only 151000 kHz, before anything is sent. One difference from `acpm_dvfs_set`: it also sends the request when GET already reports that rate (Linux re-sends the init rate at every probe; the whole point).
+- **Gates.** All existing ones apply and are checked first, with the reason printed and zero writes: DVFS channel configured, `acpm.layout_verified`, `acpm.elem_unit_verified` (both **1** in soc.json since 2026-10-22: descriptor fields and 16-byte slots
+  observed on the PMIC channel, run `acpm3`; the DVFS channel 1 GET was observed on 3/3 CPU clusters in run `dvfsr2`), a validating descriptor, empty queues, a working timer.
+  The unverified fact that remains: a FREQ_REQ for the GPU domains (idx 5/6) has never run, nor any GET for them (a CPU FREQ_REQ through this client did run: `dvfs1..4`, effect observed, reply words not logged) and nothing is known about the reply for the GPU domains
+  (Linux sets `response=true` for them, acpm_dvfs.c:97-135; our client waits for the reply for every request anyway).
+- **Order** (kbase `gpu_dvfs_set_initial_level`, pixel_gpu_dvfs.c:859-896; domains from gs101-gpu.dtsi:46-47): GET G3DL2, GET G3D, then FREQ_REQ G3DL2 = 151000, FREQ_REQ G3D = 151000 (a failure of the first stops the second, no retry), ~10 ms, GET both back,
+  `GPU CLK after: ...` and the CMU_G3D dump again (the `--gpu-probe` dump is the "before").
+- **Output** (`GPU CLK ...`): `cfg dvfs_ch=.. layout_verified=.. elem_unit_verified=..`, `target kHz=151000 g3dl2_idx=6 g3d_idx=5`, `desc/queues` lines, per transaction `<get|pre-read|request> <G3DL2|G3D> req=.. / rep=.. / seq= err= ret= val= writes= pub=`,
+  `G3DL2 kHz=<n>`, `readback g3dl2=<n> g3d=<n> asked=151000`, `result: ok|MISMATCH|REFUSED-or-FAILED`, refusals as `refused: <reason>` (+ `flag: soc.json acpm.<flag> = 0` for a gate). A request that was published and failed prints `STATE` and `the request stays queued`.
+- **What can be written** (exactly): a run is 8 ACPM transactions on channel 1 (2 GETs, per domain a pre-read GET and a FREQ_REQ, 2 read-back GETs = 6 GETs + 2 REQs); each one makes the same 8 writes of acpm.c's audited writer (4 request-slot words, the request-front pointer, the doorbell bit, and after the reply the response rear pointer and INTCR0); whatever the firmware then does to its PLLs/PMIC is outside our code. Nothing else.
+
+## shim --gpu-rails: READ-ONLY S2MPG11 registers of the GPU rails (opt-in, implies --gpu-probe)
+
+```
+cd shim && ./build.sh --board bluejay --avb --pstore-fast --gpu-probe --gpu-rails
+tools/probe-run --build-args "--pstore-fast --gpu-probe --gpu-rails" --expect "GPU RAIL result" --label g0rails
+```
+Why (*guess*, doc 27): the tiler/L2 (rail BUCK8S = S8S_VDD_G3D_L2) came up but the shaders (rail BUCK2S = S2S_VDD_G3D) never leave PWRTRANS; the DT initial mode of all three GPU rails is SEC_OPMODE_SUSPEND ("ON in standby"). This reads what the PMIC says.
+Source `shim/gpurails.c/.h`, host test `shim/gpurails_host_test.c` (fake APM of `acpm_host_test.c`, plus gate-0 and null-config builds), config `soc.json` `acpm.s2mpg11` (pins in `tools/boards.py _ACPM_S11_PINS/_ACPM_S11_REGS`, tests `tools/test_boards_gpuclk.py`).
+- **Derived the same way as S2MPG10's speedy_ch/pmic_addr** (doc 23 section 1): channel = 1 (every `s2mpg11_*_reg` passes `u8 channel = 1`, s2mpg11-core.c:55,73,91,109,127; DT `acpm-speedy-channel = <1>`, gs101-pmic.dtsi:710-718), TYPE = pmic_addr = 1 (`I2C_ADDR_PMIC`, s2mpg11-core.c:29), IPC channel unchanged (2). Request word 0 = `reg | 1 << 8 | 1 << 12 | seq << 16`, word 1 = 0 (FUNC_READ).
+  The registers (s2mpg11-register.h:26-100, regulator descriptors s2mpg11-regulator.c:226-275) are listed with their cites in the soc.json `s2mpg11` note. Any null value in the block => `GPU RAIL refused: ... null/unknown value, no ACPM request sent` and zero ACPM traffic.
+- **Reuse, no fork**: `acpm_s11_read()` in acpm.c is a 15-line twin of the S2MPG10 `read1` and calls the same `xfer()`/writer allowlist; `gpurails.c` has no MMIO access of its own (audited: no `try_write32`/`try_read32`, stack-only stores; 13 source + 3 object mutations).
+- **Gates / refusals (zero ACPM traffic)**: `acpm.layout_verified`, `acpm.elem_unit_verified` (both 1), a working timer, a validating PMIC-channel descriptor, empty queues, a fully known s2mpg11 block.
+- **Output**: `GPU RAIL cfg speedy ch=1 pmic_addr=1`, then per register `GPU RAIL <STATUS1|B2S_CTRL|B2S_OUT1|B2S_OUT2|B8S_CTRL|B8S_OUT1|B8S_OUT2|L1S_CTRL1|L1S_CTRL2|LDO_CTRL1> reg=0x.. v=0x..`, then `GPU RAIL decode <rail> mode=<0-3>(name) enabled=<0|1> uV=<n>` for BUCK2S/BUCK8S/LDO1S and `decode note:` (mode field and uV formulas *read from source*; mode 1 = SUSPEND is the DT default of the CPU rails too, so it is not evidence of standby; that OUT1 is the live output is a *guess*).
+- **Exactly the ACPM traffic**: one descriptor read (reads only), then at most **ten** FUNC_READ transactions on IPC channel 2 (S2MPG11 registers 0x0C, 0x15, 0x16, 0x17, 0x25, 0x26, 0x27, 0x41, 0x42, 0x52, in that order), each making the audited IPC writes of acpm.c (4 request-slot words, the request-front pointer, the AP->APM doorbell bit, the reply-rear pointer, INTCR0). The first failure stops the rest, no retry, nothing rolled back. No PMIC register is written (no FUNC_WRITE/UPDATE is expressible in this path).
+
+## shim --gpu-rail-on: switch the shader rail on for the power cycle, and back (opt-in WRITER, implies --gpu-rails)
+
+```
+cd shim && ./build.sh --board bluejay --avb --pstore-fast --gpu-probe --gpu-rails --gpu-rail-on --gpu-power
+tools/probe-run --build-args "--pstore-fast --gpu-probe --gpu-rails --gpu-rail-on --gpu-power" --expect "GPU RAILON" --label g2rail    # only with the user's go-ahead and after the Opus review
+```
+Why: run `g1rails2` (doc 27, *observed*) found S2MPG11 BUCK2S (S2S_VDD_G3D, the shader rail) OFF (CTRL 0x15 = 0x38, mode 0, OUT1 0x40 = 600000 uV) while BUCK8S (L2) and LDO1S were on: the shaders cannot power without their rail.
+Source `shim/gpurailon.c/.h` (orchestration, no MMIO), the writer `acpm_s11_rail_set()` in `acpm.c` (a twin of `acpm_pmic_update`, same `xfer()` and IPC writer allowlist), host test `shim/gpurailon_host_test.c` (fake APM, gate-0 and null builds), config `soc.json acpm.s2mpg11.rail_on`
+(pins `tools/boards.py _ACPM_S11_ON_PINS`, cites in the soc.json note, table of the write in doc 27).
+- **Sequence** (shim.c, after `gpu_rails`, before the power cycle): (1) pre-read BUCK2S_CTRL and read OUT1; refuse with ZERO writes unless the mode field (bits 7:6) is exactly 0 and OUT1 decodes inside 550000..700000 uV (codes 56..80); (2) ONE FUNC_UPDATE of 0x15, mask 0xC0, value **0x40** (mode 1 = SUSPEND, what Linux writes for this rail, *read from source*: gs101-pmic.dtsi:766-779 initial mode + always-on, s2mpg11-regulator.c:35-91,718),
+  never the voltage registers; (3) wait 8 x 130 us (the driver's `ENABLE_TIME_BUCK`), read CTRL, OUT1 and OUT2 back once, accept only if mode == 1 and OUT1 unchanged (`GPU RAIL on after ...`, `on result: rail is on, voltage unchanged`); (4) the power cycle runs only then (also `--gpu-clk` now skips it after a failed request);
+  (5) ALWAYS afterwards: pre-read, ONE FUNC_UPDATE of 0x15, mask 0xC0, value 0x00 (only if the mode is not already 0), read back, `GPU RAILON enable=<ok|unverified|refused> readback=<ok|mismatch|n/a> restore=<ok|FAILED|none> power=<ran|skipped|not-requested>`; before the restore the shader state is logged (`GPU RESTORE_SHADER_READY` ...). A failed restore prints `GPU RAIL !!! RESTORE FAILED: ... may be LEFT ON` and `restore=FAILED`.
+  After a refusal (nothing written) there is nothing to restore; after an enable that was published but not verified (error reply, mismatch) the power cycle is skipped and the restore still runs.
+- **Gates (zero ACPM traffic, `GPU RAIL on refused: ...`)**: `acpm.layout_verified`, `acpm.elem_unit_verified` (both 1), a working timer, a validating PMIC-channel descriptor, empty queues, and a fully known `acpm.s2mpg11` + `rail_on` block (a null value refuses, `S11_ON_KNOWN` 0).
+- **Exact writes of the option** (besides the IPC words every ACPM request makes, 8 per transaction): two PMIC register updates, listed with cites in doc 27. Transactions: enable = pre-read 0x15, read 0x16, update, read-back 0x15, 0x16 (5); restore = pre-read 0x15, update, read-back 0x15, 0x16 (4); one request per write, never retried.
+- **Run order** (Opus review): (1) FIRST `--gpu-probe --gpu-rails --gpu-rail-on` ALONE (no `--gpu-power`): enable, read back, restore; expect `GPU RAILON enable=ok readback=ok restore=ok power=not-requested` and `on after ... mode=1`. (2) Only then add `--gpu-power`. Never combine with `--gpu-clk`.
+  A rail left ON (hang mid-cycle, `restore=FAILED`) cannot be cleared by the shim: the next run's enable refuses (mode != 0) and does no restore; a SoC reset (PSCI) is not a PMIC reset, so S2MPG11 probably keeps the value (*guess*); since the value is mode 1 = 0x40 this equals the stock Android state (idle, gated cores: leakage only, *guess*).
+- **Guess**: the soft-start margin (8x the driver's 130 us) is ours. B2S_CTRL bits 5:0 (0x38, vs 0x18 on BUCK8S) have no name in the header; the update preserves them, OUT2 is printed before/after.
+
+## shim --gpu-s2mpu and --gpu-job: G2 stage 2 (address space 0 + the first job), design in docs/research/28-gpu-stage2-job.md
+
+```
+cd shim && ./build.sh --board bluejay --avb --pstore-fast --gpu-probe --gpu-s2mpu          # READ-ONLY: the four G3D S2MPU blocks. Safe to run first, alone.
+cd shim && ./build.sh --board bluejay --avb --pstore-fast --gpu-probe --gpu-job            # implies --gpu-rails --gpu-rail-on --gpu-power --gpu-s2mpu; a WRITER (needs the Opus review and the user's go-ahead)
+tools/probe-run --build-args "--pstore-fast --gpu-probe --gpu-s2mpu" --expect "GPU S2MPU3 vid1" --label g2s2mpu
+tools/probe-run --build-args "--pstore-fast --gpu-probe --gpu-job" --expect "GPU JOB SUMMARY" --label g2job
+```
+- **`--gpu-s2mpu`** (`shim/gpus2mpu.c`, host test `gpus2mpu_host_test.c`, object audited like `gpuprobe.o`): prints `GPU S2MPU probe_pa=.. gb_index=..`, per instance `CTRL0/CTRL1/CFG/MPC_CTRL/PAGE_AWARE0/1/FAULT_STATUS`, per VID `FAULT_INFO/FAULT_PA_LOW`, `vidN rdwr=<mask> l2=<mask> nonzero= bad=` (64 granules of 1 GiB: which are open RD+WR, which use an L2 table) and the L1 entry of the granule of `probe_pa`.
+  Only if `PMU_G3D_STAT` says `pd_g3d` is on; never writes. Config: soc.json `gpu.s2mpu_g3d0..3` (pinned in `tools/boards.py`).
+- **`--gpu-job`** (`shim/gpujob.c`, hook in `gpupower.c`, host test `gpujob_host_test.c` with a fake Mali: AS0, page-table walker, WRITE_VALUE executor, fault / hang / S2MPU-block injections): inside the powered window it builds the page tables and one Valhall WRITE_VALUE job in 5 pages of the shim image (`gpujob_pages` in shim.c), programs AS0, submits on JS0, waits 100 ms
+  (one `HARD_STOP_1` after a timeout), prints everything and always disables AS0 and clears the IRQ bits it caused; then the usual OFF sequence and rail restore. Output: `GPU JOB cfg`, the S2MPU dump, `GPU JOB <REG> pa= v=` lines, `GPU JOB target=<64-bit> header_exc=`, and
+  `GPU JOB SUMMARY submit=<ok|no> wait=<done|failed|mmu-fault|timeout|n/a> hardstop=<yes|no> target=<MAGIC|unchanged|other> as0_off=<ok|FAILED>`; refusals `GPU JOB refused: <scratch-bad|no-timer|js0-absent|js0-no-set-value|shaders-not-ready|job-irq-pending|mmu-irq-pending|as0-active|js0-busy|gpu-fault>` with zero writes (`GPU JOB JS_PRESENT` and `JS0..2_FEATURES` are printed first, refused or not; slot 0 needs `JS_PRESENT` bit 0 and `JS0_FEATURES` bit 2 = SET_VALUE_JOB; panfrost uses slot 1 for non-fragment jobs, doc 28 section 4). Cleanup runs in kbase's kill order: hard stop (only if still ACTIVE), AS0 off, IRQ clear.
+- **Exact writes**: the scratch window plus the register/value pairs of doc 28 section 7 (AS0 TRANSCFG/TRANSTAB/MEMATTR/COMMAND, JS0 HEAD/AFFINITY/CONFIG/COMMAND_NEXT, JS0 COMMAND = 7 once, JOB/MMU_IRQ_CLEAR = 0x00010001); no GPU_COMMAND, no soft reset, no S2MPU/PMU write. 21 w32 sites are pinned by the source audit (21 mutations); the object audit is the same as `gpupower.o`'s.
+- Image size: `--gpu-job` adds 24 KiB of `.bss` (`gpujob_pages`). `build.sh` fails if the default image contains `gpu_job_run`.
+
+## shim --wlan-probe: read-only Wi-Fi path probe (W1; review items D1-D5 fixed, docs/research/20 section 3)
+
+```
+cd shim && ./build.sh --board bluejay --avb --pstore-fast --usb-gadget --wlan-probe
+tools/probe-run --build-args "--pstore-fast --wlan-probe" --expect "WLAN SUMMARY" --label w1       # read-only, safe to run; never run on hardware yet
+```
+Source `shim/wlanprobe.c/.h`, host test `shim/wlanprobe_host_test.c` (builds the real file against a fake register window + a faulting address), addresses `soc.json` key `wlan` (generated `WLAN_*` macros). Strictly read-only (object audit: stack-only stores, no `try_write32`).
+- **Level 1** (`WLAN pmu+pins` section): `PMU_PCIE1_ISO` / `PMU_PCIE0_ISO` (PMU 0x17463EC4 / EC0, bit 0 = PHY not isolated), `PD_HSI0_CFG/STAT` (0x17462080/84, the HSI0 domain) and `PD_HSI2_A`, `+4` (0x17462180/84, the disabled `pd_hsi2` node, never a gate), the pin banks `GPP14/GPH2/GPA7 CON/DAT` and `WLAN_EN gpp14-2`, `PERST gph2-0`, `CLKREQ gph2-1`, `DEVWAKE gph2-5`, `HOSTWAKE gpa7-0` as `func=X lvl=Y`.
+- **Level 2 is gated.** `WLAN CMU_HSI2_PCIE_MUX pa=14400620 v=..` is read only if `PMU_PCIE1_ISO` bit 0 is set; the verdict line is `WLAN l2 gate=open` or `WLAN l2 gated: <pcie1-phy-isolated|pmu-iso-unreadable|cmu-hsi2-pcie-mux-off|cmu-hsi2-unreadable>`, and then **nothing** of the PCIe wrapper is read.
+  When open, the groups run in this order with a pstore checkpoint after each: `SYSREG+000..01C`, `ELBI+000..040, 054, 080, 2C8, 2E8, 3A4`, `DBI+000/004/008/00C`, then (last, the riskiest) the PMA lock words `PMA+3F0, E0C, DE8, 5FC, E18` and `WLAN PHY pll_lock= cdr_lock= oc_done= oc_after_rst=`.
+- **Always**: `WLAN SUMMARY gate=<open|reason> en=<0|1|?> perst=<..> dbi_id=<8 hex|unreadable> link=<2 hex|?>` (`link` = `ELBI+2C8 & 0x3F`, `11` = L0). All register lines are `WLAN <name> pa=<8 hex> v=<8 hex>` or `... unreadable`.
+- On a normal ABL boot the PCIe1 PHY is expected to be isolated (nobody has brought the link up), so the expected first result is `l2 gated: pcie1-phy-isolated` (*guess*); that is itself the baseline for the PCIe bring-up stage.
+
+## shim --wlan-rails / --wlan-en: rail state (read-only) and the first WLAN_EN write (W2; docs/research/29)
+
+```
+cd shim && ./build.sh --board bluejay --avb --pstore-fast --usb-gadget --wlan-probe --wlan-rails          # READ-ONLY
+cd shim && ./build.sh --board bluejay --avb --pstore-fast --usb-gadget --wlan-probe --wlan-rails --wlan-en  # + the WRITER, only after the rails run and the review
+tools/probe-run --build-args "--pstore-fast --wlan-rails" --expect "WLAN RAILS" --label w2r             # never run on hardware yet
+```
+`--wlan-rails` (`shim/wlanrails.c`, host test `wlanrails_host_test.c`) runs after the level-1 section and before the level-2 gate. Lines (`WLAN ...`):
+- `CMU gate ufs_ver=XXXXXXXX open=<0|1>`: the CMU_HSI2 words are read only if the UFS HCI VER (UFS_BASE+0x08, observed 0x300) is readable and nonzero. Then `CMU PCIE_MUX|OSC|QCH_GPIO|QCH_PCIE_A|QCH_PCIE_B|QCH_UFS|QCH_SYSREG pa= v=`
+  (offsets +0x620, +0x800, +0x7018, +0x7060, +0x7064, +0x7068, +0x707C of 0x14400000) and `CMU decode ...` lines tagged `(guess)` (bit 4 of the mux = selected, bit 28 of OSC = automatic gating, QCH equality with the UFS word; the QCH bit layout is UNKNOWN).
+- `PMU TXCO pa=17463C10 v=` and `PMU decode txco bits 2,3,10 all set=<b>` (read from source: rc.c:80,2698).
+- `RAIL L16M|L17M|L18M|L19M(PCIe0|PCIe1 PHY) reg=0x53..0x56 v=0x..` and `RAIL decode ... mode=<0 off|1 standby|2 PWREN_MIF|3 on-normal> enabled= sel= uV= dt_window=` (S2MPG10 over ACPM, `acpm_s10_read`; refuses with zero ACPM traffic like `--gpu-rails`).
+- `RAILS l17=<mode>/<uV> l19=<mode>/<uV> cmu_mux=<b|?> txco=<b|?>`: the one summary line.
+
+`--wlan-en` (`shim/wlanen.c`, host test `wlanen_host_test.c`, audits in `tools/test-bluejay-boot.py`): drives WLAN_EN gpp14-2 high for 200 ms and puts it back. Write set (all `w32`, read-modify-write of the masked bits only):
+
+| # | Register | Mask | Value | Cite |
+|---|---|---|---|---|
+| 1 | GPP14.DAT `0x108401C4` | `0x4` (bit 2) | set | Linux `samsung_gpio_direction_output` = DAT first (`pinctrl-samsung.c:693-696`, `samsung_gpio_set_value` `:555-570`) |
+| 2 | GPP14.CON `0x108401C0` | `0xF00` (field of pin 2) | 1 = OUTPUT (observed before: 0 = INPUT, CON `0x33`) | `samsung_gpio_set_direction` `:624-653`; `PIN_CON_FUNC_OUTPUT 1` `pinctrl-samsung.h:61-62` |
+| 3 | GPP14.DAT | `0x4` | back to the saved bit (0) | drive low while still an output: `dhd_wlan_power(0)`, `dhd_custom_google.c:616` |
+| 4 | GPP14.CON | `0xF00` | back to the saved field (0 = input) | `samsung_gpio_direction_input` `:656-676` |
+
+Preconditions (otherwise ZERO writes, `enable=refused`): counter running; GPP14.CON/DAT and GPH2.CON/DAT readable; WLAN_EN CON field exactly 0 and DAT bit 2 = 0; PERST (gph2-0) DAT bit 0 = 0 and its CON field <= 1.
+Lines: `WLAN EN before GPP14|GPH2 ...`, `EN after enable CON= DAT=`, (after 200 ms on the counter) `EN sample GPP14|GPH2 ...`, `EN restore CON= DAT=`, and the summary
+`WLAN EN enable=<ok|refused|fault> sample=<en perst clkreq devwake hostwake: 0/1/?> restore=<ok|FAILED|n/a>`. Any write that faults, or a read-back that differs, is `fault` and skips the wait; the restore runs in every case that attempted a write.
+A failed restore prints `!!! RESTORE FAILED ...` and `restore=FAILED`; (guess) the pin state is volatile and does not survive a reset. Restore order (DAT low, then input) deliberately differs from "reverse of the enable" so the module is driven off before the pin is released.
+The writer touches no PERST, no PHY isolation, no SMC, no PMIC rail. Expected quiet result: sample `10100` (*guess*: nothing in the chain reacts without the PHY/PERST); that is not a failure (research 29 U3/U8).
+Also printed read-only before and after: `EN before|after pads GPP14 PUD= DRV=` / `CONPDN= PUDPDN=` (GPP14 +0x08/+0x0C/+0x10/+0x14, `pinctrl-exynos-arm64.c:47-50`): what the pin floats to after the restore and the drive of the high level.
+**Polarity: do not "fix" it.** The DT flag `0x1` of `wl_reg_on` / `pcie,wlan-gpio` is GPIO_ACTIVE_LOW, but rc.c (`:1989-1995`) and dhd (`dhd_custom_google.c:529-566,601`) use the legacy raw GPIO calls (`gpio_direction_output(.., 1)` = ON); *guess* (Linux gpiolib legacy API, not fetched): they ignore the flag, so raw HIGH = module on.
+
+## shim --wlan-smc-read: two EL3 SMC READs of the PHY-isolation word (W2a; docs/research/29 section 12)
+
+```
+cd shim && ./build.sh --board bluejay --avb --pstore-fast --usb-gadget --wlan-probe --wlan-smc-read
+tools/probe-run --build-args "--pstore-fast --wlan-smc-read" --expect "WLAN SMC summary" --label w2a      # never run on hardware yet
+```
+`shim/wlansmc.c` (host test `wlansmc_host_test.c` with a fake EL3). The only SMC of the object `wlansmc.o` (the rest of the image keeps shim.c's PSCI calls and `prepare_bluejay_cpu`'s option-1 WRITE of CPU_INFORM; review 2 F5): `smc #0`, **x0 = 0x82000504** (SMC_CMD_PRIV_REG, `exynos-smc.h:45`), **x1 = 0x17463EC4** then **0x17463EC0**,
+**x2 = 0 (PRIV_REG_OPTION_READ**, `exynos-el3_mon.h:21`), **x3 = 0**; results a0..a3 printed. Lines (`WLAN ...`): `SMC read pa=17463EC4 ret=<int32 a0> a0=..`, `SMC read a1= a2= a3=`, `SMC cmp pa= mmio= same=<yes|no|error>`,
+`SMC mmio after pa= v=` (`!!!` if a READ changed it), and `SMC summary same=<yes|no|error> ambiguous=<0|1>`. `error` = a0 negative as int32 (EL3 refusal -EINVAL = -22, mainline `exynos-pmu.c:65,82`; SMCCC unknown function -1,
+`linux-arm-smccc.h:247-249`) or the MMIO read faulted. `ambiguous=1`: a0 == 0 and the MMIO word == 0 (observed 0): the reply cannot tell a value from a status 0 (*guess* that the first run is ambiguous). Both reads, no write, no loop; the
+helper refuses (no SMC) any other address. Audits: exactly one `smc` instruction in the object, x0/x2/x3 constants and the address guard checked in the disassembly (`check_wlansmc_object_text`, 9 object + 13 source mutations).
+
+## shim --wlan-iso: release the PCIe1 PHY isolation through EL3 and put it back (W2c; docs/research/29 section 12)
+
+```
+cd shim && ./build.sh --board bluejay --avb --pstore-fast --usb-gadget --wlan-probe --wlan-iso      # implies --wlan-smc-read; WRITER via EL3, only after the Opus review
+tools/probe-run --build-args "--pstore-fast --wlan-iso" --expect "WLAN ISO release=" --label w2c       # never run on hardware yet
+```
+Code: the `WLAN_ISO_RUN` block of `shim/wlansmc.c` (object `wlansmc_iso.o`), host test `wlaniso_host_test.c` (fake EL3 with RMW / full-overwrite / ignore / refuse / lie / late semantics). **SMCs of the object `wlansmc_iso.o`** (scope: that object only; shim.c's PSCI calls, the reboot-to-bootloader SYSIP_DAT0 WRITE and the CPU_INFORM clear remain in the image):
+(1) `smc #0` x0 = `0x82000504`, x1 = `0x17463EC4` or `0x17463EC0`, x2 = 0 (READ), x3 = 0 (the W2a reads, plus one READ of `0x17463EC4` as a precondition); (2) ONE RMW set: x0 = `0x82000504`, x1 = `0x17463EC4`, x2 = 2, x3 = 1 (mask), x4 = 1 (value);
+(3) exactly ONE RMW clear after any sent set: the same with x4 = 0 (x5..x7 = 0 in both RMW calls, as Linux). Nothing else in `wlansmc_iso.o` (no WRITE option 1, no other register, no other mask or value). Linux: `exynos_pcie_phy_isolation()` = `rmw_priv_reg(pmu_alive_pa + 0x3EC4, 1, val)` (`pcie-exynos-rc.c:393-407`), as the FIRST step of
+`exynos_pcie_rc_poweron()` (`:3387-3389`, before clocks/pinctrl/PHY init, no delay) and the last of `rc_poweroff` (`:3667-3669`); `PCIE_PHY_BYPASS = 1` = isolation released (`common.h:51-52`).
+Preconditions (else nothing is sent, `release=refused`): timer running; `0x17463EC4` bit 0 == 0; `0x17463EC0`, GPH2.DAT, GPP14.DAT readable; PERST gph2-0 low; WLAN_EN gpp14-2 low; the SMC READ of `0x17463EC4` returns a0 >= 0 AND a0 == the MMIO word (F3). **A `--wlan-iso` image never reads the PCIe wrapper (level 2 and its SUMMARY are compiled out) and cannot contain `--wlan-en` (`build.sh` refuses the combination and `shim.c` has an `#error`; F2).**
+After the set: bounded poll (<= 10 reads, 100 us apart; OUR bound, Linux has none): `ok` needs bit 0 set, a0 == 0, every other bit of `0x17463EC4` unchanged and `0x17463EC0` unchanged. a0 != 0 with nothing changed = `refused`; the word unreadable = `fault`;
+anything else (accepted but unchanged, a0 != 0 but changed, other bits moved: e.g. the EL3 overwrites instead of read-modify-write) = `mismatch`. **The one clear RMW is sent after every sent set (F1; idempotent if the bit is 0)**, never a second set; it must read back bit 0 == 0 in the bounded poll AND in one more read 10 ms later (`ISO final ISO1=`).
+Lines: `ISO before ISO1= ISO0=`, `ISO rmw set ret= a1=`, `ISO after set ISO1= ISO0=`, `ISO rmw clear ...`, `ISO after clear ...` and `WLAN ISO release=<ok|refused|fault|mismatch> readback=0x.. restore=<ok|FAILED|n/a>`; `!!! RESTORE FAILED` if the bit stays set.
+Known blind spots (*guess*): the observed word is 0, so an overwrite instead of RMW is indistinguishable from the guessed semantics at this value; an EL3 whose late apply survives the clear and lands after the 10 ms final look would still leave the bit set (the final line would not show it); *guess*: bit 0 = 1 means the isolation cells are bypassed, not that the PHY is powered (its supplies are the LDO rails).
 
 ## Runtime MMIO pokes: `sweettouchpoke=` (xnu patch 0093)
 

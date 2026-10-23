@@ -27,9 +27,10 @@ Status values: proposed, approved, building, done, rejected, superseded.
 | TP-005 | tools/ci-kernel skips cancelled runs | done |
 | TP-006 | tools/hang-recover | done (amended) |
 | TP-007 | tools/tool-proposals | done |
-| TP-008 | tools/acpm-verify | proposed (amended) |
+| TP-008 | tools/acpm-verify | done (amended) |
 | TP-009 | tools/xnu-local-build | done |
 | TP-010 | tools/qr-calibrate | proposed |
 | TP-011 | tools/phone | done |
 | TP-012 | tools/xrun --burst-on REGEX | proposed |
-| TP-013 | tools/mg-key NAME... [--dsc CACHE] | proposed |
+| TP-013 | tools/mg-key NAME... [--dsc CACHE] | done (amended) |
+| TP-014 | tools/lint-c | done (amended) |

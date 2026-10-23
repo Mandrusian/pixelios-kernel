@@ -1,6 +1,6 @@
 --- a/shim/shim.c
 +++ b/shim/shim.c
-@@ -10,16 +10,33 @@
+@@ -10,16 +10,42 @@
  #include "console.h"
  #include "mmu.h"
  #include "loader.h"
@@ -10,7 +10,16 @@
 +#include "ufsinit.h"
 +#include "usbprobe.h"
 +#include "wlanprobe.h"
++#include "wlanrails.h"
++#include "wlanen.h"
++#include "wlansmc.h"
 +#include "gpuprobe.h"
++#include "gpupower.h"
++#include "gpuclk.h"
++#include "gpurails.h"
++#include "gpurailon.h"
++#include "gpus2mpu.h"
++#include "gpujob.h"
 +#include "touchprobe.h"
 +#ifdef BOOT_XNU
 +#include "loader.h"
@@ -38,7 +47,7 @@
  #define GICR_TYPER		0x08
  #define GICR_WAKER		0x14
  #define GICR_SGI		0x10000
-@@ -30,7 +47,6 @@
+@@ -30,7 +56,6 @@
  #define GICR_ISPENDR0		(GICR_SGI + 0x200)
  #define GICR_ISACTIVER0		(GICR_SGI + 0x300)
  #define GICR_ICFGR1		(GICR_SGI + 0xc04)
@@ -46,7 +55,7 @@
  #define PTIMER_INTID		18	/* DT: <GIC_PPI 2 ...> */
  #define SGI_INTID		1
  
-@@ -39,14 +55,11 @@
+@@ -39,14 +64,11 @@
  #define PSCI_CPU_OFF		0x84000002UL
  #define PSCI_CPU_ON		0xc4000003UL
  #define PSCI_MIGRATE_INFO_TYPE	0x84000006UL
@@ -61,7 +70,7 @@
  #define rsr(r) ({ uint64_t _v; __asm__ volatile("mrs %0, " r : "=r"(_v)); _v; })
  #define wsr(r, v) __asm__ volatile("msr " r ", %0" : : "r"((uint64_t)(v)))
  #define isb() __asm__ volatile("isb" ::: "memory")
-@@ -57,12 +70,27 @@
+@@ -57,12 +79,27 @@
  static inline void wr8(uintptr_t a, uint8_t v) { *(volatile uint8_t *)a = v; }
  
  extern char secondary_entry[];
@@ -89,7 +98,7 @@
  
  /* ICC_SGI1R_EL1 value targeting the calling core only. */
  static uint64_t sgi_self(unsigned id)
-@@ -88,6 +116,670 @@
+@@ -88,6 +125,777 @@
  	return x0;
  }
  
@@ -649,18 +658,66 @@
 +	 * final pstore save/pager so it reaches screen and pstore alike. */
 +	usbprobe_report(dtb);
 +	pstore_save();			/* checkpoint: USB section */
++#if defined(WLAN_ISO_RUN) && defined(WLAN_EN_RUN)
++#error "--wlan-iso and --wlan-en must not be combined: the WLAN_EN writer must never run on a PHY whose isolation may be left released (review 2 F2)"
++#endif
 +#ifdef WLAN_PROBE
 +	/* Read-only BCM4389 Wi-Fi path probe (wlanprobe.c); l1 = PMU + pins, then l2 =
-+	 * PCIe wrapper, which may hang on a gated block, so checkpoint in between. */
++	 * PCIe wrapper (gated, see below), which may hang on a gated block, so checkpoints in between. */
 +	delay_ms(3000);
 +	con_clear(0xff000000U);
 +	con_str("SECTION", "WLAN pmu+pins");
 +	wlan_probe_l1();
 +	pstore_save();
++#ifdef WLAN_RAILS
++	/* READ-ONLY rail / CMU_HSI2 / PMU words (wlanrails.c, docs/research/29 section 4): the S2MPG10 PCIe PHY LDOs through the audited ACPM client, the CMU words only once the UFS HCI inside HSI2 answers */
++	delay_ms(3000);
++	con_clear(0xff000000U);
++	con_str("SECTION", "WLAN rails/cmu");
++	(void)wlan_rails();
++	pstore_save();
++#endif
++#ifdef WLAN_SMC_READ
++	/* W2a (wlansmc.c, docs/research/29): two EL3 SMC_CMD_PRIV_REG READs of PMU 0x17463EC4 / 0x17463EC0, compared with the MMIO words; nothing is written */
++	delay_ms(3000);
++	con_clear(0xff000000U);
++	con_str("SECTION", "WLAN smc read");
++	(void)wlan_smc_read();
++	pstore_save();
++#endif
++#ifdef WLAN_ISO_RUN
++	/* WRITER via EL3 (wlansmc.c, docs/research/29 W2c): release the PCIe1 PHY isolation with one RMW SMC and put it back; preconditions: isolation set, PERST and WLAN_EN low, the SMC READ accepted */
++	delay_ms(3000);
++	con_clear(0xff000000U);
++	con_str("SECTION", "WLAN iso");
++	(void)wlan_iso_run();
++	pstore_save();
++#endif
++#ifdef WLAN_EN_RUN
++	/* WRITER (wlanen.c, docs/research/29 W2b): WLAN_EN gpp14-2 high for 200 ms, sampled, then ALWAYS restored and read back. Only the two GPP14 registers, only with preconditions met. */
++	delay_ms(3000);
++	con_clear(0xff000000U);
++	con_str("SECTION", "WLAN en");
++	(void)wlan_en_run();
++	pstore_save();
++#endif
 +	delay_ms(3000);
 +	con_clear(0xff000000U);
 +	con_str("SECTION", "WLAN pcie");
-+	wlan_probe_l2();
++#ifdef WLAN_ISO_RUN
++	/* review 2 F2: a --wlan-iso image never reads the PCIe wrapper (SYSREG/ELBI/DBI/PMA): a bit left set by a failed restore would open the level-2 gate on an unconfigured block, and
++	 * wlan_probe_l2_group(4) reads DBI/ELBI too. Level 2 belongs to its own reviewed flag. */
++	con_str("WLAN", "l2 skipped: --wlan-iso image");
++#else
++	/* level 2 is gated (wlan_gate, docs/research/20 section 3 D1): the wrapper is read only if the PCIe1 PHY is not isolated and the CMU_HSI2 PCIe mux is
++	 * selected; a pstore checkpoint after every group so the last line of a hang names the block (PMA last) */
++	if (wlan_probe_l2_open())
++		for (unsigned g = 0; g < 4; g++) {
++			wlan_probe_l2_group(g);
++			pstore_save();
++		}
++	wlan_probe_l2_group(4);			/* SUMMARY, also when gated */
++#endif	/* !WLAN_ISO_RUN */
 +	pstore_save();
 +#endif
 +#ifdef GPU_PROBE
@@ -671,6 +728,65 @@
 +	con_str("SECTION", "GPU");
 +	gpu_probe();
 +	pstore_save();
++#ifdef GPU_S2MPU
++	/* Opt-in READ-ONLY (--gpu-s2mpu, docs/research/28): the four G3D S2MPU register blocks; the granule of the shim image is shown for reference. */
++	con_str("SECTION", "GPU s2mpu");
++	gpu_s2mpu_dump((uintptr_t)&gpu_s2mpu_dump);
++	pstore_save();
++#endif
++	{
++	/* Every opt-in step below that talks to the ACPM can leave a request queued or refuse; if one did, the power cycle (which would start shader
++	 * power-up while a request may still run in the APM, or without the rail) is skipped. The rail, if it was switched on, is restored afterwards. */
++	int skip_power = 0, rail_state = 0;
++
++	(void)skip_power;
++	(void)rail_state;
++#ifdef GPU_RAILS
++	/* Opt-in READ-ONLY (--gpu-rails, docs/research/27): the S2MPG11 registers of the GPU rails through the ACPM PMIC read path (gpurails.c);
++	 * refuses with zero ACPM traffic unless the soc.json block is known and the ACPM gates are set. Runs before anything that writes. */
++	con_str("SECTION", "GPU rails");
++	gpu_rails();
++	pstore_save();
++#endif
++#ifdef GPU_CLK
++	/* Opt-in (--gpu-clk, docs/research/27): ask the ACPM DVFS channel for the G3DL2 / G3D init rate (gpuclk.c), print the CMU words again;
++	 * refuses with zero writes unless the ACPM gates are set. Runs before the power cycle. A failure (review M2) skips the power cycle. */
++	con_str("SECTION", "GPU clk");
++	if (gpu_clk())
++		skip_power = 1;
++	pstore_save();
++#endif
++#ifdef GPU_RAIL_ON
++	/* Opt-in WRITER (--gpu-rail-on, docs/research/27): switch S2MPG11 BUCK2S (the shader rail, found OFF in run g1rails2) to mode on-normal through the audited
++	 * ACPM update (gpurailon.c); zero writes unless it reads exactly "off" with OUT1 in the window. Anything but a verified "on" skips the power cycle. */
++	con_str("SECTION", "GPU rail on");
++	rail_state = gpu_rail_enable();
++	if (rail_state != RAIL_ON_OK)
++		skip_power = 1;
++	pstore_save();
++#endif
++#ifdef GPU_POWER
++	/* Opt-in (--gpu-power, docs/research/17 stage 1): after the read-only probe, power the tiler/L2 and shaders on, report,
++	 * and power them off again (gpupower.c refuses with zero writes unless the probe's state is exactly as expected). */
++	if (skip_power)
++		con_str("GPU", "POWER skipped: an earlier ACPM step failed or was refused");
++	else
++		gpu_power_cycle();
++	pstore_save();
++#endif
++#ifdef GPU_RAIL_ON
++	/* ALWAYS, also after a timed-out power cycle: log the shader state (review L3), then put BUCK2S_CTRL back to off and say so loudly if that failed. */
++	gpu_probe_shaders();
++	gpu_rail_restore(rail_state,
++#ifdef GPU_POWER
++			 skip_power ? RAIL_POWER_SKIPPED : RAIL_POWER_RAN
++#else
++			 RAIL_POWER_NONE
++#endif
++			);
++	pstore_save();
++#endif
++	}
 +#endif
 +#ifdef TOUCH_PROBE
 +	/* Touchscreen SPI11/USI11 bring-up probe (touchprobe.c): read-only dumps first and a checkpoint, then (only
@@ -760,7 +876,7 @@
  static uint64_t now(void)
  {
  	isb();
-@@ -96,22 +788,41 @@
+@@ -96,22 +904,41 @@
  
  static void delay_ms(unsigned ms)
  {
@@ -770,8 +886,8 @@
 +	wait_ticks((counter_freq() / 1000) * ms);
  }
  
-+#ifdef TOUCH_PROBE
-+uint64_t touch_ticks(void)	/* touchprobe.c: bounded waits */
++#if defined(TOUCH_PROBE) || defined(GPU_POWER) || defined(GPU_CLK) || defined(GPU_RAILS) || defined(GPU_RAIL_ON) || defined(GPU_JOB) || defined(WLAN_RAILS)
++uint64_t touch_ticks(void)	/* touchprobe.c / gpupower.c: bounded waits (CNTPCT) */
 +{
 +	return now();
 +}
@@ -806,7 +922,7 @@
  }
  
  /* ---- exceptions ---- */
-@@ -138,10 +849,30 @@
+@@ -138,10 +965,30 @@
  
  void exc_handler(uint64_t slot, uint64_t *regs)
  {
@@ -838,7 +954,7 @@
  	con_clear(BLUE);
  	switch (slot & 3) {
  	case 0: con_str("PANIC", "SYNC"); break;
-@@ -157,18 +888,32 @@
+@@ -157,18 +1004,32 @@
  	con_hex("SPSR", rsr("spsr_el1"));
  	con_hex("X0", regs[0]);
  	con_hex("X1", regs[1]);
@@ -874,7 +990,7 @@
  		uintptr_t r = find_gicr();
  		if (r) {
  			sec_probe[0] = rd32(r + GICR_IGROUPR0);
-@@ -178,6 +923,7 @@
+@@ -178,6 +1039,7 @@
  			sec_probe[2] = rd32(r + GICR_IPRIORITYR + 16);
  		}
  		sec_probe[3] = r ? 1 : 0xdead;
@@ -882,7 +998,35 @@
  	}
  	__asm__ volatile("dsb sy" ::: "memory");
  	smc(PSCI_CPU_OFF, 0, 0, 0);
-@@ -372,7 +1118,10 @@
+@@ -347,6 +1209,27 @@
+ 	con_hex2(label, "feat=", smc(PSCI_FEATURES, fn, 0, 0), 0, 0);
+ }
+ 
++#ifdef GPU_JOB
++/* --gpu-job (docs/research/28): 5 pages of the shim image's own RAM for the GPU page tables, the job and the target word (6 pages reserved, the base is aligned up at
++ * run time because the image load address is not known at link time). Used for nothing else. */
++static uint8_t gpujob_pages[6 * 4096] __attribute__((aligned(4096)));
++
++uintptr_t gpu_job_scratch(void)
++{
++	return ((uintptr_t)gpujob_pages + 4095u) & ~(uintptr_t)4095u;
++}
++
++/* clean + invalidate to the point of coherency, line by line (64-byte lines on the Cortex-A55/A76 cores); the shim runs MMU-off so VA == PA */
++void gpu_job_cache_flush(uintptr_t pa, unsigned len)
++{
++	uintptr_t a = pa & ~(uintptr_t)63, end = pa + len;
++
++	for (; a < end; a += 64)
++		__asm__ volatile("dc civac, %0" :: "r"(a) : "memory");
++	__asm__ volatile("dsb sy\n\tisb" ::: "memory");
++}
++#endif
++
+ static uint64_t scratch[8192];	/* 64KB, lives in our (later cacheable) image */
+ 
+ static uint64_t ticks_fill(uint32_t c)
+@@ -372,7 +1255,10 @@
  
  void shim_main(uint64_t dtb)
  {
@@ -894,7 +1038,7 @@
  
  	/* An xnu payload in the ramdisk means: boot it (MMU stays off). */
  	stage = "loader";
-@@ -397,7 +1146,7 @@
+@@ -397,7 +1283,7 @@
  	uint64_t mem_off = ticks_mem();
  
  	stage = "mmu enable";
@@ -903,7 +1047,7 @@
  
  	stage = "fill on";
  	uint64_t fill_on = rc ? 0 : ticks_fill(RED);
-@@ -410,6 +1159,7 @@
+@@ -410,6 +1296,7 @@
  	con_hex2("DTB", "at=", dtb, "magic=", dtb ? __builtin_bswap32(rd32(dtb)) : 0);
  	con_hex2("IMAGE", "lo=", mi.img_lo, "hi=", mi.img_hi);
  	con_hex2("MMU", "rc=", rc, "l3=", mi.n_l3);
@@ -911,7 +1055,7 @@
  	con_hex2("TTBR0", "pa=", mi.ttbr, "pa_hi=", mi.ttbr >> 32);
  	con_hex("SCTLR0", mi.sctlr_before);
  	con_hex("SCTLR1", mi.sctlr_after);
-@@ -417,7 +1167,7 @@
+@@ -417,7 +1304,7 @@
  	con_hex2("PARANGE", "mmfr0=", rsr("id_aa64mmfr0_el1") & 0xf, "tg16=", (rsr("id_aa64mmfr0_el1") >> 20) & 0xf);
  	con_skip();
  	con_hex("PAR img", mmu_probe((uintptr_t)shim_main));

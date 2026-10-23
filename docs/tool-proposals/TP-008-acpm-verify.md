@@ -1,14 +1,14 @@
 ---
 id: TP-008
 tool: "tools/acpm-verify"
-status: proposed
+status: done
 proposed_by: "Claude Sonnet 5.5 (delegate)"
 date: 2026-10-22
 exposed_by: "shim --touch-probe=railsr: the ACPM client refuses to write until a human has compared the printed channel descriptor with doc 23 and set layout_verified / elem_unit_verified (and the rail vsel range) in soc/google/gs101/soc.json"
 extends: "tools/probe-run"
 related: "TP-004"
 usage: "tools/acpm-verify --from-dir DIR [--expect-ch 2]"
-refs: "-"
+refs: "tools/acpm-verify, tools/test_acpm_verify.py"
 ---
 
 ## checked
@@ -35,3 +35,4 @@ none (offline, reads a captured log). A false PASS is the risk: it only checks i
   (`ACPM req|rsp buf+OFF w w w w`, one 16-byte slot per line): the checker must confirm that the request buffer's non-empty slots look like commands at a 16-byte stride (seq in bits 21:16 of word 0, 0x01 in bits 11:8)
   and print `set acpm.elem_unit_verified=1` only then; it also needs `desc[3] == 1` (TYPE_QUEUE) and `idx == ch_id`. (3) A refused describe now prints the raw descriptor and the reason, so the checker must also explain a FAIL
   from those lines (`ACPM describe refused: ...`, `ACPM ids[..]=...`). Still offline and report-only: the human flips the flags.
+- 2026-10-23 Claude Sonnet 5.5 (delegate): built as tools/acpm-verify (`--from-dir DIR [--expect-ch 2] [--sram-size 0x40000]`, ERROR if no `ACPM init[` lines). Rules re-derived from shim/acpm.c acpm_describe [read from source]: ap_max=init[6] in 1..32, table fits SRAM at the stride, desc id/index == channel, type 1, q_len 3..256, q_elem_size == 16 BYTES, 4 pointer words aligned inside SRAM, 2 buffers (q_len*16 B) inside SRAM, no overlaps, printed bases/table/q lines agree with the raw words, indices < q_len and queues empty; `elem_unit_verified=1` is suggested only if the request buffer shows non-empty slots at a 16 B stride with bits 11:8 of word 0 == 1. Report says it checks internal consistency only; never edits soc.json. Self-test tools/test_acpm_verify.py uses a SYNTHETIC fixture (not observed). Ran on three real captures in the main checkout (logs/probe, read-only) [observed on this dev machine 2026-10-23, not new hardware runs]: 20261022T145330Z-acpm3_ and 20261022T151219Z-acpm4_ PASS (ch 2, q_len 5, 5 request slots at 16 B); 20261022T172739Z-dvfsr1_ is the DVFS channel (id 1) and FAILs with the default `--expect-ch 2`, as it should. logs/runs/*/usb.txt has no ACPM lines.

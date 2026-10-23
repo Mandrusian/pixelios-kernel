@@ -1,6 +1,6 @@
 --- a/shim/build.sh
 +++ b/shim/build.sh
-@@ -1,36 +1,312 @@
+@@ -1,36 +1,491 @@
  #!/bin/bash
 -# Build the shim and wrap it in a boot.img v2 that mirrors the stock PixelOS header.
  set -euo pipefail
@@ -18,7 +18,18 @@
 +udump_mib=0
 +qrlog=0
 +wlan_probe=0
++wlan_rails=0
++wlan_en=0
++wlan_smc_read=0
++wlan_iso=0
 +gpu_probe=0
++gpu_power=0
++gpu_stack=0
++gpu_clk=0
++gpu_rails=0
++gpu_rail_on=0
++gpu_s2mpu=0
++gpu_job=0
 +touch_probe=0
 +touch_opts=
 +touch_rails=0
@@ -34,7 +45,19 @@
 +		--udump) udump_mib="$2"; shift 2 ;;
 +		--qrlog) qrlog=1; shift ;;
 +		--wlan-probe) wlan_probe=1; shift ;;
++		--wlan-rails) wlan_rails=1; wlan_probe=1; shift ;;	# implies --wlan-probe; READ-ONLY S2MPG10 PCIe-PHY LDOs (ACPM) + CMU_HSI2 + PMU words (wlanrails.c, docs/research/29)
++		--wlan-smc-read) wlan_smc_read=1; wlan_probe=1; shift ;;	# implies --wlan-probe; two EL3 SMC_CMD_PRIV_REG READs of PMU 0x17463EC4 / 0x17463EC0 (wlansmc.c, docs/research/29 W2a)
++		--wlan-iso) wlan_iso=1; wlan_smc_read=1; wlan_probe=1; shift ;;	# implies --wlan-smc-read --wlan-probe; WRITER via EL3: PCIe1 PHY isolation release + restore (wlansmc.c WLAN_ISO_RUN, docs/research/29 W2c)
++		--wlan-en) wlan_en=1; wlan_probe=1; shift ;;	# implies --wlan-probe; WRITER: WLAN_EN gpp14-2 high for 200 ms and back (wlanen.c, docs/research/29 W2b)
 +		--gpu-probe) gpu_probe=1; shift ;;
++		--gpu-job) gpu_job=1; gpu_probe=1; gpu_rails=1; gpu_rail_on=1; gpu_power=1; gpu_s2mpu=1; shift ;;	# G2 stage 2: AS0 + one WRITE_VALUE job inside the powered window (gpujob.c)
++		--gpu-s2mpu) gpu_s2mpu=1; gpu_probe=1; shift ;;	# READ-ONLY dump of the four G3D S2MPU blocks (gpus2mpu.c)
++		--gpu-rail-on) gpu_rail_on=1; gpu_rails=1; gpu_probe=1; shift ;;	# WRITER: S2MPG11 BUCK2S mode on/restore via ACPM (gpurailon.c); implies --gpu-rails
++		--gpu-rails) gpu_rails=1; gpu_probe=1; shift ;;	# implies --gpu-probe; READ-ONLY S2MPG11 GPU-rail registers via ACPM (gpurails.c)
++		--gpu-clk) gpu_clk=1; gpu_probe=1; shift ;;	# implies --gpu-probe; ACPM DVFS request for G3DL2/G3D (gpuclk.c)
++		--gpu-power=stack) gpu_power=1; gpu_probe=1; gpu_stack=1; shift ;;	# + STACK_PWRON/PWROFF (kbase corestack path)
++		--gpu-power=*) echo "unknown --gpu-power option '${1#--gpu-power=}' (only: stack)" >&2; exit 2 ;;
++		--gpu-power) gpu_power=1; gpu_probe=1; shift ;;	# implies --gpu-probe (the gate lives there)
 +		--dvfs) dvfs_khz="$2"; shift 2 ;;
 +		--touch-probe) touch_probe=1; shift ;;
 +		--touch-probe=*) touch_probe=1; touch_opts="${1#--touch-probe=}"; shift ;;
@@ -79,10 +102,58 @@
 +	[ "$gs101" = 1 ] || { echo "--wlan-probe needs a gs101 board" >&2; exit 2; }
 +	CFLAGS="$CFLAGS -DWLAN_PROBE"
 +fi
++if [ "$wlan_rails" = 1 ]; then
++	[ "$gs101" = 1 ] || { echo "--wlan-rails needs a gs101 board" >&2; exit 2; }
++	CFLAGS="$CFLAGS -DWLAN_RAILS"
++fi
++if [ "$wlan_smc_read" = 1 ]; then
++	[ "$gs101" = 1 ] || { echo "--wlan-smc-read needs a gs101 board" >&2; exit 2; }
++	CFLAGS="$CFLAGS -DWLAN_SMC_READ"
++fi
++if [ "$wlan_iso" = 1 ]; then
++	[ "$gs101" = 1 ] || { echo "--wlan-iso needs a gs101 board" >&2; exit 2; }
++	[ "$wlan_en" = 0 ] || { echo "--wlan-iso cannot be combined with --wlan-en (the WLAN_EN writer must not run when the PHY isolation may be left released; review 2 F2)" >&2; exit 2; }
++	CFLAGS="$CFLAGS -DWLAN_ISO_RUN"
++fi
++if [ "$wlan_en" = 1 ]; then
++	[ "$gs101" = 1 ] || { echo "--wlan-en needs a gs101 board" >&2; exit 2; }
++	CFLAGS="$CFLAGS -DWLAN_EN_RUN"
++fi
 +if [ "$gpu_probe" = 1 ]; then
 +	# Read-only Mali-G78 probe (default OFF); bluejay only.
 +	[ "$gs101" = 1 ] || { echo "--gpu-probe needs a gs101 board" >&2; exit 2; }
 +	CFLAGS="$CFLAGS -DGPU_PROBE"
++fi
++if [ "$gpu_rails" = 1 ]; then
++	# Opt-in read-only S2MPG11 GPU-rail dump through the ACPM PMIC read path (gpurails.c); bluejay only.
++	[ "$gs101" = 1 ] || { echo "--gpu-rails needs a gs101 board" >&2; exit 2; }
++	CFLAGS="$CFLAGS -DGPU_RAILS"
++fi
++if [ "$gpu_job" = 1 ]; then
++	# Opt-in WRITER (docs/research/28): AS0 programming + one WRITE_VALUE job inside the power window; needs the rail on (implied) and the plain power cycle.
++	[ "$gs101" = 1 ] || { echo "--gpu-job needs a gs101 board" >&2; exit 2; }
++	[ "$gpu_stack" = 0 ] || { echo "--gpu-job cannot be combined with --gpu-power=stack" >&2; exit 2; }
++	CFLAGS="$CFLAGS -DGPU_JOB"
++fi
++if [ "$gpu_s2mpu" = 1 ]; then
++	# Opt-in READ-ONLY dump of the G3D S2MPU registers (gpus2mpu.c); bluejay only, runs right after the read-only probe.
++	[ "$gs101" = 1 ] || { echo "--gpu-s2mpu needs a gs101 board" >&2; exit 2; }
++	CFLAGS="$CFLAGS -DGPU_S2MPU"
++fi
++if [ "$gpu_rail_on" = 1 ]; then
++	# Opt-in WRITER (BUCK2S mode on before the power cycle, restored afterwards); bluejay only.
++	[ "$gs101" = 1 ] || { echo "--gpu-rail-on needs a gs101 board" >&2; exit 2; }
++	CFLAGS="$CFLAGS -DGPU_RAIL_ON"
++fi
++if [ "$gpu_clk" = 1 ]; then
++	# Opt-in GPU clock request through the ACPM DVFS client (gpuclk.c); bluejay only, runs after the read-only probe and before --gpu-power.
++	[ "$gs101" = 1 ] || { echo "--gpu-clk needs a gs101 board" >&2; exit 2; }
++	CFLAGS="$CFLAGS -DGPU_CLK"
++fi
++if [ "$gpu_power" = 1 ]; then
++	# Opt-in Mali-G78 power on/off cycle (gpupower.c, docs/research/17 stage 1); bluejay only, runs after the read-only probe.
++	[ "$gs101" = 1 ] || { echo "--gpu-power needs a gs101 board" >&2; exit 2; }
++	CFLAGS="$CFLAGS -DGPU_POWER"
 +fi
 +if [ "$touch_probe" != 0 ]; then
 +	# Touchscreen SPI11/USI11 probe (default OFF); bluejay only. =run adds the XNU driver's writes (allowlisted).
@@ -191,9 +262,36 @@
 +"$CC" $CFLAGS -c udump.c -o out/udump.o
 +# Same for wlanprobe.c (read-only audit sees it every build); only LINKED with --wlan-probe.
 +"$CC" $CFLAGS -c wlanprobe.c -o out/wlanprobe.o
++# Same for wlanrails.c (read-only rail / CMU / PMU words, docs/research/29); only LINKED with --wlan-rails. Reads only (audited).
++"$CC" $CFLAGS -fno-tree-switch-conversion -fno-jump-tables -c wlanrails.c -o out/wlanrails.o
++# Same for wlansmc.c (W2a: two SMC READs); built with -DWLAN_SMC_READ on every build so the audit sees the real code (the one smc instruction), only LINKED with --wlan-smc-read.
++"$CC" $CFLAGS -UWLAN_ISO_RUN -DWLAN_SMC_READ -fno-tree-switch-conversion -fno-jump-tables -c wlansmc.c -o out/wlansmc.o
++# and wlansmc_iso.o = the same file with the W2c RMW writer (WLAN_ISO_RUN), audited every build, linked INSTEAD of wlansmc.o with --wlan-iso (an --wlan-smc-read image contains no RMW code)
++"$CC" $CFLAGS -DWLAN_SMC_READ -DWLAN_ISO_RUN -fno-tree-switch-conversion -fno-jump-tables -c wlansmc.c -o out/wlansmc_iso.o
++# Same for wlanen.c (the opt-in WLAN_EN writer); built with -DWLAN_EN_RUN on every build so the audit sees the real code, only LINKED with --wlan-en. Its two writes go through one allowlisted helper (audited).
++"$CC" $CFLAGS -DWLAN_EN_RUN -fno-tree-switch-conversion -fno-jump-tables -c wlanen.c -o out/wlanen.o
 +# Same for gpuprobe.c; only LINKED with --gpu-probe. Its name switches must not become
 +# .rodata pointer tables (ABS64 relocations, rejected below).
 +"$CC" $CFLAGS -fno-tree-switch-conversion -fno-jump-tables -c gpuprobe.c -o out/gpuprobe.o
++# Same for gpupower.c (the opt-in GPU power cycle); only LINKED with --gpu-power. Its writes go through one allowlisted helper (audited).
++NOJOB_CFLAGS="${CFLAGS//-DGPU_JOB/}"	# the plain / stack gpupower objects never carry the --gpu-job hook (their audit forbids the extra undefined symbol)
++"$CC" $NOJOB_CFLAGS -fno-tree-switch-conversion -fno-jump-tables -c gpupower.c -o out/gpupower.o
++# and its --gpu-power=stack variant (extra STACK_PWRON/PWROFF writes), also audited every build, linked only with --gpu-power=stack
++"$CC" $NOJOB_CFLAGS -DGPU_POWER_STACK -fno-tree-switch-conversion -fno-jump-tables -c gpupower.c -o out/gpupower_stack.o
++# Same for gpuclk.c (the opt-in GPU clock request); only LINKED with --gpu-clk. It has no MMIO writer of its own (audited).
++"$CC" $CFLAGS -fno-tree-switch-conversion -fno-jump-tables -c gpuclk.c -o out/gpuclk.o
++# Same for gpus2mpu.c (read-only S2MPU dump); only LINKED with --gpu-s2mpu (or --gpu-job). Reads only, audited like gpuprobe.o.
++"$CC" $CFLAGS -fno-tree-switch-conversion -fno-jump-tables -c gpus2mpu.c -o out/gpus2mpu.o
++# Same for gpujob.c (the stage-2 job writer; only LINKED with --gpu-job) and gpupower_job.o (gpupower.c with the one `gpu_job_run()` hook in the powered window; linked instead of gpupower.o
++# with --gpu-job). Both are audited on every build (writer audit / object audit in tools/test-bluejay-boot.py).
++"$CC" $CFLAGS -fno-tree-switch-conversion -fno-jump-tables -c gpujob.c -o out/gpujob.o
++"$CC" $CFLAGS -DGPU_JOB -fno-tree-switch-conversion -fno-jump-tables -c gpupower.c -o out/gpupower_job.o
++# Same for gpurails.c (read-only GPU-rail dump); only LINKED with --gpu-rails. No MMIO of its own (audited).
++"$CC" $CFLAGS -fno-tree-switch-conversion -fno-jump-tables -c gpurails.c -o out/gpurails.o
++# Same for gpurailon.c (the opt-in rail writer's orchestration); only LINKED with --gpu-rail-on. No MMIO of its own (audited). Built with -DGPU_RAIL_ON on every
++# build so the audit sees the real code; acpm_railon.o is acpm.c with the GPU_RAIL_ON writer, for the audit only (the image links acpm.o built with the image's flags).
++"$CC" $CFLAGS -DGPU_RAIL_ON -fno-tree-switch-conversion -fno-jump-tables -c gpurailon.c -o out/gpurailon.o
++"$CC" $CFLAGS -DGPU_RAIL_ON -fno-tree-switch-conversion -fno-jump-tables -c acpm.c -o out/acpm_railon.o
 +# Same for touchprobe.c; only LINKED with --touch-probe. Its writes go through one allowlisted helper (audited).
 +"$CC" $CFLAGS -fno-tree-switch-conversion -fno-jump-tables -c touchprobe.c -o out/touchprobe.o
 +# Same for acpm.c (ACPM client for the touch rails); only LINKED with --touch-probe=railsr|rails. Its writes go through one allowlisted helper (audited).
@@ -215,16 +313,46 @@
 +if [ "$wlan_probe" = 1 ]; then
 +	usb_objs="$usb_objs out/wlanprobe.o"
 +fi
++if [ "$wlan_rails" = 1 ]; then
++	usb_objs="$usb_objs out/wlanrails.o"
++fi
++if [ "$wlan_iso" = 1 ]; then
++	usb_objs="$usb_objs out/wlansmc_iso.o"
++elif [ "$wlan_smc_read" = 1 ]; then
++	usb_objs="$usb_objs out/wlansmc.o"
++fi
++if [ "$wlan_en" = 1 ]; then
++	usb_objs="$usb_objs out/wlanen.o"
++fi
 +if [ "$gpu_probe" = 1 ]; then
 +	usb_objs="$usb_objs out/gpuprobe.o"
++fi
++if [ "$gpu_clk" = 1 ]; then
++	usb_objs="$usb_objs out/gpuclk.o"
++fi
++if [ "$gpu_s2mpu" = 1 ]; then
++	usb_objs="$usb_objs out/gpus2mpu.o"
++fi
++if [ "$gpu_rails" = 1 ]; then
++	usb_objs="$usb_objs out/gpurails.o"
++fi
++if [ "$gpu_rail_on" = 1 ]; then
++	usb_objs="$usb_objs out/gpurailon.o"
++fi
++if [ "$gpu_job" = 1 ]; then
++	usb_objs="$usb_objs out/gpupower_job.o out/gpujob.o"
++elif [ "$gpu_stack" = 1 ]; then
++	usb_objs="$usb_objs out/gpupower_stack.o"
++elif [ "$gpu_power" = 1 ]; then
++	usb_objs="$usb_objs out/gpupower.o"
 +fi
 +if [ "$touch_probe" != 0 ]; then
 +	usb_objs="$usb_objs out/touchprobe.o"
 +fi
-+if [ "$touch_rails" = 1 ] || [ "$touch_dvfs" = 1 ]; then
++if [ "$touch_rails" = 1 ] || [ "$touch_dvfs" = 1 ] || [ "$gpu_clk" = 1 ] || [ "$gpu_rails" = 1 ] || [ "$wlan_rails" = 1 ]; then
 +	usb_objs="$usb_objs out/acpm.o"
 +fi
-+abs=$("$READELF" -r out/shim.o out/console.o out/ramlog.o out/mmu.o out/fdt.o out/pstore.o out/loader.o out/payload.o out/ufs.o out/ufsdiag.o out/ufsinit.o out/usbprobe.o out/usbproto.o out/usbgadget.o out/usbpool.o out/udump.o out/wlanprobe.o out/gpuprobe.o out/touchprobe.o out/acpm.o $qr_objs | grep -c ABS64 || true)
++abs=$("$READELF" -r out/shim.o out/console.o out/ramlog.o out/mmu.o out/fdt.o out/pstore.o out/loader.o out/payload.o out/ufs.o out/ufsdiag.o out/ufsinit.o out/usbprobe.o out/usbproto.o out/usbgadget.o out/usbpool.o out/udump.o out/wlanprobe.o out/wlanrails.o out/wlanen.o out/wlansmc.o out/wlansmc_iso.o out/gpuprobe.o out/gpupower.o out/gpupower_stack.o out/gpupower_job.o out/gpujob.o out/gpuclk.o out/gpus2mpu.o out/gpurails.o out/gpurailon.o out/acpm_railon.o out/touchprobe.o out/acpm.o $qr_objs | grep -c ABS64 || true)
  [ "$abs" = 0 ] || { echo "error: $abs absolute relocations in C objects" >&2; exit 1; }
 -$CC $CFLAGS -static -T shim.ld -Wl,--build-id=none -Wl,--no-warn-rwx-segments -Wl,-N \
 -	out/start.o out/shim.o out/console.o out/mmu.o out/fdt.o out/loader.o out/ufs.o -o out/shim.elf
@@ -290,8 +418,39 @@
 +gcc -O1 -Wall -Wextra -I. -o out/usbproto_host_test usbproto.c usbproto_host_test.c && ./out/usbproto_host_test
 +gcc -O1 -Wall -Wextra -I. -o out/usbgadget_host_test usbproto.c usbgadget.c usbgadget_host_test.c && ./out/usbgadget_host_test
 +gcc -O1 -Wall -Wextra -I. -DUSB_DMA_HI_BASE=1 -o out/usbpool_host_test usbpool.c usbpool_host_test.c && ./out/usbpool_host_test
-+gcc -O1 -Wall -Wextra -Werror -I. -o out/wlanprobe_host_test wlanprobe_host_test.c && ./out/wlanprobe_host_test
++gcc -O1 -Wall -Wextra -Werror -I. -Iout -include out/board_config.h -o out/wlanprobe_host_test wlanprobe_host_test.c && ./out/wlanprobe_host_test
++# --wlan-rails (wlanrails.c) against the fake APM of acpm_host_test.c; --wlan-en (wlanen.c) against a fake GPIO bank. try_write32 is deliberately absent from the rails test (linking fails if wlanrails.c ever writes).
++gcc -O1 -Wall -Wextra -Werror -Wno-unused-function -DTOUCH_RAILS_WRITE -I. -Iout -include out/board_config.h -o out/wlanrails_host_test wlanrails_host_test.c && ./out/wlanrails_host_test
++gcc -O1 -Wall -Wextra -Werror -DWLAN_EN_RUN -I. -Iout -include out/board_config.h -o out/wlanen_host_test wlanen_host_test.c && ./out/wlanen_host_test
++gcc -O1 -Wall -Wextra -Werror -DWLAN_SMC_READ -I. -Iout -include out/board_config.h -o out/wlansmc_host_test wlansmc_host_test.c && ./out/wlansmc_host_test
++gcc -O1 -Wall -Wextra -Werror -DWLAN_SMC_READ -DWLAN_ISO_RUN -I. -Iout -include out/board_config.h -o out/wlaniso_host_test wlaniso_host_test.c && ./out/wlaniso_host_test
 +gcc -O1 -Wall -Wextra -Werror -I. -o out/gpuprobe_host_test gpuprobe_host_test.c && ./out/gpuprobe_host_test
++gcc -O1 -Wall -Wextra -Werror -I. -Iout -include out/board_config.h -o out/gpuprobe_dump_host_test gpuprobe_dump_host_test.c && ./out/gpuprobe_dump_host_test
++gcc -O1 -Wall -Wextra -Werror -I. -Iout -include out/board_config.h -o out/gpus2mpu_host_test gpus2mpu_host_test.c && ./out/gpus2mpu_host_test
++gcc -O1 -Wall -Wextra -Werror -I. -Iout -include out/board_config.h -o out/gpujob_host_test gpus2mpu.c gpujob_host_test.c && ./out/gpujob_host_test
++gcc -O1 -Wall -Wextra -Werror -I. -Iout -include out/board_config.h -o out/gpupower_host_test gpupower_host_test.c && ./out/gpupower_host_test
++gcc -O1 -Wall -Wextra -Werror -DGPU_POWER_STACK -I. -Iout -include out/board_config.h -o out/gpupower_stack_host_test gpupower_host_test.c && ./out/gpupower_stack_host_test
++# --gpu-clk (gpuclk.c) against the fake DVFS-channel APM of dvfs_host_test.c; the two gate variants use a copy of the board header with one ACPM gate forced to 0
++sed 's/^#define ACPM_LAYOUT_VERIFIED 1$/#define ACPM_LAYOUT_VERIFIED 0/' out/board_config.h > out/board_config_l0.h
++sed 's/^#define ACPM_ELEM_UNIT_VERIFIED 1$/#define ACPM_ELEM_UNIT_VERIFIED 0/' out/board_config.h > out/board_config_u0.h
++GCLK="gcc -O1 -Wall -Wextra -Werror -Wno-unused-function -DGPU_CLK -I."
++$GCLK -Iout -include out/board_config.h -o out/gpuclk_host_test gpuclk_host_test.c && ./out/gpuclk_host_test
++$GCLK -DGATE_TEST -Iout -include out/board_config_l0.h -o out/gpuclk_gate_l_host_test gpuclk_host_test.c && ./out/gpuclk_gate_l_host_test
++$GCLK -DGATE_TEST -DGATE_UNIT -Iout -include out/board_config_u0.h -o out/gpuclk_gate_u_host_test gpuclk_host_test.c && ./out/gpuclk_gate_u_host_test
++# --gpu-rails (gpurails.c) against the fake APM of acpm_host_test.c; the gate variants again use the sed'ed headers, a null-config variant drops ACPM_S11_KNOWN
++GRL="gcc -O1 -Wall -Wextra -Werror -Wno-unused-function -I."
++$GRL -DTOUCH_RAILS_WRITE -Iout -include out/board_config.h -o out/gpurails_host_test gpurails_host_test.c && ./out/gpurails_host_test
++$GRL -DTOUCH_RAILS_WRITE -DGATE_TEST -Iout -include out/board_config_l0.h -o out/gpurails_gate_l_host_test gpurails_host_test.c && ./out/gpurails_gate_l_host_test
++$GRL -DTOUCH_RAILS_WRITE -DGATE_TEST -DGATE_UNIT -Iout -include out/board_config_u0.h -o out/gpurails_gate_u_host_test gpurails_host_test.c && ./out/gpurails_gate_u_host_test
++sed 's/^#define ACPM_S11_KNOWN 1$/#define ACPM_S11_KNOWN 0/' out/board_config.h > out/board_config_s0.h
++sed 's/^#define ACPM_S11_ON_KNOWN 1$/#define ACPM_S11_ON_KNOWN 0/' out/board_config.h > out/board_config_n0.h
++$GRL -DTOUCH_RAILS_WRITE -DNULL_TEST -Iout -include out/board_config_s0.h -o out/gpurails_null_host_test gpurails_host_test.c && ./out/gpurails_null_host_test
++# --gpu-rail-on (gpurailon.c, the S2MPG11 BUCK2S writer) against the same fake APM; gate variants and a null rail_on block
++GRO="$GRL -DTOUCH_RAILS_WRITE -DGPU_RAIL_ON"
++$GRO -Iout -include out/board_config.h -o out/gpurailon_host_test gpurailon_host_test.c && ./out/gpurailon_host_test
++$GRO -DGATE_TEST -Iout -include out/board_config_l0.h -o out/gpurailon_gate_l_host_test gpurailon_host_test.c && ./out/gpurailon_gate_l_host_test
++$GRO -DGATE_TEST -DGATE_UNIT -Iout -include out/board_config_u0.h -o out/gpurailon_gate_u_host_test gpurailon_host_test.c && ./out/gpurailon_gate_u_host_test
++$GRO -DNULL_TEST -Iout -include out/board_config_n0.h -o out/gpurailon_null_host_test gpurailon_host_test.c && ./out/gpurailon_null_host_test
 +gcc -O1 -Wall -Wextra -Werror -I. -Iout -include out/board_config.h -o out/touch_host_test touch_host_test.c && ./out/touch_host_test
 +gcc -O1 -Wall -Wextra -Werror -DTOUCH_RAILS_WRITE -I. -Iout -include out/board_config.h -o out/acpm_host_test acpm_host_test.c && ./out/acpm_host_test
 +for v in 0 1; do gcc -O1 -Wall -Wextra -Werror -DRT_VERIFIED=$v -I. -Iout -include out/board_config.h -o out/rails_host_test$v rails_host_test.c && ./out/rails_host_test$v; done
@@ -315,9 +474,29 @@
 +chk "dvfsr object has no acpm_dvfs_set" sh -c '! nm out/acpm_dvfs_ro.o | grep -q acpm_dvfs_set'
 +gcc -O1 -w -DTOUCH_PROBE -DTOUCH_DVFS -DTOUCH_DVFS_WRITE -I. -Iout -include out/board_config.h -c -o out/acpm_dvfs_rw.o acpm.c
 +chk "dvfs object has acpm_dvfs_set" sh -c 'nm out/acpm_dvfs_rw.o | grep -q acpm_dvfs_set'
++# a --gpu-clk object has the GPU-only request path and NOT the CPU one; a plain one has neither
++gcc -O1 -w -DGPU_CLK -I. -Iout -include out/board_config.h -c -o out/acpm_gpuclk.o acpm.c
++chk "gpu-clk acpm object has acpm_dvfs_reassert and no acpm_dvfs_set" sh -c 'nm out/acpm_gpuclk.o | grep -q acpm_dvfs_reassert && ! nm out/acpm_gpuclk.o | grep -q acpm_dvfs_set'
++chk "acpm objects built without --gpu-clk have no acpm_dvfs_reassert" sh -c '! nm out/acpm_ro.o out/acpm_dvfs_ro.o out/acpm_dvfs_rw.o | grep -q acpm_dvfs_reassert'
 +# and the SHIPPED objects (built with the image's flags above): a read-only dvfs image must not carry the request path at all
-+if [ "$touch_dvfs" = 1 ] && [ $((touch_bits & 1024)) = 0 ]; then
++if [ "$touch_dvfs" = 1 ] && [ $((touch_bits & 1024)) = 0 ] && [ "$gpu_clk" = 0 ]; then
 +	chk "shipped acpm.o/touchprobe.o of a dvfsr image have no acpm_dvfs_set" sh -c '! nm out/acpm.o out/touchprobe.o | grep -q acpm_dvfs_set'
++fi
++if [ "$gpu_job" = 0 ]; then
++	chk "the image has no gpu_job_run / gpujob code (no --gpu-job)" sh -c '! nm out/shim.elf | grep -q "gpu_job_run\|gpu_job_scratch"'
++else
++	chk "the --gpu-job image has gpu_job_run" sh -c 'nm out/shim.elf | grep -q " T gpu_job_run"'
++fi
++if [ "$gpu_rail_on" = 0 ]; then
++	chk "shipped acpm.o has no acpm_s11_rail_set (no --gpu-rail-on): the S2MPG11 write is not in the image" sh -c '! nm out/acpm.o | grep -q acpm_s11_rail_set'
++else
++	chk "shipped acpm.o of a --gpu-rail-on image has acpm_s11_rail_set" sh -c 'nm out/acpm.o | grep -q acpm_s11_rail_set'
++fi
++if [ "$gpu_clk" = 0 ]; then
++	chk "shipped acpm.o has no acpm_dvfs_reassert (no --gpu-clk)" sh -c '! nm out/acpm.o | grep -q acpm_dvfs_reassert'
++else
++	chk "shipped acpm.o of a --gpu-clk image has acpm_dvfs_reassert" sh -c 'nm out/acpm.o | grep -q acpm_dvfs_reassert'
++	chk "shipped gpuclk.o has no MMIO accessor" sh -c '! nm out/gpuclk.o | grep -q "try_write32\|try_read32"'
 +fi
 +gcc -O1 -Wall -Wextra -Werror -I. -o out/udump_host_test udump.c udump_host_test.c && ./out/udump_host_test
 +# the debounce under test is the header shipped in xnu patch 0087 (new-file hunk: drop the leading "+")

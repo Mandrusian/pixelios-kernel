@@ -9,7 +9,7 @@
 cd "$(dirname "$0")/.." || exit 2
 mkdir -p shim/out; log=shim/out/gate.log; stamp=shim/out/gate.stamp; : > "$log"
 h=$(git rev-parse --short HEAD)$(git diff --quiet HEAD || echo "+dirty")
-ALL="build build-fast build-usb build-wlan build-gpu build-touch build-udump host-tests boot-safety unit phone-state hang-recover probe-run rootless public-split validate"
+ALL="build build-fast build-usb build-wlan build-gpu build-gpupower build-gpuclk build-gpurails build-gpurailon build-gpujob build-touch build-udump host-tests boot-safety unit phone-state hang-recover probe-run rootless public-split validate"
 quick=; [ "$1" = --quick ] && quick=1
 want=$ALL
 if [ -n "$quick" ]; then
@@ -32,8 +32,13 @@ laneA() {
 	step A build        bash -c 'cd shim && ./build.sh --board bluejay --avb'
 	step A build-fast   bash -c 'cd shim && ./build.sh --board bluejay --avb --pstore-fast'
 	step A build-usb    bash -c 'cd shim && ./build.sh --board bluejay --avb --usb-gadget'
-	step A build-wlan   bash -c 'cd shim && ./build.sh --board bluejay --avb --usb-gadget --wlan-probe'
+	step A build-wlan   bash -c 'cd shim && ./build.sh --board bluejay --avb --usb-gadget --wlan-probe && ./build.sh --board bluejay --avb --usb-gadget --wlan-probe --wlan-rails --wlan-en && ./build.sh --board bluejay --avb --usb-gadget --wlan-probe --wlan-smc-read && ./build.sh --board bluejay --avb --usb-gadget --wlan-probe --wlan-iso && ! ./build.sh --board bluejay --avb --usb-gadget --wlan-probe --wlan-iso --wlan-en'
 	step A build-gpu    bash -c 'cd shim && ./build.sh --board bluejay --avb --usb-gadget --gpu-probe'
+	step A build-gpupower bash -c 'cd shim && ./build.sh --board bluejay --avb --usb-gadget --gpu-probe --gpu-power && ./build.sh --board bluejay --avb --usb-gadget --gpu-probe --gpu-power=stack'
+	step A build-gpuclk bash -c 'cd shim && ./build.sh --board bluejay --avb --usb-gadget --gpu-probe --gpu-clk --gpu-power'
+	step A build-gpurails bash -c 'cd shim && ./build.sh --board bluejay --avb --usb-gadget --gpu-probe --gpu-rails'
+	step A build-gpurailon bash -c 'cd shim && ./build.sh --board bluejay --avb --usb-gadget --gpu-probe --gpu-rails --gpu-rail-on --gpu-power'
+	step A build-gpujob bash -c 'cd shim && ./build.sh --board bluejay --avb --usb-gadget --gpu-probe --gpu-s2mpu && ./build.sh --board bluejay --avb --usb-gadget --gpu-probe --gpu-job'
 	step A build-touch  bash -c 'cd shim && ./build.sh --board bluejay --avb --usb-gadget --touch-probe=run,mux,cs,osc,loop,rst,misopu,rails'
 	step A build-udump  bash -c 'cd shim && ./build.sh --board bluejay --avb --pstore-fast --udump 1'
 	step A host-tests   bash -c 'cd shim && for t in out/*_host_test out/host_test; do [ -x "$t" ] && "$t" || [ ! -x "$t" ] || exit 1; done'

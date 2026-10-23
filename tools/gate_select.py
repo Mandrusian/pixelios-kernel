@@ -3,9 +3,9 @@
 Usage: gate_select.py STAMP_FILE   -> prints the steps to run (space separated), or FULL when there is no usable stamp."""
 import subprocess, sys
 
-ALL = ["build", "build-fast", "build-usb", "build-wlan", "build-gpu", "build-touch", "build-udump", "host-tests", "boot-safety",
+ALL = ["build", "build-fast", "build-usb", "build-wlan", "build-gpu", "build-gpupower", "build-gpuclk", "build-gpurails", "build-gpurailon", "build-gpujob", "build-touch", "build-udump", "host-tests", "boot-safety",
        "unit", "phone-state", "hang-recover", "probe-run", "rootless", "public-split", "validate"]
-SHIM = ALL[:9]
+SHIM = ALL[:14]
 # build.sh also extracts headers from xnu patches 0087/0088 for its host tests
 SHIM_PREFIX = ("shim/", "soc/", "device/", "tools/imgmeta", "tools/mk", "tools/test-bluejay-boot.py",
                "tools/check-all.sh", "tools/gate_select.py", "xnu/patches/0087", "xnu/patches/0088")

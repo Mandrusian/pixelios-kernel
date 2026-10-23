@@ -145,6 +145,13 @@ int acpm_describe(const struct acpm_cfg *c, struct acpm_chan *h);	/* reads only 
 int acpm_chan_id(const struct acpm_cfg *c, const struct acpm_chan *h, uint32_t idx, uint32_t *id);	/* after why == ACPM_W_NOCH: table[idx].id */
 int acpm_qword(const struct acpm_cfg *c, const struct acpm_chan *h, int rsp, uint32_t i, uint32_t *v);
 int acpm_pmic_read(const struct acpm_cfg *c, uint32_t reg, uint32_t *val, struct acpm_trace *t);
+/* S2MPG11 register read (soc.json acpm.s2mpg11 only; refuses a register not listed there or an unknown config), for --gpu-rails */
+int acpm_s11_read(const struct acpm_cfg *c, uint32_t reg, uint32_t *val, struct acpm_trace *t);
+/* S2MPG10 register read of the four PCIe-PHY LDO control registers of soc.json wlan (s10_l16m..l19m_ctrl only), for --wlan-rails (docs/research/29); no PMIC write is expressible */
+int acpm_s10_read(const struct acpm_cfg *c, uint32_t reg, uint32_t *val, struct acpm_trace *t);
+/* GPU_RAIL_ON images only (--gpu-rail-on): switch the mode field of S2MPG11 BUCK2S_CTRL (soc.json acpm.s2mpg11.rail_on): on = off -> on-normal (only from exactly 'off' and
+ * with OUT1 inside the window, *out1 = OUT1), off = restore to off (nothing to do if already off: ACPM_E_ON). t->a = pre-read, t->b = the update (or the refusal). The only S2MPG11 write. */
+int acpm_s11_rail_set(const struct acpm_cfg *c, int on, struct acpm_trace *t, uint32_t *out1);
 /* reg must be a configured rail register and val == mask == 0x80 (set bit 7, never clear): no generic poke */
 int acpm_pmic_update(const struct acpm_cfg *c, uint32_t reg, uint32_t val, uint32_t mask, struct acpm_trace *t);
 
@@ -162,3 +169,5 @@ int acpm_dvfs_ndom(void);			/* number of configured domains (0 if none) */
 int acpm_dvfs_dom(int i, uint32_t *idx);	/* the i-th configured domain's index */
 int acpm_dvfs_get(const struct acpm_cfg *c, uint32_t dom, uint32_t *khz, struct acpm_trace *t);
 int acpm_dvfs_set(const struct acpm_cfg *c, uint32_t dom, uint32_t khz, struct acpm_trace *t);
+/* GPU_CLK images only: like acpm_dvfs_set for G3D (5) / G3DL2 (6) ONLY, but the request is also sent when the pre-read equals khz. */
+int acpm_dvfs_reassert(const struct acpm_cfg *c, uint32_t dom, uint32_t khz, struct acpm_trace *t);
