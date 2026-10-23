@@ -1,14 +1,14 @@
 ---
 id: TP-016
 tool: "tools/phone-lock"
-status: proposed
+status: done
 proposed_by: "Claude Sonnet 5.5 (driver)"
 date: 2026-10-23
 exposed_by: "session 22: Wi-Fi bring-up (wip/w3a-wlan-link) and GPU work (separate branch) both need the one Pixel 6a"
 extends: ""
 related: "TP-015"
 usage: "tools/phone-lock {acquire --owner NAME [--wait S] [--ttl S] | release --owner NAME | status | force-release --yes}"
-refs: "-"
+refs: "edab5c7 (wip/w3a-wlan-link); wrappers for probe-run/xrun/fboot not applied, use phone-lock run"
 ---
 
 ## checked

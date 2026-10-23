@@ -35,4 +35,4 @@ Status values: proposed, approved, building, done, rejected, superseded.
 | TP-013 | tools/mg-key NAME... [--dsc CACHE] | done (amended) |
 | TP-014 | tools/lint-c | done (amended) |
 | TP-015 | tools/probe-run-timeout | proposed (amended) |
-| TP-016 | tools/phone-lock | proposed |
+| TP-016 | tools/phone-lock | done |
