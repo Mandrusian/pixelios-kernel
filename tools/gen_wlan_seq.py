@@ -31,8 +31,9 @@ SOC = ROOT / "soc/google/gs101/soc.json"
 # the Broadcom DHD tree (research 32 s.5b, fetched 2026-10-23, GPLv2 reference, not in git): chip-side config register names; absent refs make the generator fail like any other missing source
 REFS2 = Path(os.environ.get("WLAN_REFS2", str(REFS.parent / "wlan-stage2")))
 PCICFG = REFS2 / "include_pcicfg.h"
+PCIR = REFS2 / "pci_regs.h"	# copy of the host /usr/include/linux/pci_regs.h, linux-libc-dev 6.12.113-1 (sha-pinned below)
 DHDP, SIU, AIU = REFS2 / "dhd_pcie.c", REFS2 / "siutils.c", REFS2 / "aiutils.c"
-SRC_NAMES = {PCICFG: "bcm4389/include_pcicfg.h", DHDP: "bcm4389/dhd_pcie.c", SIU: "bcm4389/siutils.c", AIU: "bcm4389/aiutils.c", CAL: "cal.c", RC: "rc.c", RCH: "rc.h", COM: "common.h", DT_PCIE: "pcie.dtsi", DT_COMMON: "common.dtsi", DT_PINCTRL: "pinctrl.dtsi", DT_WLAN: "wlan.dtsi", DHD: "dhd_cg.c"}
+SRC_NAMES = {PCIR: "linux/pci_regs.h", PCICFG: "bcm4389/include_pcicfg.h", DHDP: "bcm4389/dhd_pcie.c", SIU: "bcm4389/siutils.c", AIU: "bcm4389/aiutils.c", CAL: "cal.c", RC: "rc.c", RCH: "rc.h", COM: "common.h", DT_PCIE: "pcie.dtsi", DT_COMMON: "common.dtsi", DT_PINCTRL: "pinctrl.dtsi", DT_WLAN: "wlan.dtsi", DHD: "dhd_cg.c"}
 KINDS = ("gpio_dat", "gpio_con", "mmio_rmw", "mmio_write", "smc_iso", "delay", "wait_eq", "wait_mask", "read_only")
 BLOCKS = ("GPP14", "GPH2", "PMA", "PCS", "ELBI", "IA", "DBI", "PMU", "ATU", "CFG")
 FULL = 0xFFFFFFFF
@@ -494,12 +495,12 @@ def build():
     add(23, "wait_eq", "ELBI", ev("PCIE_ELBI_RDLH_LINKUP"), ev("PCIE_ELBI_LTSSM_STATE_MASK"), ev("S_L0"), us=12, polls=ev("MAX_TIMEOUT"), cite=f"rc.c:{lw}-{lw + 9} (MAX_TIMEOUT common.h:20 polls of usleep_range(10, 12))", note="LTSSM == L0")
 
     # ---- S24: READ-ONLY link report (explicit --wlan-link=24 only). Every row: DBI/ELBI read, logged as `LINK R24 row=<i> rd=0x..`. No write, no teardown row. DBI was probed at S19. ----
-    PCI_REGS = "/usr/include/linux/pci_regs.h"
+    PCI_REGS = "linux/pci_regs.h"
     GEN = REFS / "dwc-generic"
 
     def gc(path, rx, start=1):
         n = find_line(path, rx, start)
-        return f"{path.parent.name}/{path.name}:{n}"
+        return f"{SRC_NAMES[path] if path == PCIR else path.parent.name + chr(47) + path.name}:{n}"	# PCIR keeps its old cite name linux/pci_regs.h
     own = gc(RC, r"rd_own_conf\(pp, PCI_VENDOR_ID, 4, &val\)", 3400)
     pcc = gc(RC, r"rc_dbi_base \+ PCI_CAPABILITY_LIST")
     pmo, pco = gc(RCH, r"define PM_CAP_OFFSET\s+0x40"), gc(RCH, r"define PCIE_CAP_OFFSET\s+0x70")
@@ -575,7 +576,7 @@ def build():
     # ---- S27: READ-ONLY endpoint config dump (research 32 s.4.2 "step A") through the CFG window S26 left enabled (block already probed in S26), then iATU outbound region 1 reset values (ATU probed in S25).
     # Every row is a 32-bit read printed as `LINK R27 row=<i> rd=0x..`; no write, no restore, no teardown row (S26's ATU teardown covers the run). An offset is a row only if its source is cited, or it is tagged guess with the capability-walk cite (0x40-0x7C, 0xC0-0xFC).
     # 0x8C-0xA8 are DELIBERATELY NOT read: 0xA4 PCI_BACKPLANE_DATA (include_pcicfg.h:496-497) is a backplane access (a read can touch the backplane), 0x90/0x98 are interrupt/mailbox registers (:493, :495); 0xAC (candidate PCIe capability header) is kept. ----
-    PCIP = Path(PCI_REGS)
+    PCIP = PCIR
     pcr = lambda nm: gc(PCIP, r"define " + nm + r"\s")
     pcg = lambda rx: anchor(PCICFG, find_line(PCICFG, rx), rx)
     rcw = lambda nm: gc(RCH, r"define " + nm + r"\s+0x")
