@@ -2861,7 +2861,7 @@ def check_wlan_seq_table(doc: dict, header: str, pin: str | None = _WLAN_SEQ_SHA
     # every write is inside the allowlist; every write kind has bounded parameters; every row has a cite and a valid tag
     wr = [x for x in rows + tear if x["kind"] in _WLAN_WRITE_KINDS]
     for x in wr:
-        if not _wlan_row_allowed(x["blk"], x["off"], x["mask"]):
+        if not _wlan_row_allowed(x["blk"], x["off"], x["mask"]) or (x["kind"] == "mmio_write" and x["mask"] != 0xFFFFFFFF):  # twin of w32: a full write needs a whole-word mask
             raise AssertionError(f"{name}: {x['id']} writes {x['blk']}+{x['off']:#x} mask {x['mask']:#x}, outside the allowlist")
     for x in rows + tear:
         if not x["cite"] or x["tag"] not in ("read from source", "observed", "guess") or x["delay_us"] > 250000 or x["polls"] > 20000:
@@ -2932,6 +2932,10 @@ def wlan_seq_selftest() -> int:
         add_row(d, step=22, kind="mmio_write", blk="ELBI", off=0x54, value=1, restore="T02")
         resha(d)
 
+    def f_partial_write(d):
+        add_row(d, blk="PMA", off=0x10, mask=0xFF, value=1)
+        resha(d)
+
     def f_dbi(d):
         add_row(d, blk="DBI", off=0x8BC, value=1, step=19)
         resha(d)
@@ -2941,7 +2945,7 @@ def wlan_seq_selftest() -> int:
         resha(d)
 
     def f_iso_last(d):
-        d["teardown"].append(dict(d["teardown"][0], id=f"T{len(d['teardown']) + 1:02d}", blk="PMA", off=0x400, kind="mmio_write", requires=8))
+        d["teardown"].append(dict(d["teardown"][0], id=f"T{len(d['teardown']) + 1:02d}", blk="PMA", off=0x400, kind="mmio_write", mask=0xFFFFFFFF, requires=8))
         resha(d)
 
     def f_other_smc(d):
@@ -2956,6 +2960,7 @@ def wlan_seq_selftest() -> int:
     cases = [
         ("an extra write beyond a window", f_extra_pa, None, "outside the allowlist"),
         ("an extra pin of a GPIO bank", f_other_pin, None, "outside the allowlist"),
+        ("a partial-mask mmio_write", f_partial_write, None, "outside the allowlist"),
         ("an extra DBI register", f_dbi, None, "outside the allowlist"),
         ("PERST raised inside the default run", f_perst_early, None, "default run"),
         ("rows for the UNKNOWN step S22", f_unknown_row, None, "step coverage"),
