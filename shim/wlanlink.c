@@ -3,7 +3,7 @@
  *
  * Every value it uses comes from out/wlan_seq.h = soc/google/gs101/wlan_seq.json (tools/gen_wlan_seq.py, cites per row in the JSON). This file adds an INDEPENDENT allowlist (w32_allowed: blocks, offsets,
  * pin masks), so a corrupted table or index cannot write anywhere else, and the runtime rules:
- *  - a block (PMA, PCS, ELBI, IA, DBI) is touched only after its probe row (a fault-guarded READ) succeeded in this run (docs/research/29 section 14: first unreadable => stop);
+ *  - a block (PMA, PCS, ELBI, IA, DBI, ATU) is touched only after its probe row (a fault-guarded READ) succeeded in this run (docs/research/29 section 14: first unreadable => stop);
  *  - rows are executed in table order, the run stops at the first failing row, the teardown always runs for the steps that were started;
  *  - delays are bounded (<= 250 ms), polls are bounded by count AND by the counter.
  * Window sizes: GPP14/GPH2 banks = CON..PUDPDN (+0x00..+0x14, pinctrl-exynos-arm64.c:47-50), PMA 0x2000, PCS 0x1000, ELBI 0x2000, I/A 0x1000, DBI window 0x1000 (gs101-pcie.dtsi:57-63).
@@ -15,7 +15,7 @@
 #include "wlansmc.h"
 #include "wlanlink.h"
 
-#if SOC_GS101 && defined(WLAN_LINK_RUN) && defined(WLAN_GPP14) && defined(WLAN_GPH2) && defined(WLAN_PMA) && defined(WLAN_PCS) && defined(WLAN_ELBI) && defined(WLAN_IA) && defined(WLAN_DBI) && \
+#if SOC_GS101 && defined(WLAN_LINK_RUN) && defined(WLAN_GPP14) && defined(WLAN_GPH2) && defined(WLAN_PMA) && defined(WLAN_PCS) && defined(WLAN_ELBI) && defined(WLAN_IA) && defined(WLAN_DBI) && defined(WLAN_ATU) && \
 	defined(WLAN_PMU_ALIVE) && defined(WLAN_GPP14_EN_PIN) && defined(WLAN_GPH2_PERST_PIN)
 
 #include "wlan_seq.h"
@@ -147,6 +147,8 @@ static uintptr_t base_of(unsigned blk)
 		return WLAN_DBI;
 	if (blk == WLB_PMU)
 		return WLAN_PMU_ALIVE;
+	if (blk == WLB_ATU)
+		return WLAN_ATU;
 	return 0;
 }
 
@@ -156,7 +158,7 @@ static uint32_t size_of(unsigned blk)
 		return 0x18u;
 	if (blk == WLB_PMA || blk == WLB_ELBI)
 		return 0x2000u;
-	if (blk == WLB_PCS || blk == WLB_IA || blk == WLB_DBI)
+	if (blk == WLB_PCS || blk == WLB_IA || blk == WLB_DBI || blk == WLB_ATU)
 		return 0x1000u;
 	if (blk == WLB_PMU)
 		return 0x4000u;
@@ -166,7 +168,7 @@ static uint32_t size_of(unsigned blk)
 /* the blocks that may only be touched after their probe read worked */
 static unsigned need_probe(unsigned blk)
 {
-	return (blk == WLB_PMA || blk == WLB_PCS || blk == WLB_ELBI || blk == WLB_IA || blk == WLB_DBI) ? 1u << blk : 0u;
+	return (blk == WLB_PMA || blk == WLB_PCS || blk == WLB_ELBI || blk == WLB_IA || blk == WLB_DBI || blk == WLB_ATU) ? 1u << blk : 0u;
 }
 
 static uintptr_t pa_of(unsigned blk, uint32_t off)

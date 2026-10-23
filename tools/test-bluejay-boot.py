@@ -2791,12 +2791,12 @@ def wlansmc_object_selftest(obj_path: pathlib.Path, iso: bool = False) -> int:
 
 
 # ---- --wlan-link: the table (soc/google/gs101/wlan_seq.json -> out/wlan_seq.h), the interpreter wlanlink.c, the objects (docs/research/29 section 14) ----
-_WLAN_SEQ_SHA = "86b55942e43315328bb998a16e03b9d918c2010d3826481e6f011f7b4994df08"
-_WLAN_SEQ_COUNTS = {"rows": 252, "teardown": 28, "write_rows": 237, "distinct_targets": 176}
+_WLAN_SEQ_SHA = "f27e4544e23092e459c6f6b896be611dbbfb19cddd08c78b27bf534e980f6c4e"
+_WLAN_SEQ_COUNTS = {"rows": 267, "teardown": 28, "write_rows": 237, "distinct_targets": 176}
 _WLAN_SEQ_TARGET_BLOCKS = {"DBI": 1, "ELBI": 12, "GPH2": 6, "GPP14": 2, "IA": 37, "PCS": 5, "PMA": 113}
 FULL_MASK = 0xFFFFFFFF
 _WLAN_WRITE_KINDS = ("gpio_dat", "gpio_con", "mmio_rmw", "mmio_write")
-_WLAN_WIN = {"GPP14": 0x18, "GPH2": 0x18, "PMA": 0x2000, "PCS": 0x1000, "ELBI": 0x2000, "IA": 0x1000, "DBI": 0x1000, "PMU": 0x4000}
+_WLAN_WIN = {"GPP14": 0x18, "GPH2": 0x18, "PMA": 0x2000, "PCS": 0x1000, "ELBI": 0x2000, "IA": 0x1000, "DBI": 0x1000, "PMU": 0x4000, "ATU": 0x1000}
 _WLAN_ELBI_OK = {0x054, 0x080, 0x388, 0x3A0, 0x3A4, 0x3A8, 0x3BC, 0x474, 0x1078, 0x1400, 0x1404, 0x1408}
 _WLAN_HDR_ROW = re.compile(r"\{ (\d+)u, WLK_(\w+), WLB_(\w+), (0x[0-9a-f]+)u, (0x[0-9a-f]+)u, (0x[0-9a-f]+)u, (\d+)u, (\d+)u \},")
 
@@ -2846,8 +2846,8 @@ def check_wlan_seq_table(doc: dict, header: str, pin: str | None = _WLAN_SEQ_SHA
         raise AssertionError(f"{name}: out/wlan_seq.h differs from the JSON table")
     # coverage
     steps = sorted({r["step"] for r in rows})
-    if steps != list(range(0, 25)) or any(u["step"] == 22 for u in doc["unknown"]) is False or doc["last_step"] != 24 or doc["default_last_step"] != 19:
-        raise AssertionError(f"{name}: step coverage must be S00..S24 with S22 a documented skip (unknown text kept), last 24, default 19: {steps}")
+    if steps != list(range(0, 26)) or any(u["step"] == 22 for u in doc["unknown"]) is False or doc["last_step"] != 25 or doc["default_last_step"] != 19:
+        raise AssertionError(f"{name}: step coverage must be S00..S25 with S22 a documented skip (unknown text kept), last 25, default 19: {steps}")
     # S22 (RC setup) is a DOCUMENTED SKIP (driver decision 2026-10-23): exactly one row, a 0 us delay, no write, tagged guess, saying so; its blocker text stays in `unknown`
     s22 = [r for r in rows if r["step"] == 22]
     if len(s22) != 1 or s22[0]["kind"] != "delay" or s22[0]["delay_us"] != 0 or s22[0]["tag"] != "guess" or s22[0]["blk"] is not None or "deliberately skipped" not in s22[0].get("note", "") \
@@ -2857,13 +2857,27 @@ def check_wlan_seq_table(doc: dict, header: str, pin: str | None = _WLAN_SEQ_SHA
     s23 = [(r["kind"], r["blk"], r["off"], r["mask"], r["value"], r["delay_us"], r["polls"]) for r in rows if r["step"] == 23]
     if s23 != [("mmio_write", "ELBI", 0x54, FULL_MASK, 1, 0, 0), ("wait_eq", "ELBI", 0x2C8, 0x3F, 0x11, 12, 4800)]:
         raise AssertionError(f"{name}: S23 must be exactly LTSSM enable (ELBI 0x54 = 1) and the L0 wait (ELBI 0x2C8 & 0x3F == 0x11, 4800 polls x 12 us): {s23}")
+    # a block that needs a probe (PMA PCS ELBI IA DBI ATU) is never touched by a row before its probe row (the interpreter refuses it at run time; this is the table twin)
+    seen = set()
+    for r in rows:
+        if r["blk"] in ("PMA", "PCS", "ELBI", "IA", "DBI", "ATU"):
+            if r.get("probe"):
+                seen.add(r["blk"])
+            elif r["blk"] not in seen:
+                raise AssertionError(f"{name}: row {r['id']} (S{r['step']:02d}) touches {r['blk']} before its probe row")
     # S24: the READ-ONLY link report (explicit --wlan-link=24 only): the pinned DBI / ELBI offsets, every row read_only + log (a = 2, never a probe), no write kind, no restore, nothing else in the step
     s24 = [(r["kind"], r["blk"], r["off"], r.get("log"), r.get("probe"), r["restore"]) for r in rows if r["step"] == 24]
     s24_offs = [("DBI", o) for o in (0x000, 0x004, 0x008, 0x034, 0x040, 0x070, 0x07C, 0x080, 0x0A0, 0x710, 0x80C, 0x890)] + [("ELBI", 0x2C8)]
     if s24 != [("read_only", b, o, True, None, None) for b, o in s24_offs]:
         raise AssertionError(f"{name}: S24 must be exactly the 13 read_only log rows {s24_offs}, no write, no probe, no restore: {s24}")
-    if any(r.get("log") and (r["kind"] != "read_only" or r.get("probe") or r["step"] != 24) for r in rows + tear) or any("log" in t for t in tear):
-        raise AssertionError(f"{name}: the log flag is only for the non-probe read_only rows of S24")
+    # S25: READ-ONLY iATU layout (explicit --wlan-link=25 only): DBI words, then the ATU block probe (a guarded read, not logged), then outbound region 0 CR1..UPPER_TARGET, then ELBI 0x2C8; all log, no write, no restore
+    s25 = [(r["kind"], r["blk"], r["off"], r.get("log"), r.get("probe"), r["restore"]) for r in rows if r["step"] == 25]
+    s25_want = [("read_only", "DBI", o, True, None, None) for o in (0x018, 0x03C, 0x8BC, 0x8F8, 0x8FC, 0x900)] + [("read_only", "ATU", 0x000, None, True, None)] + \
+               [("read_only", "ATU", o, True, None, None) for o in (0x000, 0x004, 0x008, 0x00C, 0x010, 0x014, 0x018)] + [("read_only", "ELBI", 0x2C8, True, None, None)]
+    if s25 != s25_want:
+        raise AssertionError(f"{name}: S25 must be exactly the DBI words, the ATU probe, ATU 0x000..0x018 and ELBI 0x2C8, read_only, logged (the probe not), no write, no restore: {s25}")
+    if any(r.get("log") and (r["kind"] != "read_only" or r.get("probe") or r["step"] not in (24, 25)) for r in rows + tear) or any("log" in t for t in tear):
+        raise AssertionError(f"{name}: the log flag is only for the non-probe read_only rows of S24 and S25")
     if [r["step"] for r in rows] != sorted(r["step"] for r in rows) or [r["id"] for r in rows] != list(range(len(rows))):
         raise AssertionError(f"{name}: rows must be in step order with sequential ids")
     # the default run (N = 19) must not release PERST nor enable the LTSSM
@@ -2971,7 +2985,7 @@ def wlan_seq_selftest() -> int:
         resha(d)
 
     def f_step_overflow(d):
-        add_row(d, step=25)
+        add_row(d, step=26)
         resha(d)
 
     def first_row(d, step, **sel):
@@ -2982,6 +2996,23 @@ def wlan_seq_selftest() -> int:
             first_row(d, step, **sel)[key] = val
             resha(d)
         return f
+
+    def f_atu_write(d):
+        d["teardown"].append(dict(d["teardown"][0], id=f"T{len(d['teardown']) + 1:02d}", blk="ATU", off=0x8, kind="mmio_write", mask=0xFFFFFFFF, requires=8))
+        resha(d)
+
+    def f_atu_probe_late(d):
+        i = next(n for n, r in enumerate(d["rows"]) if r["step"] == 25 and r.get("probe"))
+        d["rows"][i], d["rows"][i + 1] = d["rows"][i + 1], d["rows"][i]
+        for n, r in enumerate(d["rows"]):
+            r["id"] = n
+        resha(d)
+
+    def f_s25_removed(d):
+        d["rows"].remove(first_row(d, 25, off=0x8F8))
+        for n, r in enumerate(d["rows"]):
+            r["id"] = n
+        resha(d)
 
     def f_s24_removed(d):
         d["rows"].remove(first_row(d, 24, off=0x70))
@@ -3009,6 +3040,13 @@ def wlan_seq_selftest() -> int:
         ("log flag on a non-S24 read_only row", set_row(16, "log", True, kind="read_only"), None, "log flag"),
         ("an S24 row removed", f_s24_removed, None, "S24 must be exactly"),
         ("an S24 row changed (offset)", set_row(24, "off", 0x74, off=0x70), None, "S24 must be exactly"),
+        ("an ATU write row", f_atu_write, None, "outside the allowlist"),
+        ("the ATU probe flag removed", set_row(25, "probe", False, blk="ATU", off=0), None, "before its probe row"),
+        ("the ATU probe moved after its first read", f_atu_probe_late, None, "before its probe row"),
+        ("an S25 row removed", f_s25_removed, None, "S25 must be exactly"),
+        ("an S25 row changed (offset)", set_row(25, "off", 0x20, blk="ATU", off=0x18), None, "S25 must be exactly"),
+        ("an S25 row turned to ELBI", set_row(25, "blk", "ELBI", blk="ATU", off=0x14), None, "S25 must be exactly"),
+        ("log flag on the S25 ATU probe", set_row(25, "log", True, blk="ATU", probe=True), None, "S25 must be exactly"),
         ("an S24 row without the log flag", set_row(24, "log", False, off=0x70), None, "S24 must be exactly"),
         ("a changed value (hash pin)", lambda d: (d["rows"][7].__setitem__("value", 2), resha(d)), _WLAN_SEQ_SHA, "audited"),
     ]
@@ -3057,7 +3095,7 @@ _WLANLINK_PINS = {
                    "if(pa>=WLAN_PMA&&pa<WLAN_PMA+0x2000u)return!(pa&3u);if(pa>=WLAN_PCS&&pa<WLAN_PCS+0x1000u)return!(pa&3u);if(pa>=WLAN_IA&&pa<WLAN_IA+0x180u)return!(pa&3u);"
                    "if(pa>=WLAN_ELBI&&pa<WLAN_ELBI+0x2000u)returnelbi_ok((uint32_t)(pa-WLAN_ELBI));if(pa==WLAN_DBI+0x890u)return1;return0;",
     "elbi_ok": "returnoff==0x054u||off==0x080u||off==0x388u||off==0x3a0u||off==0x3a4u||off==0x3a8u||off==0x3bcu||off==0x474u||off==0x1078u||off==0x1400u||off==0x1404u||off==0x1408u;",
-    "size_of": "if(blk==WLB_GPP14||blk==WLB_GPH2)return0x18u;if(blk==WLB_PMA||blk==WLB_ELBI)return0x2000u;if(blk==WLB_PCS||blk==WLB_IA||blk==WLB_DBI)return0x1000u;if(blk==WLB_PMU)return0x4000u;return0u;",
+    "size_of": "if(blk==WLB_GPP14||blk==WLB_GPH2)return0x18u;if(blk==WLB_PMA||blk==WLB_ELBI)return0x2000u;if(blk==WLB_PCS||blk==WLB_IA||blk==WLB_DBI||blk==WLB_ATU)return0x1000u;if(blk==WLB_PMU)return0x4000u;return0u;",
     "gpio_field_mask": "uint32_tm=0,w;if(off==0x00u||off==0x08u||off==0x0cu||off==0x14u)w=4u;elseif(off==0x04u)w=1u;elseif(off==0x10u)w=2u;elsereturn0;for(unsignedpin=0;pin<8u;pin++)if(pins&(1u<<pin))m|=((1u<<w)-1u)<<(pin*w);returnm;",
 }
 
@@ -3068,8 +3106,8 @@ _WLANLINK_BODY_SHA = {
     "get_row": "d73e01074e7c551f652a4322ee7bfde2a53d8f3c0a76087a53c8247c354406c9",
     "r32": "d03e22024c23e0221538c17949c0a45b92ceddaf055b9e1b6f2fcc4d7e6580ae",
     "pa_of": "9d86b866272f0aa42d1adb2ad38ddecf54d9bba0d5e69825d725eb95ec04a2a6",
-    "base_of": "0469f7f00771c93ec8ae6681e257e345b85db6f576adce7f1c8ac6acf7e14a50",
-    "need_probe": "f1cdcfd58982cc5be5d8b192ab4355a6dea79183379420c3cb529fbf050c89b8",
+    "base_of": "23e42b1fb83aa36fffc8695534e9bd4c4d12b0bc612cab4c4d9addc24d75b683",
+    "need_probe": "79e317912bc54a8afdc6bb993f9f41dc83546b5e6b963f009a0f2a3088311884",
     "delay_us": "10a70ec802b5fa345f4b514fa73dd3b1a3e383a977aedb6f4f5f1271c386dfcd",
     "poll_row": "2bab73a5704648f41011acc830dfa02985d0a67c197f790eb79765ab0b5a6877",
     "run_row": "b65add0b34e68bbba31b7a53502b011888083742fef68ef26555a0faa910d57a",
@@ -3175,6 +3213,9 @@ def wlanlink_source_selftest() -> int:
         ("no probe needed", good.replace("return (blk == WLB_PMA || blk == WLB_PCS", "return 0u && (blk == WLB_PMA || blk == WLB_PCS", 1)),
         ("pa_of without the window bound", good.replace(" || off >= size_of(blk))", ")", 1)),
         ("swapped block base", good.replace("return WLAN_PCS;", "return WLAN_PMA;", 1)),
+        ("ATU needs no probe", good.replace(" || blk == WLB_DBI || blk == WLB_ATU) ? 1u << blk : 0u;", " || blk == WLB_DBI) ? 1u << blk : 0u;", 1)),
+        ("ATU base swapped", good.replace("return WLAN_ATU;", "return WLAN_DBI;", 1)),
+        ("allowlist: ATU window writable", good.replace("\tif (pa == WLAN_DBI + 0x890u)", "\tif (pa >= WLAN_ATU && pa < WLAN_ATU + 0x1000u)\n\t\treturn !(pa & 3u);\n\tif (pa == WLAN_DBI + 0x890u)", 1)),
         ("value tweaked after the allowlist", good.replace("\treturn try_write32(pa, v) ? 0 : -1;", "\tv |= 0x80u;\n\treturn try_write32(pa, v) ? 0 : -1;", 1)),
         ("partial-mask full write allowed", good.replace("r.kind == WLK_MMIO_WRITE && r.mask != 0xFFFFFFFFu", "0", 1)),
         ("GPIO read-back removed", good.replace("\t\tif ((v & r.mask) != (r.val & r.mask))\n\t\t\treturn ST_FAULT;", "", 1)),
@@ -3196,7 +3237,7 @@ def wlanlink_source_selftest() -> int:
     return caught
 
 
-def check_wlan_link_n(effective: int, explicit: str | None, default: int = 19, last: int = 24) -> None:
+def check_wlan_link_n(effective: int, explicit: str | None, default: int = 19, last: int = 25) -> None:
     """Build-time policy: an image whose effective step bound N is >= 20 (PERST release, LTSSM enable) is accepted ONLY when the builder typed `--wlan-link=N` with exactly that N; anything without an
     explicit N is the default run (N = default_last_step = 19: no PERST, no LTSSM). `effective` is read from the preprocessed wlanlink.c by shim/build.sh."""
     if not 0 <= effective <= last:
@@ -3235,10 +3276,10 @@ def wlan_link_n_selftest() -> int:
     root = pathlib.Path(__file__).resolve().parents[1]
     src, sh = (root / "shim" / "wlanlink.c").read_text(), (root / "shim" / "build.sh").read_text()
     check_wlan_link_n_sources(src, sh)  # control must pass
-    for eff, exp in ((19, None), (19, ""), (7, "7"), (20, "20"), (23, "23"), (24, "24")):
+    for eff, exp in ((19, None), (19, ""), (7, "7"), (20, "20"), (23, "23"), (24, "24"), (25, "25")):
         check_wlan_link_n(eff, exp)
     caught = 0
-    bad_n = [(19, "20"), (20, None), (21, ""), (23, "22"), (24, None), (25, "25"), (24, "23"), (20, "x"), (22, "019")]
+    bad_n = [(19, "20"), (20, None), (21, ""), (23, "22"), (24, None), (25, None), (26, "26"), (25, "24"), (24, "23"), (20, "x"), (22, "019")]
     for eff, exp in bad_n:
         try:
             check_wlan_link_n(eff, exp)
@@ -3898,7 +3939,7 @@ def main() -> None:
     wlan_seq_selftest()
     _doc = json.loads((repo_root / "soc/google/gs101/wlan_seq.json").read_text())
     check_wlan_seq_table(_doc, (repo_root / "shim" / "out" / "wlan_seq.h").read_text())
-    print(f"PASS wlan_seq table audit: sha256 {_WLAN_SEQ_SHA[:16]} pinned; header == JSON; S00..S24 (S22 = one 0 us delay row, a documented skip); the default run (N=19) never raises PERST or enables the LTSSM; "
+    print(f"PASS wlan_seq table audit: sha256 {_WLAN_SEQ_SHA[:16]} pinned; header == JSON; S00..S25 (S22 = one 0 us delay row, a documented skip); the default run (N=19) never raises PERST or enables the LTSSM; "
           f"{_WLAN_SEQ_COUNTS['write_rows']} write rows on {_WLAN_SEQ_COUNTS['distinct_targets']} distinct registers in 7 blocks, all inside the allowlist; every write row has a restore")
     wlanlink_source_selftest()
     check_wlanlink_source_text((repo_root / "shim" / "wlanlink.c").read_text())

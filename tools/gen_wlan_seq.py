@@ -30,7 +30,7 @@ SOC = ROOT / "soc/google/gs101/soc.json"
 
 SRC_NAMES = {CAL: "cal.c", RC: "rc.c", RCH: "rc.h", COM: "common.h", DT_PCIE: "pcie.dtsi", DT_COMMON: "common.dtsi", DT_PINCTRL: "pinctrl.dtsi", DT_WLAN: "wlan.dtsi", DHD: "dhd_cg.c"}
 KINDS = ("gpio_dat", "gpio_con", "mmio_rmw", "mmio_write", "smc_iso", "delay", "wait_eq", "wait_mask", "read_only")
-BLOCKS = ("GPP14", "GPH2", "PMA", "PCS", "ELBI", "IA", "DBI", "PMU")
+BLOCKS = ("GPP14", "GPH2", "PMA", "PCS", "ELBI", "IA", "DBI", "PMU", "ATU")
 FULL = 0xFFFFFFFF
 TAG_SRC, TAG_GUESS = "read from source", "guess"
 
@@ -116,6 +116,8 @@ def check_dt():
     assert "num-lanes = <1>" in seg and 'use-ia = "true"' in seg and "EP_BCM_WIFI" in seg and 'use-phy-isol-en = "true"' in seg, "pcie_1 DT facts changed"
     assert "ip-ver = <0x984500>" in DT_PCIE.read_text()
     soc = json.loads(SOC.read_text())["wlan"]
+    assert re.search(r"0x0\s+0x14800000\s+0x301000\s*/\*\s*DBI base", DT_PCIE.read_text()), "pcie_1 DBI reg is no longer 0x14800000 size 0x301000"
+    assert int(soc["atu"], 0) == int(soc["dbi"], 0) + 0x300000, "soc.json wlan atu must be dbi + 0x300000 (pcie-designware.h:202 DEFAULT_DBI_ATU_OFFSET = 0x3 << 20; inside the 0x301000 DBI reg)"
     b = dt_blocks()
     want = {"elbi base": soc["elbi"], "phy base": soc["pma"], "sysreg base": soc["sysreg"], "DBI base": soc["dbi"], "phy pcs base": soc["pcs"], "I/A space": soc["ia"]}
     for k, v in want.items():
@@ -265,6 +267,7 @@ STEP_NAMES = {
     16: "soft power reset", 17: "ELBI device type", 18: "non-sticky reset", 19: "DBI 'EQ off'", 20: "PERST high  <-- the first step that lets the endpoint out of reset",
     21: "L1 / Q-channel / NAK options", 22: "RC setup (dw_pcie_setup_rc + exynos_pcie_setup_rc)  DELIBERATELY SKIPPED (one 0 us delay row; was UNKNOWN)", 23: "LTSSM enable and wait for L0",
     24: "READ-ONLY link report: negotiated link + capability chain of the RC, from its own DBI space (explicit --wlan-link=24 only; no writes)",
+    25: "READ-ONLY iATU layout (doc 31 Q2): DBI header/version/viewport words + the unrolled outbound region 0 registers at DBI+0x300000 (explicit --wlan-link=25 only; no writes)",
 }
 
 
@@ -510,6 +513,29 @@ def build():
     add(24, "read_only", "DBI", 0x890, cite=f"rc.c:{find_line(RC, r'exynos_pcie_rc_wr_own_conf.pp, 0x890, 4, 0x12000.', EL)} (the S19 write target)", note="read back what S19 wrote (0x12000 expected)", **log)
     add(24, "read_only", "ELBI", ev("PCIE_ELBI_RDLH_LINKUP"), cite=f"{gc(RCH, r'define PCIE_ELBI_RDLH_LINKUP\s+0x2C8')}; same register S23 waits on", note="LTSSM state again (low 6 bits; 0x11 = L0)", **log)
 
+    # ---- S25: READ-ONLY iATU layout (doc 31 Q2). New block ATU = DBI + 0x300000 (probed by a guarded read first). Every other row: read, logged. No write, no teardown row. DBI/ELBI were probed at S19. ----
+    pc = lambda path, rx, start=1: gc(path, rx, start)
+    dwh, dwc = GEN / "pcie-designware.h", GEN / "pcie-designware.c"
+    hostc = GEN / "pcie-designware-host.c"
+    ver_n, ver_t = pc(dwh, r"define PCIE_VERSION_NUMBER\s+0x8F8"), pc(dwh, r"define PCIE_VERSION_TYPE\s+0x8FC")
+    vd = find_line(dwc, r"readl_dbi\(pci, PCIE_VERSION_NUMBER\)")
+    vw = pc(dwh, r"define PCIE_ATU_VIEWPORT\s+0x900")
+    vdet = find_line(dwc, r"val = dw_pcie_readl_dbi\(pci, PCIE_ATU_VIEWPORT\)")
+    atu_off = pc(dwh, r"define DEFAULT_DBI_ATU_OFFSET \(0x3 << 20\)")
+    unr = pc(dwh, r"define PCIE_ATU_UNROLL_BASE")
+    add(25, "read_only", "DBI", 0x018, cite=f"{pc(hostc, r'dw_pcie_readl_dbi\(pci, PCI_PRIMARY_BUS\)')} (PCI_PRIMARY_BUS = 0x18, {PCI_REGS}:131; secondary 0x19 :132)", note="primary/secondary/subordinate bus numbers (low 24 bits); Linux sets 0x00ff0100 in dw_pcie_setup_rc", **log)
+    add(25, "read_only", "DBI", 0x03C, cite=f"{pc(hostc, r'dw_pcie_readl_dbi\(pci, PCI_INTERRUPT_LINE\)')} (PCI_INTERRUPT_LINE = 0x3c, {PCI_REGS}:125; PIN :126, BRIDGE_CONTROL 0x3e :161 = high half)", note="interrupt line/pin (low half) and bridge control (high half)", **log)
+    add(25, "read_only", "DBI", ev("PCIE_MISC_CONTROL"), cite=f"{gc(RCH, r'define PCIE_MISC_CONTROL\s+0x8BC')}, written {gc(RC, r'wr_own_conf.pp, PCIE_MISC_CONTROL, 4, DBI_RO_WR_EN')}", note="PCIE_MISC_CONTROL_1 (DBI_RO_WR_EN = bit 0)", **log)
+    add(25, "read_only", "DBI", 0x8F8, cite=f"{ver_n}, read dwc-generic/pcie-designware.c:{vd}-{vd + 12} (dw_pcie_version_detect)", note="DWC IP version number (ASCII, e.g. 0x3532302a = 5.20a; table DW_PCIE_VER_* pcie-designware.h:24-29); zero = older than 4.70a", **log)
+    add(25, "read_only", "DBI", 0x8FC, cite=f"{ver_t}, read dwc-generic/pcie-designware.c:{vd + 10}", note="DWC IP version type", **log)
+    add(25, "read_only", "DBI", 0x900, cite=f"{vw}, test dwc-generic/pcie-designware.c:{vdet}-{vdet + 1} (== 0xffffffff means unrolled iATU)", note="legacy iATU viewport: 0xFFFFFFFF = unrolled ATU (the Exynos driver hard-codes unrolled offsets, rc.h:286-308)", **log)
+    add(25, "read_only", "ATU", ev("PCIE_ATU_CR1_OUTBOUND0") - 0x300000, cite=f"{gc(RCH, r'define PCIE_ATU_CR1_OUTBOUND0\s+0x300000')}; ATU window = DBI + 0x300000 (DEFAULT_DBI_ATU_OFFSET = 0x3 << 20, {atu_off}), inside the 0x301000 DBI reg (pcie.dtsi:60)", probe=True, tag=TAG_GUESS, note="BLOCK PROBE: the first access to the iATU window (phys DBI + 0x300000 = 0x14B00000); unreadable = stop. That the window answers reads is a guess until measured", )
+    atu_regs = (("PCIE_ATU_CR1_OUTBOUND0", "CR1 (region type; 0x4 = CFG0 once programmed)"), ("PCIE_ATU_CR2_OUTBOUND0", "CR2 (bit 31 = region enable)"), ("PCIE_ATU_LOWER_BASE_OUTBOUND0", "LOWER_BASE"),
+                ("PCIE_ATU_UPPER_BASE_OUTBOUND0", "UPPER_BASE"), ("PCIE_ATU_LIMIT_OUTBOUND0", "LIMIT"), ("PCIE_ATU_LOWER_TARGET_OUTBOUND0", "LOWER_TARGET"), ("PCIE_ATU_UPPER_TARGET_OUTBOUND0", "UPPER_TARGET"))
+    for mac, what in atu_regs:
+        add(25, "read_only", "ATU", ev(mac) - 0x300000, cite=f"{gc(RCH, 'define ' + mac + r'\s+0x3000')} (DBI + 0x300000 + off; unroll stride 0x200 per region: {unr}-{int(unr.split(':')[1]) + 1})", note=f"outbound region 0 {what}", **log)
+    add(25, "read_only", "ELBI", ev("PCIE_ELBI_RDLH_LINKUP"), cite=f"{gc(RCH, r'define PCIE_ELBI_RDLH_LINKUP\s+0x2C8')}; same register S23 waits on", note="LTSSM state again (low 6 bits; 0x11 = L0)", **log)
+
     # ---- teardown (Linux rc_poweroff order, rc.c:3622-3669; PERST low, LTSSM off first; the isolation LAST) ----
     lp = find_line(RC, r"gpio_set_value\(exynos_pcie->perst_gpio, 0\)", 3560)
     add_t(20, "gpio_dat", "GPH2", pr["DAT"][0], 1, 0, cite=anchor(RC, lp, r"perst_gpio, 0"), note="PERST low", key="perst_low")
@@ -542,7 +568,7 @@ def finish():
     core = {"rows": rows, "teardown": tear}
     sha = hashlib.sha256(json.dumps(core, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     doc = {"_doc": "GENERATED by tools/gen_wlan_seq.py from ~/pixelios-artifacts/refs/wlan-stage1 (docs/research/29 sections 2 and 14); do not edit. sha256 covers rows + teardown and is pinned in tools/test-bluejay-boot.py.",
-           "table_sha256": sha, "sources_sha256_16": srcs, "default_last_step": 19, "last_step": 24, "steps": meta["steps"], "unknown": meta["unknown"],
+           "table_sha256": sha, "sources_sha256_16": srcs, "default_last_step": 19, "last_step": 25, "steps": meta["steps"], "unknown": meta["unknown"],
            "kinds": list(KINDS), "blocks": list(BLOCKS), "rows": rows, "teardown": tear}
     return doc
 

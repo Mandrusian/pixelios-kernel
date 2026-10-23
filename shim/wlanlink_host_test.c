@@ -2,7 +2,7 @@
  * level), plain register files for PMA / PCS / ELBI / I/A / DBI that read back what was written, lock bits that appear after k polls, the PMU isolation word behind a fake of the two EL3 steps
  * (wlan_link_iso_set / _clear), and fault / timeout / ignored-write injection. Built once per N (-DWLAN_LINK_N=7|8|10|19|20|21|22|23|24), see build.sh. Checks: the default run (N = 19) never raises PERST,
  * never enables the LTSSM and ends with the pins, the isolation and the PHY back where they were; N = 20 / 21 add the PERST release and the options; N = 22 adds the documented S22 skip (one 0 us delay row, no write); N = 23 enables the LTSSM and waits for L0 (fake: ELBI 0x2C8 == 0x11
- * after k polls, never, or a read fault), with a fault injected at EVERY forward write row and the teardown checked against the table order; N = 24 adds S24, read-only rows whose `log` flag prints `LINK R24 row=<i> rd=0x..` (the link report), no write, teardown unchanged; every failure branch (unreadable probe, lock timeout, write fault, refused / failed isolation, failed restore) stops, tears down in the table order with the isolation clear LAST and is
+ * after k polls, never, or a read fault), with a fault injected at EVERY forward write row and the teardown checked against the table order; N = 25 adds S25 (read-only iATU layout: DBI words + the ATU block probe + ATU region 0 + ELBI, `LINK R25` lines); N = 24 adds S24, read-only rows whose `log` flag prints `LINK R24 row=<i> rd=0x..` (the link report), no write, teardown unchanged; every failure branch (unreadable probe, lock timeout, write fault, refused / failed isolation, failed restore) stops, tears down in the table order with the isolation clear LAST and is
  * loud; the writer's independent allowlist refuses every other register. Uses the REAL generated board macros and out/wlan_seq.h. Build (also run by build.sh):
  *   gcc -O1 -Wall -Wextra -Werror -DWLAN_LINK_RUN -DWLAN_LINK_N=19 -I. -Iout -include out/board_config.h -o out/wlanlink_host_test19 wlanlink_host_test.c */
 #include <assert.h>
@@ -15,8 +15,10 @@
 #ifndef WLAN_LINK_N
 #define WLAN_LINK_N 19
 #endif
-/* S24 reads ELBI 0x2C8 once more, after the L0 wait: one extra poll of the L0 fake */
-#if WLAN_LINK_N >= 24
+/* S24 and S25 each read ELBI 0x2C8 once more, after the L0 wait: one extra poll of the L0 fake each */
+#if WLAN_LINK_N >= 25
+#define L0X 2u
+#elif WLAN_LINK_N >= 24
 #define L0X 1u
 #else
 #define L0X 0u
@@ -31,7 +33,7 @@
 /* ---- fake SoC ---- */
 struct bank { uint32_t con, latch, ext, w[6]; };
 static struct bank gp14, gh2;
-static uint32_t pma[0x2000 / 4], pcs[0x1000 / 4], elbi[0x2000 / 4], ia[0x1000 / 4], dbi[0x1000 / 4];
+static uint32_t pma[0x2000 / 4], pcs[0x1000 / 4], elbi[0x2000 / 4], ia[0x1000 / 4], dbi[0x1000 / 4], atu[0x1000 / 4];
 static uint32_t iso1, iso0;
 static unsigned pll_after, cdr_after, oc_after, pll_cnt, cdr_cnt, oc_cnt, l0_after, l0_cnt, l0_polls;
 static int never_l0, fault_l0_read;
@@ -63,6 +65,7 @@ static uint32_t *cell(uintptr_t pa)
 	if (pa >= WLAN_ELBI && pa < WLAN_ELBI + 0x2000) return &elbi[(pa - WLAN_ELBI) / 4];
 	if (pa >= WLAN_IA && pa < WLAN_IA + 0x1000) return &ia[(pa - WLAN_IA) / 4];
 	if (pa >= WLAN_DBI && pa < WLAN_DBI + 0x1000) return &dbi[(pa - WLAN_DBI) / 4];
+	if (pa >= WLAN_ATU && pa < WLAN_ATU + 0x1000) return &atu[(pa - WLAN_ATU) / 4];
 	return NULL;
 }
 
@@ -78,7 +81,8 @@ static uint32_t dat_read(const struct bank *b)
 static int blk_unreadable(uintptr_t pa)
 {
 	return (unreadable_blk == 1 && pa >= WLAN_PMA && pa < WLAN_PMA + 0x2000) || (unreadable_blk == 2 && pa >= WLAN_IA && pa < WLAN_IA + 0x1000) ||
-	       (unreadable_blk == 3 && pa >= WLAN_ELBI && pa < WLAN_ELBI + 0x2000) || (unreadable_blk == 4 && pa >= WLAN_DBI && pa < WLAN_DBI + 0x1000);
+	       (unreadable_blk == 3 && pa >= WLAN_ELBI && pa < WLAN_ELBI + 0x2000) || (unreadable_blk == 4 && pa >= WLAN_DBI && pa < WLAN_DBI + 0x1000) ||
+	       (unreadable_blk == 5 && pa >= WLAN_ATU && pa < WLAN_ATU + 0x1000);
 }
 
 int try_read32(uintptr_t pa, uint32_t *v)
@@ -163,7 +167,7 @@ int wlan_link_iso_clear(uint32_t *rd)
 
 static void world(void)
 {
-	memset(pma, 0, sizeof(pma)); memset(pcs, 0, sizeof(pcs)); memset(elbi, 0, sizeof(elbi)); memset(ia, 0, sizeof(ia)); memset(dbi, 0, sizeof(dbi));
+	memset(pma, 0, sizeof(pma)); memset(pcs, 0, sizeof(pcs)); memset(elbi, 0, sizeof(elbi)); memset(ia, 0, sizeof(ia)); memset(dbi, 0, sizeof(dbi)); memset(atu, 0, sizeof(atu));
 	memset(&gp14, 0, sizeof(gp14)); memset(&gh2, 0, sizeof(gh2));
 	gp14.con = 0x33; gp14.ext = 0x3;			/* run w1: CON 0x33, DAT 0x3 */
 	gh2.con = 0; gh2.ext = 0x2;				/* PERST input low, CLKREQ high */
@@ -314,7 +318,7 @@ int main(void)
 {
 	struct wlan_row r;
 
-	EXPECT(WLAN_SEQ_LAST == 24 && WLAN_SEQ_DEFAULT_N == 19 && WLAN_SEQ_NROWS > 200 && WLAN_LINK_N <= WLAN_SEQ_LAST);
+	EXPECT(WLAN_SEQ_LAST == 25 && WLAN_SEQ_DEFAULT_N == 19 && WLAN_SEQ_NROWS > 200 && WLAN_LINK_N <= WLAN_SEQ_LAST);
 	/* the independent allowlist refuses every other register (a corrupted table / index cannot reach them) */
 	EXPECT(!w32_allowed(WLAN_GPP14 + 4, 1u << 3, 0, 0) && !w32_allowed(WLAN_GPP14 + 4, 1u << 2, 0, 1u << 3) && w32_allowed(WLAN_GPP14 + 4, 1u << 2, 0, 1u << 2));
 	EXPECT(!w32_allowed(WLAN_GPH2 + 4, 1u << 2, 0, 0) && w32_allowed(WLAN_GPH2 + 4, 3u, 0, 1) && !w32_allowed(WLAN_GPH2, 0xf00u, 0, 0) && !w32_allowed(WLAN_GPP14 + 0x18, 1, 0, 0));
@@ -360,7 +364,7 @@ int main(void)
 #endif
 	baseline_restored();
 #if WLAN_LINK_N < 24
-	EXPECT(!has("LINK R"));					/* the log flag exists only on the S24 rows */
+	EXPECT(!has("LINK R"));					/* the log flag exists only on the S24 / S25 rows */
 #endif
 	if (getenv("WLAN_DUMP")) {
 		for (unsigned i = 0; i < nl; i++)
@@ -433,7 +437,7 @@ int main(void)
 			EXPECT(has(b));
 		}
 		for (unsigned i = 0; i < nl; i++)
-			if (strstr(lines[i], "LINK R"))
+			if (strstr(lines[i], "LINK R24 "))
 				nR++;
 		EXPECT(nR == n24 && !has("LINK R23") && !has("LINK R19"));
 		teardown_tail_is_table_order(24);
@@ -441,6 +445,51 @@ int main(void)
 		world(); fault_read_pa = WLAN_DBI + 0x70;		/* an unreadable capability word stops S24 (fault at that row), teardown unchanged, restore ok */
 		EXPECT(wlan_link_run() == 1 && has("LINK S24 fault row=244") && has("stopped=fault at=S24 row=244 restore=ok") && !has("!!!") && has("LINK R24 row=243"));
 		teardown_tail_is_table_order(24);
+		baseline_restored();
+	}
+#endif
+#if WLAN_LINK_N >= 25
+	{	/* S25: READ-ONLY iATU layout: 6 DBI words, the ATU block probe (a == 1, not logged), ATU 0x000..0x018, ELBI 0x2C8; 14 `LINK R25` lines; the ATU window is never written */
+		unsigned n25 = 0, nR = 0, probe_row = 0, nprobe = 0, natu = 0;
+		uint32_t want;
+		unsigned wid[32];
+		char b[64];
+
+		world();
+		dbi[0x018 / 4] = 0x00010100u; dbi[0x03C / 4] = 0x000001FFu; dbi[0x8BC / 4] = 1u; dbi[0x8F8 / 4] = 0x3532302Au; dbi[0x8FC / 4] = 0x45703032u; dbi[0x900 / 4] = 0xFFFFFFFFu;
+		atu[0x00 / 4] = 0x4u; atu[0x04 / 4] = 0x80000000u; atu[0x08 / 4] = 0x60FFE000u; atu[0x10 / 4] = 0x60FFFFFFu; atu[0x14 / 4] = 0x01000000u; elbi[0x2C8 / 4] = 0x0300AA00u;
+		for (unsigned i = 0; i < WLAN_SEQ_NROWS; i++)
+			if (get_row(i, 0, &r) && r.step == 25) {
+				EXPECT(r.kind == WLK_READ_ONLY && (r.blk == WLB_DBI || r.blk == WLB_ATU || r.blk == WLB_ELBI) && n25 < 32);
+				EXPECT(r.a == (r.blk == WLB_ATU && r.off == 0u && !nprobe ? 1u : 2u));	/* the first ATU 0x000 row is the probe, every other one logs */
+				if (r.a == 1u)
+					nprobe++, probe_row = i;
+				else
+					wid[n25++] = i;
+				natu += r.blk == WLB_ATU;
+			}
+		EXPECT(n25 == 14 && nprobe == 1 && natu == 8);
+		EXPECT(wlan_link_run() == 0 && has("LINK S25 ok rows=15") && !has("!!!"));
+		for (unsigned j = 0; j < n25; j++) {
+			(void)get_row(wid[j], 0, &r);
+			want = r.blk == WLB_ELBI ? 0x0300AA11u : r.blk == WLB_DBI ? dbi[r.off / 4] : atu[r.off / 4];
+			snprintf(b, sizeof b, "LINK R25 row=%u rd=0x%08X", wid[j], (unsigned)want);
+			EXPECT(has(b));
+		}
+		for (unsigned i = 0; i < nl; i++)
+			if (strstr(lines[i], "LINK R25 "))
+				nR++;
+		EXPECT(nR == n25 && has("LINK R24 row=") && last_ev(EV_W, WLAN_ATU, WLAN_ATU + 0x1000) == 0);	/* S24 still logs its own rows; nothing wrote the ATU window */
+		teardown_tail_is_table_order(25);
+		baseline_restored();
+		world(); unreadable_blk = 5;			/* the ATU probe fails: stop at that row, no ATU row ran, no R25 line from the ATU/ELBI rows, teardown unchanged, restore ok */
+		snprintf(b, sizeof b, "LINK S25 fault row=%u", probe_row);
+		EXPECT(wlan_link_run() == 1 && has(b) && has("stopped=fault at=S25") && has("restore=ok") && !has("!!!"));
+		nR = 0;
+		for (unsigned i = 0; i < nl; i++)
+			nR += strstr(lines[i], "LINK R25 ") != NULL;
+		EXPECT(nR == 6);				/* only the 6 DBI rows before the probe */
+		teardown_tail_is_table_order(25);
 		baseline_restored();
 	}
 #endif
