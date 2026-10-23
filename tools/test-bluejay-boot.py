@@ -2971,7 +2971,22 @@ def wlan_seq_selftest() -> int:
         resha(d)
 
     def f_step_overflow(d):
-        add_row(d, step=24)
+        add_row(d, step=25)
+        resha(d)
+
+    def first_row(d, step, **sel):
+        return next(r for r in d["rows"] if r["step"] == step and all(r.get(k) == v for k, v in sel.items()))
+
+    def set_row(step, key, val, **sel):
+        def f(d):
+            first_row(d, step, **sel)[key] = val
+            resha(d)
+        return f
+
+    def f_s24_removed(d):
+        d["rows"].remove(first_row(d, 24, off=0x70))
+        for n, r in enumerate(d["rows"]):
+            r["id"] = n
         resha(d)
 
     cases = [
@@ -2989,6 +3004,12 @@ def wlan_seq_selftest() -> int:
         ("a PHY access after the isolation clear", f_iso_last, None, "isolation clear"),
         ("another SMC target", f_other_smc, None, "only SMC target"),
         ("a step index overflow", f_step_overflow, None, "malformed"),
+        ("log flag on a write row", set_row(8, "log", True, kind="mmio_write"), None, "log flag"),
+        ("log flag on a probe row", set_row(19, "log", True, probe=True), None, "log flag"),
+        ("log flag on a non-S24 read_only row", set_row(16, "log", True, kind="read_only"), None, "log flag"),
+        ("an S24 row removed", f_s24_removed, None, "S24 must be exactly"),
+        ("an S24 row changed (offset)", set_row(24, "off", 0x74, off=0x70), None, "S24 must be exactly"),
+        ("an S24 row without the log flag", set_row(24, "log", False, off=0x70), None, "S24 must be exactly"),
         ("a changed value (hash pin)", lambda d: (d["rows"][7].__setitem__("value", 2), resha(d)), _WLAN_SEQ_SHA, "audited"),
     ]
     caught = 0
@@ -3877,7 +3898,7 @@ def main() -> None:
     wlan_seq_selftest()
     _doc = json.loads((repo_root / "soc/google/gs101/wlan_seq.json").read_text())
     check_wlan_seq_table(_doc, (repo_root / "shim" / "out" / "wlan_seq.h").read_text())
-    print(f"PASS wlan_seq table audit: sha256 {_WLAN_SEQ_SHA[:16]} pinned; header == JSON; S00..S23 (S22 = one 0 us delay row, a documented skip); the default run (N=19) never raises PERST or enables the LTSSM; "
+    print(f"PASS wlan_seq table audit: sha256 {_WLAN_SEQ_SHA[:16]} pinned; header == JSON; S00..S24 (S22 = one 0 us delay row, a documented skip); the default run (N=19) never raises PERST or enables the LTSSM; "
           f"{_WLAN_SEQ_COUNTS['write_rows']} write rows on {_WLAN_SEQ_COUNTS['distinct_targets']} distinct registers in 7 blocks, all inside the allowlist; every write row has a restore")
     wlanlink_source_selftest()
     check_wlanlink_source_text((repo_root / "shim" / "wlanlink.c").read_text())
