@@ -1,7 +1,7 @@
 ---
 id: TP-010
 tool: "tools/qr-calibrate"
-status: proposed
+status: rejected
 proposed_by: "Claude Sonnet 5.5 (delegate)"
 date: 2026-10-22
 exposed_by: "QL2 design session: tools/qrsim.py decode matrix, docs/research/24-qr-throughput.md"
@@ -32,4 +32,4 @@ Same as `tools/xrun` (boots an XNU image from fastboot, bluejay only, no partiti
 mode (small: reuses qs_draw). Must not print the camera credentials (.env).
 
 ## amendments
-(none)
+- 2026-10-23 user: rejected, the QR/camera reader is deprecated (the USB UDP log is the debug channel); do not re-propose without a new reason.

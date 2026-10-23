@@ -1,7 +1,7 @@
 ---
 id: TP-012
 tool: "tools/xrun --burst-on REGEX"
-status: proposed
+status: rejected
 proposed_by: "Sonnet 5.5 (delegate, screen-off investigation)"
 date: 2026-10-22
 exposed_by: "cannot see a sub-second screen-off fade: camera frames are kept every 4 s (luma) / ~16 s (jpg)"
@@ -24,4 +24,4 @@ While the usbnet listener sees REGEX, qr-log saves every camera frame for --burs
 More jpg on disk (a few MB per burst). Camera fps is unknown (maybe 5-15); if <10 fps a 100-300 ms fade still gives only 1-3 frames.
 
 ## amendments
-(none)
+- 2026-10-23 user: rejected, the QR/camera reader is deprecated (the USB UDP log is the debug channel); do not re-propose without a new reason.
