@@ -2791,9 +2791,9 @@ def wlansmc_object_selftest(obj_path: pathlib.Path, iso: bool = False) -> int:
 
 
 # ---- --wlan-link: the table (soc/google/gs101/wlan_seq.json -> out/wlan_seq.h), the interpreter wlanlink.c, the objects (docs/research/29 section 14) ----
-_WLAN_SEQ_SHA = "b04131601a3bd5d8f3d94774124c4ba1bfd4c438dd68ddbdf950fc25aa4754ab"
-_WLAN_SEQ_COUNTS = {"rows": 242, "teardown": 28, "write_rows": 241, "distinct_targets": 180}
-_WLAN_SEQ_TARGET_BLOCKS = {"DBI": 1, "ELBI": 12, "GPH2": 6, "GPP14": 6, "IA": 37, "PCS": 5, "PMA": 113}
+_WLAN_SEQ_SHA = "1d4398fdbfdeb00f228bf5ba6be9f52a47ac9c73891b1b563bf1dfc040712b6e"
+_WLAN_SEQ_COUNTS = {"rows": 238, "teardown": 28, "write_rows": 237, "distinct_targets": 176}
+_WLAN_SEQ_TARGET_BLOCKS = {"DBI": 1, "ELBI": 12, "GPH2": 6, "GPP14": 2, "IA": 37, "PCS": 5, "PMA": 113}
 _WLAN_WRITE_KINDS = ("gpio_dat", "gpio_con", "mmio_rmw", "mmio_write")
 _WLAN_WIN = {"GPP14": 0x18, "GPH2": 0x18, "PMA": 0x2000, "PCS": 0x1000, "ELBI": 0x2000, "IA": 0x1000, "DBI": 0x1000, "PMU": 0x4000}
 _WLAN_ELBI_OK = {0x054, 0x080, 0x388, 0x3A0, 0x3A4, 0x3A8, 0x3BC, 0x474, 0x1078, 0x1400, 0x1404, 0x1408}

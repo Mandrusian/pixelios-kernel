@@ -310,13 +310,13 @@ int main(void)
 	EXPECT(wlan_link_run() == 1 && nwrites == 0 && has("LINK S00 refused"));
 
 	world(); unreadable_blk = 1;				/* the PMA probe fails: no PMA write, teardown touches no PMA */
-	EXPECT(wlan_link_run() == 1 && has("LINK S08 fault row=27") && has("stopped=fault at=S08 row=27 restore=ok"));
+	EXPECT(wlan_link_run() == 1 && has("LINK S08 fault row=23") && has("stopped=fault at=S08 row=23 restore=ok"));
 	writes_are_table_rows();
 	EXPECT(last_ev(EV_W, WLAN_PMA, WLAN_PMA + 0x2000) == 0 && last_ev(EV_ISO_CLR, 0, 0) && !wrote(WLAN_PMA, 0, 0));
 	baseline_restored();
 
 	world(); never_pll = 1;					/* the PLL never locks: S15 timeout at its row, soft reset + PHY power-down + isolation clear LAST */
-	EXPECT(wlan_link_run() == 1 && has("LINK S15 timeout row=218") && has("stopped=timeout at=S15 row=218 restore=ok"));
+	EXPECT(wlan_link_run() == 1 && has("LINK S15 timeout row=214") && has("stopped=timeout at=S15 row=214 restore=ok"));
 	EXPECT(wrote(WLAN_PMA + 0x400, 0x80, 0) && wrote(WLAN_ELBI + 0x3a4, 2, 0) && last_ev(EV_ISO_CLR, 0, 0) > last_ev(EV_W, WLAN_PMA, WLAN_PMA + 0x2000));
 	EXPECT(!wrote(WLAN_ELBI + 0x80, 0xffffffff, 4));	/* S17 never ran */
 	baseline_restored();

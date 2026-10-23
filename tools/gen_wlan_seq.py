@@ -372,7 +372,7 @@ def build():
         off, w = pr["CON"]
         c = f"{SRC_NAMES[path]}:{line}"
         add(7, "gpio_con", blk, off, ((1 << w) - 1) << (pin * w), v << (pin * w), cite=c, note=f"{node}: pinctrl 'active' mux (pcie_1 pinctrl-0, common-wlan.dtsi:143)", restore={"pcie1_clkreq": "clkreq_in"}.get(node))
-    for node, path, blk, pin in (("pcie1_clkreq", DT_PINCTRL, "GPH2", 1), ("pcie1_perst", DT_PINCTRL, "GPH2", 0), ("cfg_wlanen", DT_WLAN, "GPP14", 2)):
+    for node, path, blk, pin in (("pcie1_clkreq", DT_PINCTRL, "GPH2", 1), ("pcie1_perst", DT_PINCTRL, "GPH2", 0)):  # M1 (Opus review): no WLAN_EN pad-config rows (pud/drv/conpdn), the pad keeps its S2 state
         for reg, off, mask, val, line in pins(path, node, blk, pin, (("pin-pud", "PUD"), ("pin-drv", "DRV"), ("pin-con-pdn", "CONPDN"), ("pin-pud-pdn", "PUDPDN"))):
             add(7, "mmio_rmw", blk, off, mask, val, cite=f"{SRC_NAMES[path]}:{line}", note=f"{node} {reg} (pinctrl-samsung.c:437-488 writes the raw DT value into the field)")
 
