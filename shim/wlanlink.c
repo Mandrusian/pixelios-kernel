@@ -6,7 +6,7 @@
  *  - a block (PMA, PCS, ELBI, IA, DBI, ATU, CFG) is touched only after its probe row (a fault-guarded READ) succeeded in this run (docs/research/29 section 14: first unreadable => stop);
  *  - rows are executed in table order, the run stops at the first failing row, the teardown always runs for the steps that were started;
  *  - delays are bounded (<= 250 ms), polls are bounded by count AND by the counter.
- * Window sizes: GPP14/GPH2 banks = CON..PUDPDN (+0x00..+0x14, pinctrl-exynos-arm64.c:47-50), PMA 0x2000, PCS 0x1000, ELBI 0x2000, I/A 0x1000, DBI window 0x1000, ATU 0x1000 (DBI + 0x300000, pcie-designware.h:202, inside the 0x301000 DBI reg), CFG 0x2000 (the 'config' reg, gs101-pcie.dtsi:62) (gs101-pcie.dtsi:57-63).
+ * Window sizes: GPP14/GPH2 banks = CON..PUDPDN (+0x00..+0x14, pinctrl-exynos-arm64.c:47-50), PMA 0x2000, PCS 0x1000, ELBI 0x2000, I/A 0x1000, DBI window 0x1000 (gs101-pcie.dtsi:57-63), ATU 0x1000 (DBI + 0x300000, pcie-designware.h:202, inside the 0x301000 DBI reg of gs101-pcie.dtsi:60), CFG 0x2000 (the 'config' reg, gs101-pcie.dtsi:62).
  */
 #include <stdint.h>
 #include "console.h"
