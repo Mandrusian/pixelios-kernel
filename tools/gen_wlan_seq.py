@@ -263,7 +263,7 @@ STEP_NAMES = {
     6: "clocks: none in the clock framework", 7: "pinctrl 'active' state", 8: "PHY all-power-down clear", 9: "initial OC status read", 10: "PHY config A (input clk path, PCS mux W/A)",
     11: "PHY reset pulse (ELBI)", 12: "PHY config B (PMA/PCS tables)", 13: "PHY reset release and extras", 14: "I/A (CDR lock helper)", 15: "PHY lock waits (PLL, CDR, offset calibration)",
     16: "soft power reset", 17: "ELBI device type", 18: "non-sticky reset", 19: "DBI 'EQ off'", 20: "PERST high  <-- the first step that lets the endpoint out of reset",
-    21: "L1 / Q-channel / NAK options", 22: "RC setup (dw_pcie_setup_rc + exynos_pcie_setup_rc)  UNKNOWN", 23: "LTSSM enable and wait for L0",
+    21: "L1 / Q-channel / NAK options", 22: "RC setup (dw_pcie_setup_rc + exynos_pcie_setup_rc)  DELIBERATELY SKIPPED (one 0 us delay row; was UNKNOWN)", 23: "LTSSM enable and wait for L0",
 }
 
 
@@ -459,9 +459,13 @@ def build():
     add(21, "mmio_rmw", "ELBI", ev("PCIE_QCH_SEL"), ev("CLOCK_GATING_PMU_MASK") | ev("CLOCK_GATING_APB_MASK") | ev("CLOCK_GATING_AXI_MASK"), 0, cite=f"rc.c:{lc + 1}-{lc + 7} (ip_ver 0x984500 >= 0x889500, pcie.dtsi:77)", restore="soft_reset")
     add(21, "mmio_write", "ELBI", ev("PCIE_MSTR_PEND_SEL_NAK"), FULL, ev("NACK_ENABLE"), cite=anchor(RC, find_line(RC, r"exynos_elbi_write\(exynos_pcie, NACK_ENABLE", EL), r"NACK_ENABLE"), restore="soft_reset")
     add(21, "mmio_write", "ELBI", ev("PCIE_DBI_L1_EXIT_DISABLE"), FULL, ev("DBI_L1_EXIT_DISABLE"), cite=anchor(RC, find_line(RC, r"exynos_elbi_write\(exynos_pcie, DBI_L1_EXIT_DISABLE", EL), r"DBI_L1_EXIT_DISABLE"), restore="soft_reset")
-    # ---- S22 UNKNOWN ----
+    # ---- S22: DOCUMENTED SKIP (driver decision 2026-10-23) ----
+    # The step exists with exactly ONE delay row (0 us, no write): the interpreter refuses a step without rows, and S23 must stay reachable. The blocker text below is kept in `unknown`.
+    add(22, "delay", us=0, cite=anchor(RC, find_line(RC, r"dw_pcie_setup_rc\(pp\);", EL), r"dw_pcie_setup_rc") + " (call site; exynos_pcie_setup_rc on the next line)", tag=TAG_GUESS,
+        note="S22 deliberately skipped: RC config-space setup not transcribed (capability offset and MSI address are runtime values, see unknown text); not required for LTSSM link training; "
+             "speed target stays at the hardware default; the endpoint is NOT enumerable until S22 exists")
     unknown.append({"step": 22, "what": "dw_pcie_setup_rc() (generic DWC host code, rc.c:3216) and the DBI writes of exynos_pcie_setup_rc() (rc.c:2720-2790)",
-                    "why": "SOURCE NOW READ (dwc-generic, android14-6.1) but S22 stays UNKNOWN: it needs runtime values. "
+                    "why": "SOURCE NOW READ (dwc-generic, android14-6.1) but S22 stays UNKNOWN (and is SKIPPED, see its delay row): it needs runtime values. "
                            "(1) dw_pcie_msi_init() (pcie-designware-host.c:273-284, called at :740) writes DBI 0x820/0x824 (PCIE_MSI_ADDR_LO/HI, rc.h:206-207) with pp->msi_data, a dmam_alloc_coherent() DMA address (pcie-designware-host.c:383-391); "
                            "it runs because pci_msi_enabled() is true by default, no msi_host_init/msi-parent/msi-map exists (rc.c:2805-2807, dts), so has_msi_ctrl is true (:462); a non-constant, and the Exynos driver rewrites it itself (rc.c:2982-2983). "
                            "(2) dw_pcie_setup() -> dw_pcie_link_set_max_speed() (pcie-designware.c:489-521, link_gen = DT max-link-speed GEN2 from common.dtsi:373 via :449) addresses LNKCAP/LNKCTL2 at dw_pcie_find_capability(PCI_CAP_ID_EXP)+off, a DBI cap-list walk (:73-82) whose result is read, not constant (expected 0x70 = PCIE_CAP_OFFSET, rc.h:124: a guess until measured). "

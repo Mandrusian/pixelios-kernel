@@ -268,6 +268,10 @@ done
 # Same for wlansmc.c (W2a: two SMC READs); built with -DWLAN_SMC_READ on every build so the audit sees the real code (the one smc instruction), only LINKED with --wlan-smc-read.
 # wlanlink.c (W3a, the table-driven chain; audited every build, linked only with --wlan-link) and wlansmc_link.o = wlansmc.c with the two chain steps (wlan_link_iso_set/clear) INSTEAD of wlan_iso_run
 "$CC" $CFLAGS -DWLAN_LINK_RUN -fno-tree-switch-conversion -fno-jump-tables -c wlanlink.c -o out/wlanlink.o
+if [ "$wlan_link" = 1 ]; then	# the effective step bound N, read from the preprocessed wlanlink.c (its _Static_assert(N <= LAST)); N >= 20 is accepted only for an explicit --wlan-link=N
+	eff_n=$("$CC" $CFLAGS -DWLAN_LINK_RUN -E wlanlink.c | sed -n 's/.*_Static_assert(\([0-9][0-9]*\)u\{0,1\} <= .*/\1/p')
+	"$PYTHON" ../tools/test-bluejay-boot.py --wlan-link-effective "${eff_n:-none}" --wlan-link-explicit "$wlan_link_n"
+fi
 "$CC" $CFLAGS -DWLAN_SMC_READ -DWLAN_ISO_RUN -DWLAN_LINK_RUN -fno-tree-switch-conversion -fno-jump-tables -c wlansmc.c -o out/wlansmc_link.o
 "$CC" $CFLAGS -UWLAN_ISO_RUN -UWLAN_LINK_RUN -DWLAN_SMC_READ -fno-tree-switch-conversion -fno-jump-tables -c wlansmc.c -o out/wlansmc.o
 # and wlansmc_iso.o = the same file with the W2c RMW writer (WLAN_ISO_RUN), audited every build, linked INSTEAD of wlansmc.o with --wlan-iso (an --wlan-smc-read image contains no RMW code)
@@ -413,9 +417,9 @@ gcc -O1 -Wall -Wextra -Werror -Wno-unused-function -DTOUCH_RAILS_WRITE -I. -Iout
 gcc -O1 -Wall -Wextra -Werror -DWLAN_EN_RUN -I. -Iout -include out/board_config.h -o out/wlanen_host_test wlanen_host_test.c && ./out/wlanen_host_test
 gcc -O1 -Wall -Wextra -Werror -DWLAN_SMC_READ -I. -Iout -include out/board_config.h -o out/wlansmc_host_test wlansmc_host_test.c && ./out/wlansmc_host_test
 gcc -O1 -Wall -Wextra -Werror -DWLAN_SMC_READ -DWLAN_ISO_RUN -I. -Iout -include out/board_config.h -o out/wlaniso_host_test wlaniso_host_test.c && ./out/wlaniso_host_test
-# --wlan-link (wlanlink.c) against a fake SoC, once per step bound N (22 = S22 UNKNOWN: refuses before the first write; it does not use every helper)
+# --wlan-link (wlanlink.c) against a fake SoC, once per step bound N (S22 is a documented skip: one 0 us delay row; N=20..23 run in the fake SoC)
 chk() { local what="$1"; shift; if "$@"; then echo "PASS $what"; else echo "FAIL $what" >&2; exit 1; fi; }	# a failed compile or test must stop the build (review 2 M2: gcc && test inside a loop did not)
-for n in 7 8 10 19 20 21 22; do
+for n in 7 8 10 19 20 21 22 23; do
 	chk "wlanlink_host_test$n (compile)" gcc -O1 -Wall -Wextra -Werror -Wno-unused-function -DWLAN_LINK_RUN -DWLAN_LINK_N=$n -I. -Iout -include out/board_config.h -o out/wlanlink_host_test$n wlanlink_host_test.c
 	chk "wlanlink_host_test$n" ./out/wlanlink_host_test$n
 done

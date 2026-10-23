@@ -1,8 +1,8 @@
 /* Host test for wlanlink.c (--wlan-link, docs/research/29 section 14) against a FAKE SoC: GPIO banks with Samsung semantics (a pin whose CON field is 1 reads its DAT latch, any other pin the external
  * level), plain register files for PMA / PCS / ELBI / I/A / DBI that read back what was written, lock bits that appear after k polls, the PMU isolation word behind a fake of the two EL3 steps
- * (wlan_link_iso_set / _clear), and fault / timeout / ignored-write injection. Built once per N (-DWLAN_LINK_N=7|8|10|19|20|21|22), see build.sh. Checks: the default run (N = 19) never raises PERST,
- * never enables the LTSSM and ends with the pins, the isolation and the PHY back where they were; N = 20 / 21 add the PERST release and the options; N = 22 refuses before the first write (S22 is
- * UNKNOWN); every failure branch (unreadable probe, lock timeout, write fault, refused / failed isolation, failed restore) stops, tears down in the table order with the isolation clear LAST and is
+ * (wlan_link_iso_set / _clear), and fault / timeout / ignored-write injection. Built once per N (-DWLAN_LINK_N=7|8|10|19|20|21|22|23), see build.sh. Checks: the default run (N = 19) never raises PERST,
+ * never enables the LTSSM and ends with the pins, the isolation and the PHY back where they were; N = 20 / 21 add the PERST release and the options; N = 22 adds the documented S22 skip (one 0 us delay row, no write); N = 23 enables the LTSSM and waits for L0 (fake: ELBI 0x2C8 == 0x11
+ * after k polls, never, or a read fault), with a fault injected at EVERY forward write row and the teardown checked against the table order; every failure branch (unreadable probe, lock timeout, write fault, refused / failed isolation, failed restore) stops, tears down in the table order with the isolation clear LAST and is
  * loud; the writer's independent allowlist refuses every other register. Uses the REAL generated board macros and out/wlan_seq.h. Build (also run by build.sh):
  *   gcc -O1 -Wall -Wextra -Werror -DWLAN_LINK_RUN -DWLAN_LINK_N=19 -I. -Iout -include out/board_config.h -o out/wlanlink_host_test19 wlanlink_host_test.c */
 #include <assert.h>
@@ -27,7 +27,9 @@ struct bank { uint32_t con, latch, ext, w[6]; };
 static struct bank gp14, gh2;
 static uint32_t pma[0x2000 / 4], pcs[0x1000 / 4], elbi[0x2000 / 4], ia[0x1000 / 4], dbi[0x1000 / 4];
 static uint32_t iso1, iso0;
-static unsigned pll_after, cdr_after, oc_after, pll_cnt, cdr_cnt, oc_cnt;
+static unsigned pll_after, cdr_after, oc_after, pll_cnt, cdr_cnt, oc_cnt, l0_after, l0_cnt, l0_polls;
+static int never_l0, fault_l0_read;
+static uint64_t waited_at_en;
 static int never_pll, unreadable_blk, iso_set_ret, iso_clear_ret, write_fault_n, ignore_pa_set;
 static uintptr_t ignore_pa, fault_read_pa;
 static uint64_t freq, tick, waited_us;
@@ -94,6 +96,12 @@ int try_read32(uintptr_t pa, uint32_t *v)
 	c = cell(pa);
 	assert(c && "read outside every modelled block");
 	*v = *c;
+	if (pa == WLAN_ELBI + 0x2C8 && (elbi[0x54 / 4] & 1u)) {		/* RDLH_LINKUP / LTSSM state: only polled after the LTSSM enable */
+		l0_polls++;
+		if (fault_l0_read)
+			return 0;
+		*v = (*v & ~0x3fu) | (!never_l0 && ++l0_cnt >= l0_after ? 0x11u : 0x0u);
+	}
 	if (pa == WLAN_PMA + 0x3F0) { if (!never_pll && ++pll_cnt >= pll_after) *v |= 8; else *v &= ~8u; }
 	if (pa == WLAN_PMA + 0xE0C) { if (++cdr_cnt >= cdr_after) *v |= 4; else *v &= ~4u; }
 	if (pa == WLAN_PMA + 0xDE8) { if (++oc_cnt >= oc_after) *v |= 0xf; else *v &= ~0xfu; }
@@ -107,6 +115,8 @@ int try_write32(uintptr_t pa, uint32_t v)
 	assert(nev < 600);
 	ev[nev].t = EV_W; ev[nev].pa = pa; ev[nev].v = v; nev++;
 	nwrites++;
+	if (pa == WLAN_ELBI + 0x54 && (v & 1u))
+		waited_at_en = waited_us;
 	if (write_fault_n && nwrites == (unsigned)write_fault_n)
 		return 0;
 	if (ignore_pa_set && pa == ignore_pa)
@@ -152,7 +162,8 @@ static void world(void)
 	gp14.con = 0x33; gp14.ext = 0x3;			/* run w1: CON 0x33, DAT 0x3 */
 	gh2.con = 0; gh2.ext = 0x2;				/* PERST input low, CLKREQ high */
 	iso1 = 0; iso0 = 0;
-	pll_after = 3; cdr_after = 2; oc_after = 4; pll_cnt = cdr_cnt = oc_cnt = 0;
+	pll_after = 3; cdr_after = 2; oc_after = 4; pll_cnt = cdr_cnt = oc_cnt = l0_cnt = l0_polls = 0;
+	l0_after = 3; never_l0 = fault_l0_read = 0; waited_at_en = 0;
 	never_pll = unreadable_blk = iso_set_ret = iso_clear_ret = write_fault_n = ignore_pa_set = 0;
 	ignore_pa = fault_read_pa = 0;
 	freq = 24576000ull; tick = 1000; waited_us = 0; nsave = 0;
@@ -231,6 +242,68 @@ static void baseline_restored(void)
 	EXPECT(gp14.con == 0x33 && (dat_read(&gp14) & 4) == 0 && gh2.con == 0 && (dat_read(&gh2) & 1) == 0 && iso1 == 0);
 }
 
+static unsigned reached_step(void)	/* from the summary line: "LINK summary reached=Snn ..." */
+{
+	for (unsigned i = 0; i < nl; i++) {
+		const char *p = strstr(lines[i], "LINK summary reached=S");
+
+		if (p)
+			return (unsigned)atoi(p + strlen("LINK summary reached=S"));
+	}
+	return 99;
+}
+
+/* PERST is never high at the end of a run: the last write to the GPH2 DAT clears bit 0 (when one raised it), the pin latch is low and the pin is an input again */
+static void perst_low_at_end(void)
+{
+	unsigned last = 0, raised = 0;
+
+	for (unsigned i = 0; i < nev; i++)
+		if (ev[i].t == EV_W && ev[i].pa == WLAN_GPH2 + 4) {
+			last = i + 1;
+			raised |= ev[i].v & 1u;
+		}
+	EXPECT(!raised || (ev[last - 1].v & 1u) == 0u);
+	EXPECT((gh2.latch & 1u) == 0 && (dat_read(&gh2) & 1u) == 0 && gh2.con == 0);
+}
+
+/* the teardown of a run that reached step hi (>= 15: every probed block has teardown rows) is, in order, exactly the write-like teardown rows with step <= hi: the tail of the event log
+ * equals the table order (T01 PERST low, T02 LTSSM disable [only if S23 started], T03 WLAN_EN low, soft reset, PHY power-down, isolation clear, then the pins back to inputs) */
+static void teardown_tail_is_table_order(unsigned hi)
+{
+	int et[64];
+	uintptr_t epa[64];
+	unsigned n = 0, first_perst_low = 0;
+	struct wlan_row r;
+
+	for (unsigned i = 0; i < WLAN_SEQ_NTEAR; i++) {
+		if (!get_row(i, 1, &r) || r.step > hi)
+			continue;
+		if (r.kind == WLK_SMC_ISO) {
+			EXPECT(n < 64);
+			et[n] = EV_ISO_CLR; epa[n++] = 0;
+		} else if (r.kind == WLK_GPIO_DAT || r.kind == WLK_GPIO_CON || r.kind == WLK_MMIO_RMW || r.kind == WLK_MMIO_WRITE) {
+			EXPECT(n < 64);
+			et[n] = EV_W; epa[n++] = pa_of(r.blk, r.off);
+		}
+	}
+	EXPECT(n > 8 && nev >= n);
+	for (unsigned j = 0; j < n; j++) {
+		EXPECT(ev[nev - n + j].t == et[j]);
+		EXPECT(et[j] != EV_W || ev[nev - n + j].pa == epa[j]);
+	}
+	if (hi >= 20) {		/* T01: PERST low first; T02: LTSSM disable second if the S23 step started; then WLAN_EN low */
+		first_perst_low = nev - n;
+		EXPECT(ev[first_perst_low].pa == WLAN_GPH2 + 4 && (ev[first_perst_low].v & 1u) == 0);
+		if (hi >= 23)
+			EXPECT(ev[first_perst_low + 1].pa == WLAN_ELBI + 0x54 && ev[first_perst_low + 1].v == 0 && ev[first_perst_low + 2].pa == WLAN_GPP14 + 4);
+		else
+			EXPECT(ev[first_perst_low + 1].pa == WLAN_GPP14 + 4);
+	}
+	EXPECT(last_ev(EV_ISO_CLR, 0, 0) > last_ev(EV_W, WLAN_PMA, WLAN_PMA + 0x2000));	/* the isolation clear after the last PHY write */
+	perst_low_at_end();
+}
+
 int main(void)
 {
 	struct wlan_row r;
@@ -256,13 +329,6 @@ int main(void)
 		if (get_row(i, 0, &r) && (r.kind == WLK_DELAY || r.kind == WLK_READ_ONLY || r.kind == WLK_WAIT_EQ || r.kind == WLK_SMC_ISO))
 			EXPECT(w32(i, 0) == -2);
 
-#if WLAN_LINK_N == 22
-	/* S22 has no rows: the whole run is refused before the first write */
-	world();
-	EXPECT(wlan_link_run() == 2 && nwrites == 0 && nev == 0 && has("S22 refused: UNKNOWN step") && !has("S00 start"));
-	puts("PASS wlanlink host test N=22");
-	return 0;
-#else
 	/* ---- the happy path ---- */
 	world();
 	EXPECT(wlan_link_run() == 0);
@@ -311,7 +377,28 @@ int main(void)
 	}
 #endif
 #if WLAN_LINK_N >= 21
-	EXPECT(wrote(WLAN_ELBI + 0x3bc, 0xffffffff, 0x11) && wrote(WLAN_ELBI + 0x3a0, 0xffffffff, 2) && !wrote(WLAN_ELBI + 0x54, 0xffffffff, 1));
+	EXPECT(wrote(WLAN_ELBI + 0x3bc, 0xffffffff, 0x11) && wrote(WLAN_ELBI + 0x3a0, 0xffffffff, 2));
+#endif
+#if WLAN_LINK_N >= 21 && WLAN_LINK_N < 23
+	EXPECT(!wrote(WLAN_ELBI + 0x54, 0xffffffff, 1));		/* the LTSSM stays disabled before S23 */
+#endif
+#if WLAN_LINK_N >= 22
+	{	/* S22 is the documented skip: exactly one row, a 0 us delay, so the step runs ("ok rows=1") and writes nothing */
+		unsigned n22 = 0;
+
+		for (unsigned i = 0; i < WLAN_SEQ_NROWS; i++)
+			if (get_row(i, 0, &r) && r.step == 22) {
+				n22++;
+				EXPECT(r.kind == WLK_DELAY && r.a == 0);
+			}
+		EXPECT(n22 == 1 && has("LINK S22 start") && has("LINK S22 ok rows=1"));
+	}
+#endif
+#if WLAN_LINK_N >= 23
+	/* S23: LTSSM enable = ELBI 0x54 := 1, then the L0 wait polls ELBI 0x2C8 until (v & 0x3f) == 0x11 (fake: the 3rd poll), then the teardown disables the LTSSM */
+	EXPECT(wrote(WLAN_ELBI + 0x54, 0xffffffff, 1) && l0_polls == 3 && has("LINK S23 ok rows=2") && wrote(WLAN_ELBI + 0x54, 0xffffffff, 0) && !has("!!!"));
+	EXPECT(last_ev(EV_W, WLAN_ELBI + 0x54, WLAN_ELBI + 0x55) > 0 && ev[last_ev(EV_W, WLAN_ELBI + 0x54, WLAN_ELBI + 0x55) - 1].v == 0);	/* the LTSSM ends disabled */
+	teardown_tail_is_table_order(23);
 #endif
 
 	/* ---- failure branches: each stops, tears down, is loud where it must be ---- */
@@ -378,7 +465,57 @@ int main(void)
 	EXPECT(wlan_link_run() == 1 && has("LINK S01 fault"));
 	world(); freq = 0;
 	EXPECT(wlan_link_run() == 2 && nwrites == 0 && has("no timer"));
+#if WLAN_LINK_N >= 19
+	/* fault injection at EVERY forward write row (S00..N): the k-th try_write32 fails; the run stops there with `fault`, the teardown runs in table order, restore=ok, PERST ends low */
+	{
+		unsigned fwd = 0, ids[400], steps[400];
+
+		for (unsigned i = 0; i < WLAN_SEQ_NROWS; i++)
+			if (get_row(i, 0, &r) && r.step <= WLAN_LINK_N && (r.kind == WLK_GPIO_DAT || r.kind == WLK_GPIO_CON || r.kind == WLK_MMIO_RMW || r.kind == WLK_MMIO_WRITE)) {
+				EXPECT(fwd < 400);
+				ids[fwd] = i; steps[fwd++] = r.step;
+			}
+		EXPECT(fwd > 200);
+		for (unsigned k = 1; k <= fwd; k++) {
+			char b[96];
+
+			world(); write_fault_n = (int)k;
+			EXPECT(wlan_link_run() == 1);
+			snprintf(b, sizeof b, "stopped=fault at=S%02u row=%u restore=ok", steps[k - 1], ids[k - 1]);
+			EXPECT(has(b) && !has("!!!") && reached_step() == steps[k - 1]);
+			writes_are_table_rows();
+			if (steps[k - 1] >= 15)
+				teardown_tail_is_table_order(steps[k - 1]);
+			baseline_restored();
+			perst_low_at_end();
+		}
+	}
+#endif
+#if WLAN_LINK_N >= 20
+	world(); ignore_pa_set = 1; ignore_pa = WLAN_GPH2 + 4;		/* PERST cannot be driven high: the S20 read-back mismatches -> fault at S20, teardown in order */
+	EXPECT(wlan_link_run() == 1 && has("LINK S20 fault") && reached_step() == 20 && has("restore=ok"));
+	teardown_tail_is_table_order(20);
+	baseline_restored();
+#endif
+#if WLAN_LINK_N >= 23
+	world(); never_l0 = 1;						/* the link never comes up: bounded wait -> `timeout` at S23, LTSSM disabled, PERST low, restore=ok, no hang */
+	EXPECT(wlan_link_run() == 1 && has("LINK S23 timeout row=238") && has("stopped=timeout at=S23 row=238 restore=ok") && !has("!!!"));
+	/* MAX_TIMEOUT (common.h:20) = 4800 polls is the cap; poll_row's tick guard (counter_freq / 1e6 truncates 24.576 MHz to 24 ticks/us) ends the wait ~2% earlier, never later */
+	EXPECT(l0_polls <= 4800u && l0_polls >= 4700u);
+	EXPECT(waited_us - waited_at_en >= 4800u * 10u && waited_us - waited_at_en <= 4800u * 13u);	/* ~MAX_TIMEOUT * usleep_range(10, 12): 48..58 ms, not the old guess of seconds */
+	teardown_tail_is_table_order(23);
+	baseline_restored();
+	world(); fault_l0_read = 1;					/* the ELBI becomes unreadable while polling: fault at S23, same teardown */
+	EXPECT(wlan_link_run() == 1 && has("LINK S23 fault row=238") && has("restore=ok") && l0_polls == 1u);
+	teardown_tail_is_table_order(23);
+	baseline_restored();
+	world(); l0_after = 4000;					/* a late L0 (poll 4000, ~48 ms) is still ok; one that never comes is a timeout */
+	EXPECT(wlan_link_run() == 0 && l0_polls == 4000u);
+	world(); l0_after = 4801;
+	EXPECT(wlan_link_run() == 1 && has("stopped=timeout at=S23"));
+	world(); freq = 1000000;					/* a slow counter does not turn the wait into a hang: still <= 4800 polls */
+	EXPECT(wlan_link_run() == 0 || l0_polls <= 4800u);
+#endif
 	puts("PASS wlanlink host test N=" WLAN_LINK_N_STR);
 	return 0;
-#endif
 }
