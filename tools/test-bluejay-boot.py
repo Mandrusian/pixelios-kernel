@@ -3023,6 +3023,8 @@ _WLANLINK_PINS = {
 # block is probed before it is touched, the address is bounded and the writer's mask rule holds (Opus review H1: the text pins above cover only the allowlist).
 _WLANLINK_BODY_SHA = {
     "w32": "cb467892742fbe9a64e2338f61fb5f4e6c1a81afc37303e63defcfee49868bce",
+    "get_row": "d73e01074e7c551f652a4322ee7bfde2a53d8f3c0a76087a53c8247c354406c9",
+    "r32": "d03e22024c23e0221538c17949c0a45b92ceddaf055b9e1b6f2fcc4d7e6580ae",
     "pa_of": "9d86b866272f0aa42d1adb2ad38ddecf54d9bba0d5e69825d725eb95ec04a2a6",
     "base_of": "0469f7f00771c93ec8ae6681e257e345b85db6f576adce7f1c8ac6acf7e14a50",
     "need_probe": "f1cdcfd58982cc5be5d8b192ab4355a6dea79183379420c3cb529fbf050c89b8",
