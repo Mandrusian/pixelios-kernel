@@ -25,3 +25,4 @@ none (read-only: one extra `tools/phone state` call).
 
 ## amendments
 (none)
+- 2026-10-23 claude-sonnet-5.5 (driver): add `--reject REGEX` (default reject `stopped=(timeout|fault|refused)|restore=FAILED` for LINK summaries): `--expect "LINK summary reached=S23"` alone also matches a failed run (review 4 F1).
