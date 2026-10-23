@@ -461,7 +461,14 @@ def build():
     add(21, "mmio_write", "ELBI", ev("PCIE_DBI_L1_EXIT_DISABLE"), FULL, ev("DBI_L1_EXIT_DISABLE"), cite=anchor(RC, find_line(RC, r"exynos_elbi_write\(exynos_pcie, DBI_L1_EXIT_DISABLE", EL), r"DBI_L1_EXIT_DISABLE"), restore="soft_reset")
     # ---- S22 UNKNOWN ----
     unknown.append({"step": 22, "what": "dw_pcie_setup_rc() (generic DWC host code, rc.c:3216) and the DBI writes of exynos_pcie_setup_rc() (rc.c:2720-2790)",
-                    "why": "the DWC host source of the matching 6.1 tree was not fetched/transcribed; the exynos_pcie_setup_rc part depends on it (RO write enable, ids, LNKCAP/LNKCTL2 read-modify-writes). Without it no step after S21 is reachable (the interpreter stops at the first missing step)."})
+                    "why": "SOURCE NOW READ (dwc-generic, android14-6.1) but S22 stays UNKNOWN: it needs runtime values. "
+                           "(1) dw_pcie_msi_init() (pcie-designware-host.c:273-284, called at :740) writes DBI 0x820/0x824 (PCIE_MSI_ADDR_LO/HI, rc.h:206-207) with pp->msi_data, a dmam_alloc_coherent() DMA address (pcie-designware-host.c:383-391); "
+                           "it runs because pci_msi_enabled() is true by default, no msi_host_init/msi-parent/msi-map exists (rc.c:2805-2807, dts), so has_msi_ctrl is true (:462); a non-constant, and the Exynos driver rewrites it itself (rc.c:2982-2983). "
+                           "(2) dw_pcie_setup() -> dw_pcie_link_set_max_speed() (pcie-designware.c:489-521, link_gen = DT max-link-speed GEN2 from common.dtsi:373 via :449) addresses LNKCAP/LNKCTL2 at dw_pcie_find_capability(PCI_CAP_ID_EXP)+off, a DBI cap-list walk (:73-82) whose result is read, not constant (expected 0x70 = PCIE_CAP_OFFSET, rc.h:124: a guess until measured). "
+                           "(3) the numeric LINK_SPEED_GEN2 (dt-bindings) and PCI_VENDOR_ID_SAMSUNG (linux pci_ids.h) defines are not in the fetched refs. "
+                           "(4) every Linux DBI access on this path is bracketed by clock enable + PCS rx-elecidle ignore/enable (rd_own_conf rc.c:1269-1312, wr_own_conf rc.c:1314-1356), i.e. extra PCS writes the shim would have to replay. "
+                           "Resolved for later (read from source): iATU skipped (child_ops = exynos ops, rc.c:2800, vs pcie-designware-host.c:770); N_FTS and cdm-check skipped (not set / not in dts); num-lanes=1 (common.dtsi:368) gives PCIE_PORT_LINK_CONTROL(0x710) RMW and 0x80C width=1; "
+                           "dbi_ro_wr_en/dis = RMW of 0x8BC bit0 (pcie-designware.h:390-410); exynos_pcie_rc_wr/rd_own_conf = rc_dbi_base + where, refused while phy_control == PCIE_PHY_ISOLATION (rd :1278, wr :1323-1324). Details: docs/research/29 section 14, S22 row."})
     # ---- S23 ----
     add(23, "mmio_write", "ELBI", ev("PCIE_APP_LTSSM_ENABLE"), FULL, ev("PCIE_ELBI_LTSSM_ENABLE"), cite=anchor(RC, find_line(RC, r"PCIE_ELBI_LTSSM_ENABLE, PCIE_APP_LTSSM_ENABLE", EL), r"LTSSM_ENABLE"), restore="ltssm_off")
     lw = find_line(RC, r"while \(count < MAX_TIMEOUT\)", EL)
