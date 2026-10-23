@@ -358,6 +358,43 @@ int main(void)
 		if (get_row(i, 0, &r) && (r.kind == WLK_DELAY || r.kind == WLK_READ_ONLY || r.kind == WLK_WAIT_EQ || r.kind == WLK_SMC_ISO))
 			EXPECT(w32(i, 0) == -2);
 
+	/* need_probe is checked by behaviour, not only by its sha pin (review 7 L3, review 6 info 5): a row of a probe-gated block is refused by run_row unless THAT block's probe ran, with no access */
+	{
+		unsigned allb = 0, nprobes[WLB_CFG + 1] = { 0 }, first_probe[WLB_CFG + 1] = { 0 }, first_row[WLB_CFG + 1] = { 0 };
+
+		world();
+		for (unsigned b = 0; b <= WLB_CFG; b++)
+			allb |= need_probe(b);
+		EXPECT(need_probe(WLB_CFG) == 1u << WLB_CFG && need_probe(WLB_ATU) == 1u << WLB_ATU && need_probe(WLB_NONE) == 0);
+		for (unsigned t = 0; t < 2; t++)
+			for (unsigned i = 0; i < (t ? WLAN_SEQ_NTEAR : WLAN_SEQ_NROWS); i++) {
+				unsigned probed, rd = 0;
+
+				EXPECT(get_row(i, t, &r));
+				if (r.blk == WLB_NONE || !need_probe(r.blk) || (r.kind == WLK_READ_ONLY && r.a == 1u))
+					continue;
+				probed = 0;
+				EXPECT(run_row(i, t, &probed, &rd) == ST_REFUSED);
+				probed = allb & ~need_probe(r.blk);
+				EXPECT(run_row(i, t, &probed, &rd) == ST_REFUSED);
+			}
+		EXPECT(nwrites == 0 && cfg_reads == 0);
+		/* the table twin: per probe-gated block exactly one probe row, and it is the block's first row */
+		for (unsigned i = 0; i < WLAN_SEQ_NROWS; i++) {
+			EXPECT(get_row(i, 0, &r));
+			if (r.blk == WLB_NONE || !need_probe(r.blk))
+				continue;
+			if (!first_row[r.blk])
+				first_row[r.blk] = i + 1u;
+			if (r.kind == WLK_READ_ONLY && r.a == 1u) {
+				nprobes[r.blk]++;
+				first_probe[r.blk] = i + 1u;
+			}
+		}
+		for (unsigned b = 0; b <= WLB_CFG; b++)
+			EXPECT(!need_probe(b) || (nprobes[b] == 1 && first_probe[b] == first_row[b]));
+	}
+
 	/* ---- the happy path ---- */
 	world();
 	EXPECT(wlan_link_run() == 0);
