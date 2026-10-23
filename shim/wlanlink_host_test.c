@@ -555,7 +555,7 @@ int main(void)
 	{	/* S26: outbound region 0 = CFG0 -> bus 1: 7 ATU writes (CR2 enable last), each read back (`LINK R26`), then the CFG window probe (not logged) and 4 logged window reads; the ATU is torn down FIRST */
 		static const struct { uint32_t off, v; } sw[7] = { { 0x008, 0x60FFE000u }, { 0x00C, 0 }, { 0x010, 0x60FFFFFFu }, { 0x014, 0x01000000u }, { 0x018, 0 }, { 0x000, 0x4u }, { 0x004, 0x80000000u } };
 		static const struct { uint32_t off, v; } st[7] = { { 0x004, 0 }, { 0x000, 0 }, { 0x008, 0 }, { 0x00C, 0 }, { 0x010, 0xFFFu }, { 0x014, 0 }, { 0x018, 0 } };
-		unsigned k = 0, nrow = 0, nR = 0, probe_row = 0, nprobe = 0, iw = 0, wpos[16], perst_lo = 0, wrow[32];
+		unsigned k = 0, nrow = 0, nR = 0, probe_row = 0, nprobe = 0, nwait = 0, iw = 0, wpos[16], perst_lo = 0, wrow[32];
 		char b[96];
 
 		world();
@@ -565,6 +565,9 @@ int main(void)
 				if (r.kind == WLK_MMIO_WRITE) {
 					EXPECT(r.blk == WLB_ATU && r.mask == FULL_MASK_T && k < 7 && r.off == sw[k].off && r.val == sw[k].v);
 					k++;
+				} else if (r.kind == WLK_WAIT_EQ) {		/* review 7 finding 2: ONE-SHOT ATU CR2 == 0x80000000, after the CR2 read-back and before the CFG probe */
+					EXPECT(r.blk == WLB_ATU && r.off == 4u && r.mask == FULL_MASK_T && r.val == 0x80000000u && r.a == 0u && r.b == 1u && k == 7 && !nprobe && !nwait);
+					nwait++;
 				} else {
 					EXPECT(r.kind == WLK_READ_ONLY && (r.blk == WLB_ATU || r.blk == WLB_CFG));
 					if (r.a == 1u)
@@ -574,8 +577,8 @@ int main(void)
 				}
 				wrow[nrow++] = i;
 			}
-		EXPECT(k == 7 && nrow == 19 && nprobe == 1);
-		EXPECT(wlan_link_run() == 0 && has("LINK S26 ok rows=19") && !has("!!!") && cfg_reads == 5u && cfg_reads_unconfigured == 0);	/* all 5 CFG reads after the region was enabled */
+		EXPECT(k == 7 && nrow == 20 && nprobe == 1 && nwait == 1);
+		EXPECT(wlan_link_run() == 0 && has("LINK S26 ok rows=20") && !has("!!!") && cfg_reads == 5u && cfg_reads_unconfigured == 0);	/* all 5 CFG reads after the region was enabled */
 		for (unsigned i = 0; i < nev; i++)
 			if (ev[i].t == EV_W && ev[i].pa >= WLAN_ATU && ev[i].pa < WLAN_ATU + 0x1000) {
 				EXPECT(iw < 14);
@@ -638,8 +641,8 @@ int main(void)
 		EXPECT(nR == 7 && last_ev(EV_W, WLAN_ATU, WLAN_ATU + 0x1000) > 0);		/* only the 7 ATU read-backs */
 		teardown_tail_is_table_order(26);
 		baseline_restored();
-		world(); ignore_pa_set = 1; ignore_pa = WLAN_ATU + 4;	/* the enable write does not take: the window stays dead, the probe faults (unconfigured read counted), same teardown */
-		EXPECT(wlan_link_run() == 1 && has("LINK S26 fault") && cfg_reads == 1u && cfg_reads_unconfigured == 1u && has("restore=ok") && !has("!!!"));
+		world(); ignore_pa_set = 1; ignore_pa = WLAN_ATU + 4;	/* the enable write does not take: the one-shot CR2 check REFUSES before any CFG access (review 7 finding 2), same teardown */
+		EXPECT(wlan_link_run() == 1 && has("LINK S26 refused") && has("stopped=refused at=S26") && cfg_reads == 0u && cfg_reads_unconfigured == 0u && has("restore=ok") && !has("!!!"));
 		teardown_tail_is_table_order(26);
 		baseline_restored();
 	}

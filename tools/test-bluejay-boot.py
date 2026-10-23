@@ -2791,8 +2791,8 @@ def wlansmc_object_selftest(obj_path: pathlib.Path, iso: bool = False) -> int:
 
 
 # ---- --wlan-link: the table (soc/google/gs101/wlan_seq.json -> out/wlan_seq.h), the interpreter wlanlink.c, the objects (docs/research/29 section 14) ----
-_WLAN_SEQ_SHA = "5a835647f5afbf9507bd775ebeaac3d23eca596b215eb4116684ec9ec8226af8"
-_WLAN_SEQ_COUNTS = {"rows": 286, "teardown": 35, "write_rows": 251, "distinct_targets": 183}
+_WLAN_SEQ_SHA = "e2bc4e1475191cf495366fce4d698f30334ad9a39e909e30a94cf44bf8dac9b0"
+_WLAN_SEQ_COUNTS = {"rows": 287, "teardown": 35, "write_rows": 251, "distinct_targets": 183}
 _WLAN_SEQ_TARGET_BLOCKS = {"ATU": 7, "DBI": 1, "ELBI": 12, "GPH2": 6, "GPP14": 2, "IA": 37, "PCS": 5, "PMA": 113}
 FULL_MASK = 0xFFFFFFFF
 _WLAN_WRITE_KINDS = ("gpio_dat", "gpio_con", "mmio_rmw", "mmio_write")
@@ -2892,9 +2892,11 @@ def check_wlan_seq_table(doc: dict, header: str, pin: str | None = _WLAN_SEQ_SHA
     s26_want = []
     for o, v in _WLAN_S26_WRITES:
         s26_want += [("mmio_write", "ATU", o, v, None, None, tid.get(("ATU", o))), ("read_only", "ATU", o, None, True, None, None)]
+    s26_want += [("wait_eq", "ATU", 0x004, None, None, None, None)]	# review 7 finding 2: ONE-SHOT CR2 == 0x80000000 check, so the CFG probe is never issued through a region that did not latch
     s26_want += [("read_only", "CFG", 0x000, None, None, True, None)] + [("read_only", "CFG", o, None, True, None, None) for o in (0x000, 0x004, 0x008, 0x00C)]
-    if s26 != s26_want or any(r["kind"] == "mmio_write" and r["mask"] != FULL_MASK for r in rows if r["step"] == 26):
-        raise AssertionError(f"{name}: S26 must be exactly the 7 ATU full-word writes {[(hex(o), hex(v)) for o, v in _WLAN_S26_WRITES]} each followed by its logged read-back, then the CFG probe and the CFG reads +0x0/+0x4/+0x8/+0xC, each write restored by the teardown row of its offset: {s26}")
+    s26_chk = [(r["mask"], r["value"], r["delay_us"], r["polls"]) for r in rows if r["step"] == 26 and r["kind"] == "wait_eq"]
+    if s26 != s26_want or s26_chk != [(FULL_MASK, 0x80000000, 0, 1)] or any(r["kind"] == "mmio_write" and r["mask"] != FULL_MASK for r in rows if r["step"] == 26):
+        raise AssertionError(f"{name}: S26 must be exactly the 7 ATU full-word writes {[(hex(o), hex(v)) for o, v in _WLAN_S26_WRITES]} each followed by its logged read-back, then ONE one-shot wait_eq ATU CR2 == 0x80000000, then the CFG probe and the CFG reads +0x0/+0x4/+0x8/+0xC, each write restored by the teardown row of its offset: {s26}")
     # the CFG window and the ATU are written ONLY by those rows and their teardown (the allowlist twin checks offset and value; this checks the place): CFG is never written at all
     if any(x["blk"] == "CFG" and (x["kind"] != "read_only" or x.get("step", x.get("requires")) != 26) for x in rows + tear) or any(x["blk"] == "CFG" for x in tear):
         raise AssertionError(f"{name}: the CFG window is read-only, only in S26, never in the teardown")
@@ -3046,6 +3048,13 @@ def wlan_seq_selftest() -> int:
             r["id"] = n
         resha(d)
 
+    def f_s26_cr2_check_late(d):
+        i = next(n for n, r in enumerate(d["rows"]) if r["step"] == 26 and r["kind"] == "wait_eq")
+        d["rows"][i], d["rows"][i + 1] = d["rows"][i + 1], d["rows"][i]
+        for n, r in enumerate(d["rows"]):
+            r["id"] = n
+        resha(d)
+
     def f_s26_row_removed(**sel):
         def f(d):
             d["rows"].remove(first_row(d, 26, **sel))
@@ -3134,6 +3143,10 @@ def wlan_seq_selftest() -> int:
         ("S26 CR2 enable first", f_s26_swap_cr2_first, None, "S26 must be exactly"),
         ("an S26 read-back removed", f_s26_row_removed(kind="read_only", blk="ATU", off=0x10), None, "S26 must be exactly"),
         ("an S26 CFG read removed", f_s26_row_removed(kind="read_only", blk="CFG", off=0xC), None, "S26 must be exactly"),
+        ("the S26 CR2 one-shot check removed", f_s26_row_removed(kind="wait_eq", blk="ATU"), None, "S26 must be exactly"),
+        ("the S26 CR2 check polls more than once", set_row(26, "polls", 2, kind="wait_eq", blk="ATU"), None, "S26 must be exactly"),
+        ("the S26 CR2 check waits for another value", set_row(26, "value", 0x80000001, kind="wait_eq", blk="ATU"), None, "S26 must be exactly"),
+        ("the S26 CR2 check moved after the CFG probe", f_s26_cr2_check_late, None, "S26 must be exactly"),
         ("an S26 write value changed", set_row(26, "value", 0x60FFE004, kind="mmio_write", off=0x8), None, "S26 must be exactly"),
         ("an S26 write restored by another row", f_restore_swapped, None, "S26 must be exactly"),
         ("log flag on the S26 CFG probe", set_row(26, "log", True, blk="CFG", probe=True), None, "S26 must be exactly"),

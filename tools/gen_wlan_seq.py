@@ -270,7 +270,7 @@ STEP_NAMES = {
     21: "L1 / Q-channel / NAK options", 22: "RC setup (dw_pcie_setup_rc + exynos_pcie_setup_rc)  DELIBERATELY SKIPPED (one 0 us delay row; was UNKNOWN)", 23: "LTSSM enable and wait for L0",
     24: "READ-ONLY link report: negotiated link + capability chain of the RC, from its own DBI space (explicit --wlan-link=24 only; no writes)",
     25: "READ-ONLY iATU layout (doc 31 Q2): DBI header/version/viewport words + the unrolled outbound region 0 registers at DBI+0x300000 (explicit --wlan-link=25 only; no writes)",
-    26: "iATU outbound region 0 = CFG0 -> bus 1 (7 DBI-window writes at ATU 0x14B00000, each read back) and 4 reads of the CFG window 0x60FFE000 (explicit --wlan-link=26 only; ATU torn down FIRST)",
+    26: "iATU outbound region 0 = CFG0 -> bus 1 (7 DBI-window writes at ATU 0x14B00000, each read back, CR2 re-checked once) and 4 reads of the CFG window 0x60FFE000 (explicit --wlan-link=26 only; ATU torn down FIRST)",
 }
 
 
@@ -560,6 +560,8 @@ def build():
             "PCIE_ATU_CR2_OUTBOUND0": f"; bit 31 = EXYNOS_PCIE_ATU_ENABLE defined at {gc(RCH, r'define EXYNOS_PCIE_ATU_ENABLE\s+\(0x1 << 31\)')}"}.get(mac, "")
         add(26, "mmio_write", "ATU", o, FULL, val, cite=c, tag=TAG_SRC, note=what + "; research 31 s.2.2", restore=key + ("_off" if key == "atu_cr2" else "_rst"))
         add(26, "read_only", "ATU", o, cite=f"read-back of the row above (doc 31 s.2.3 step 3; Linux has no read-back for region 0: rc.c:1379-1386)", tag=TAG_GUESS, note=f"read back {what.split(' ')[0]} (expect {val:#010x})", **log)
+    add(26, "wait_eq", "ATU", 0x004, FULL, 1 << 31, us=0, polls=1, tag=TAG_GUESS, cite=f"{gc(RCH, r'define EXYNOS_PCIE_ATU_ENABLE\s+\(0x1 << 31\)')}; review 7 finding 2 (our own gate: Linux has no read-back for region 0, rc.c:1379-1386)",
+        note="ONE-SHOT precondition before the CFG probe: ATU CR2 must read back 0x80000000 (region 0 enabled); otherwise the run stops (refused) instead of issuing an untranslated read to 0x60FFE000")
     add(26, "read_only", "CFG", 0x000, cite=f"{cfg_dt} (pcie_1 reg 'config' 0x60FFE000 size 0x2000; the Linux read is {anchor(RC, find_line(RC, r'dw_pcie_read.va_cfg_base . where, size, val.', vp), r'va_cfg_base')}, doc 31 s.2.3 step 2)",
         probe=True, tag=TAG_GUESS, note="BLOCK PROBE: the first access to the CFG window 0x60FFE000 (outbound CFG0 TLP to bus 1 dev 0 fn 0 once region 0 is enabled); unreadable = stop. That the window answers (not hangs / SError) is a guess (doc 31 Q3)")
     for o, what in ((0x00, "vendor (low half) / device (high half); vendor 0x14E4 expected (guess)"), (0x04, "command (low) / status (high)"), (0x08, "revision (low byte) / class code (high 24 bits)"), (0x0C, "cache line / latency / header type (bits 23:16) / BIST")):
