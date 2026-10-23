@@ -415,7 +415,7 @@ gcc -O1 -Wall -Wextra -Werror -DWLAN_SMC_READ -I. -Iout -include out/board_confi
 gcc -O1 -Wall -Wextra -Werror -DWLAN_SMC_READ -DWLAN_ISO_RUN -I. -Iout -include out/board_config.h -o out/wlaniso_host_test wlaniso_host_test.c && ./out/wlaniso_host_test
 # --wlan-link (wlanlink.c) against a fake SoC, once per step bound N (22 = S22 UNKNOWN: refuses before the first write; it does not use every helper)
 chk() { local what="$1"; shift; if "$@"; then echo "PASS $what"; else echo "FAIL $what" >&2; exit 1; fi; }	# a failed compile or test must stop the build (review 2 M2: gcc && test inside a loop did not)
-for n in 19 20 21 22; do
+for n in 7 8 10 19 20 21 22; do
 	chk "wlanlink_host_test$n (compile)" gcc -O1 -Wall -Wextra -Werror -Wno-unused-function -DWLAN_LINK_RUN -DWLAN_LINK_N=$n -I. -Iout -include out/board_config.h -o out/wlanlink_host_test$n wlanlink_host_test.c
 	chk "wlanlink_host_test$n" ./out/wlanlink_host_test$n
 done

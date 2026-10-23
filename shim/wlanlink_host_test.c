@@ -1,6 +1,6 @@
 /* Host test for wlanlink.c (--wlan-link, docs/research/29 section 14) against a FAKE SoC: GPIO banks with Samsung semantics (a pin whose CON field is 1 reads its DAT latch, any other pin the external
  * level), plain register files for PMA / PCS / ELBI / I/A / DBI that read back what was written, lock bits that appear after k polls, the PMU isolation word behind a fake of the two EL3 steps
- * (wlan_link_iso_set / _clear), and fault / timeout / ignored-write injection. Built once per N (-DWLAN_LINK_N=19|20|21|22), see build.sh. Checks: the default run (N = 19) never raises PERST,
+ * (wlan_link_iso_set / _clear), and fault / timeout / ignored-write injection. Built once per N (-DWLAN_LINK_N=7|8|10|19|20|21|22), see build.sh. Checks: the default run (N = 19) never raises PERST,
  * never enables the LTSSM and ends with the pins, the isolation and the PHY back where they were; N = 20 / 21 add the PERST release and the options; N = 22 refuses before the first write (S22 is
  * UNKNOWN); every failure branch (unreadable probe, lock timeout, write fault, refused / failed isolation, failed restore) stops, tears down in the table order with the isolation clear LAST and is
  * loud; the writer's independent allowlist refuses every other register. Uses the REAL generated board macros and out/wlan_seq.h. Build (also run by build.sh):
@@ -167,6 +167,17 @@ static int has(const char *s)
 	return 0;
 }
 
+static int has_last_step_ok(void)	/* 2 = "LINK Snn ok" and the clean summary for this build's N, 1 = only the step line, 0 = neither */
+{
+	char b[64];
+
+	snprintf(b, sizeof b, "LINK S%02d ok", WLAN_LINK_N);
+	if (!has(b))
+		return 0;
+	snprintf(b, sizeof b, "LINK summary reached=S%02d stopped=none restore=ok", WLAN_LINK_N);
+	return has(b) ? 2 : 1;
+}
+
 static void fail(int line, const char *e)
 {
 	fprintf(stderr, "FAIL line %d: %s\n", line, e);
@@ -256,7 +267,7 @@ int main(void)
 	world();
 	EXPECT(wlan_link_run() == 0);
 	writes_are_table_rows();
-	EXPECT(has("LINK table sha=") && has("LINK S00 ok") && has("LINK S19 ok") && has("LINK summary reached=S" WLAN_LINK_N_STR " stopped=none restore=ok") && !has("!!!"));
+	EXPECT(has("LINK table sha=") && has("LINK S00 ok") && has_last_step_ok() == 2 && !has("!!!"));
 	EXPECT(ev[0].t == EV_W && ev[0].pa == WLAN_GPH2 + 4 && ev[1].pa == WLAN_GPH2 && ev[2].pa == WLAN_GPP14 + 4 && ev[3].pa == WLAN_GPP14);	/* S01 DAT, CON; S02 DAT, CON */
 	EXPECT(waited_us >= 200000u + 1000u);
 	EXPECT(nsave >= 2u * (WLAN_LINK_N + 1u));		/* a pstore checkpoint before and after every step */
@@ -269,7 +280,12 @@ int main(void)
 		EXPECT(iso_set && last_ev(EV_ISO_CLR, 0, 0) > last_ev(EV_W, WLAN_PMA, WLAN_PMA + 0x2000));		/* the isolation clear comes after the last PHY write */
 		EXPECT(last_ev(EV_ISO_CLR, 0, 0) < last_ev(EV_W, WLAN_GPP14, WLAN_GPP14 + 1));				/* ... and before the pins go back to inputs */
 	}
-	EXPECT(wrote(WLAN_PMA + 0xD8, 0xffffffff, 0x28) && wrote(WLAN_PMA + 0x400, 0x80, 0) && wrote(WLAN_DBI + 0x890, 0xffffffff, 0x12000));
+#if WLAN_LINK_N >= 8
+	EXPECT(wrote(WLAN_PMA + 0xD8, 0xffffffff, 0x28) && wrote(WLAN_PMA + 0x400, 0x80, 0));
+#endif
+#if WLAN_LINK_N >= 19
+	EXPECT(wrote(WLAN_DBI + 0x890, 0xffffffff, 0x12000));
+#endif
 	baseline_restored();
 	if (getenv("WLAN_DUMP")) {
 		for (unsigned i = 0; i < nl; i++)
@@ -309,29 +325,39 @@ int main(void)
 	world(); gp14.con = 0x133;
 	EXPECT(wlan_link_run() == 1 && nwrites == 0 && has("LINK S00 refused"));
 
+#if WLAN_LINK_N >= 8
 	world(); unreadable_blk = 1;				/* the PMA probe fails: no PMA write, teardown touches no PMA */
 	EXPECT(wlan_link_run() == 1 && has("LINK S08 fault row=23") && has("stopped=fault at=S08 row=23 restore=ok"));
 	writes_are_table_rows();
 	EXPECT(last_ev(EV_W, WLAN_PMA, WLAN_PMA + 0x2000) == 0 && last_ev(EV_ISO_CLR, 0, 0) && !wrote(WLAN_PMA, 0, 0));
 	baseline_restored();
 
+#endif
+#if WLAN_LINK_N >= 15
 	world(); never_pll = 1;					/* the PLL never locks: S15 timeout at its row, soft reset + PHY power-down + isolation clear LAST */
 	EXPECT(wlan_link_run() == 1 && has("LINK S15 timeout row=214") && has("stopped=timeout at=S15 row=214 restore=ok"));
 	EXPECT(wrote(WLAN_PMA + 0x400, 0x80, 0) && wrote(WLAN_ELBI + 0x3a4, 2, 0) && last_ev(EV_ISO_CLR, 0, 0) > last_ev(EV_W, WLAN_PMA, WLAN_PMA + 0x2000));
 	EXPECT(!wrote(WLAN_ELBI + 0x80, 0xffffffff, 4));	/* S17 never ran */
 	baseline_restored();
 
+#endif
+#if WLAN_LINK_N >= 14
 	world(); unreadable_blk = 2;				/* the I/A probe fails (S14) */
 	EXPECT(wlan_link_run() == 1 && has("LINK S14 fault") && wrote(WLAN_PMA + 0x400, 0x80, 0) && last_ev(EV_W, WLAN_IA, WLAN_IA + 0x1000) == 0);
 	baseline_restored();
+#endif
+#if WLAN_LINK_N >= 19
 	world(); unreadable_blk = 4;				/* the DBI probe fails (S19): no DBI write */
 	EXPECT(wlan_link_run() == 1 && has("LINK S19 fault") && last_ev(EV_W, WLAN_DBI, WLAN_DBI + 0x1000) == 0);
 	baseline_restored();
 
+#endif
+#if WLAN_LINK_N >= 19
 	world(); write_fault_n = 40;				/* a write faults in the middle of the PHY tables */
 	EXPECT(wlan_link_run() == 1 && has("fault row=") && has("restore=ok"));
 	baseline_restored();
 
+#endif
 	world(); iso_set_ret = 2;				/* the isolation release fails (fake EL3 mismatch): stop at S05, the clear still runs */
 	EXPECT(wlan_link_run() == 1 && has("LINK S05 fault") && last_ev(EV_ISO_CLR, 0, 0) && last_ev(EV_W, WLAN_PMA, WLAN_PMA + 0x2000) == 0);
 	baseline_restored();
@@ -344,8 +370,10 @@ int main(void)
 
 	world(); iso_clear_ret = 2;				/* the isolation clear fails: LOUD */
 	EXPECT(wlan_link_run() == 1 && has("restore=FAILED") && has("!!! RESTORE FAILED") && has("LINK T"));
+#if WLAN_LINK_N >= 8
 	world(); ignore_pa_set = 1; ignore_pa = WLAN_PMA + 0x400;	/* the PHY power-down RMW does not take: writes are not read back, but the run is still ok */
 	EXPECT(wlan_link_run() == 0);
+#endif
 	world(); write_fault_n = 1;				/* the very first write faults */
 	EXPECT(wlan_link_run() == 1 && has("LINK S01 fault"));
 	world(); freq = 0;
