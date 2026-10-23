@@ -2791,7 +2791,7 @@ def wlansmc_object_selftest(obj_path: pathlib.Path, iso: bool = False) -> int:
 
 
 # ---- --wlan-link: the table (soc/google/gs101/wlan_seq.json -> out/wlan_seq.h), the interpreter wlanlink.c, the objects (docs/research/29 section 14) ----
-_WLAN_SEQ_SHA = "eb416008b3c8a731cefd06a04fca53d4373c6a78716772eb5406fce971b70adf"
+_WLAN_SEQ_SHA = "5a835647f5afbf9507bd775ebeaac3d23eca596b215eb4116684ec9ec8226af8"
 _WLAN_SEQ_COUNTS = {"rows": 286, "teardown": 35, "write_rows": 251, "distinct_targets": 183}
 _WLAN_SEQ_TARGET_BLOCKS = {"ATU": 7, "DBI": 1, "ELBI": 12, "GPH2": 6, "GPP14": 2, "IA": 37, "PCS": 5, "PMA": 113}
 FULL_MASK = 0xFFFFFFFF

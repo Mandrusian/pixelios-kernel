@@ -555,7 +555,9 @@ def build():
     vp = find_line(RC, r"static void exynos_pcie_rc_prog_viewport_cfg0")
     for mac, val, what, key, rx in wr_atu:
         o = ev(mac) - 0x300000
-        c = f"{anchor(RC, find_line(RC, rx, vp), rx)}; {gc(RCH, 'define ' + mac + r'\s+0x3000')}; offset = DBI + 0x300000 + {o:#x} (ATU block, S25)"
+        c = f"{anchor(RC, find_line(RC, rx, vp), rx)}; {gc(RCH, 'define ' + mac + r'\s+0x3000')}; offset = DBI + 0x300000 + {o:#x} (ATU block, S25)" + {
+            "PCIE_ATU_CR1_OUTBOUND0": f"; value 0x4 = PCIE_ATU_TYPE_CFG0 defined at {gc(GEN / 'pcie-designware.h', r'define PCIE_ATU_TYPE_CFG0\s+0x4')} (Exynos twin {gc(RCH, r'define EXYNOS_PCIE_ATU_TYPE_CFG0\s+\(0x4')})",
+            "PCIE_ATU_CR2_OUTBOUND0": f"; bit 31 = EXYNOS_PCIE_ATU_ENABLE defined at {gc(RCH, r'define EXYNOS_PCIE_ATU_ENABLE\s+\(0x1 << 31\)')}"}.get(mac, "")
         add(26, "mmio_write", "ATU", o, FULL, val, cite=c, tag=TAG_SRC, note=what + "; research 31 s.2.2", restore=key + ("_off" if key == "atu_cr2" else "_rst"))
         add(26, "read_only", "ATU", o, cite=f"read-back of the row above (doc 31 s.2.3 step 3; Linux has no read-back for region 0: rc.c:1379-1386)", tag=TAG_GUESS, note=f"read back {what.split(' ')[0]} (expect {val:#010x})", **log)
     add(26, "read_only", "CFG", 0x000, cite=f"{cfg_dt} (pcie_1 reg 'config' 0x60FFE000 size 0x2000; the Linux read is {anchor(RC, find_line(RC, r'dw_pcie_read.va_cfg_base . where, size, val.', vp), r'va_cfg_base')}, doc 31 s.2.3 step 2)",
