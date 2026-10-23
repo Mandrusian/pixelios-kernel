@@ -42,6 +42,7 @@ unclassifiable instructions, ...) and asserts each is rejected on
 every run.
 """
 import argparse
+import json
 import os
 import pathlib
 import re
@@ -2437,6 +2438,38 @@ _WLANSMC_RMW_SET = ("registeruint64_tx0__asm__(\"x0\")=SMC_FID_PRIV_REG;register
                     "registeruint64_tx7__asm__(\"x7\")=0;")
 
 
+_WLANSMC_LINK_SET = re.sub(r"\s+", "", """int wlan_link_iso_set(uint32_t *rd)
+{
+	uint32_t before = 0, iso0 = 0, iso0b = 0, after = 0;
+	struct smc_res r = { 0, 0, 0, 0 }, rs = { 0, 0, 0, 0 };
+	int rok = 0, reached;
+
+	*rd = 0;
+	if (!try_read32(ISO_REG, &before) || !try_read32(WLAN_PMU_PCIE0_ISO, &iso0))
+		return 1;
+	if ((before & 1u) || smc_priv_read(ISO_REG, &r) || (int32_t)(uint32_t)r.a0 < 0 || (uint32_t)r.a0 != before)
+		return 1;
+	smc_priv_rmw_set(&rs);
+	reached = poll_bit(1u, &after, &rok);
+	(void)try_read32(WLAN_PMU_PCIE0_ISO, &iso0b);
+	*rd = rok ? after : 0u;
+	return (rok && reached && (int32_t)(uint32_t)rs.a0 == 0 && ((after ^ before) & ~1u) == 0u && iso0b == iso0) ? 0 : 2;
+}""")
+_WLANSMC_LINK_CLEAR = re.sub(r"\s+", "", """int wlan_link_iso_clear(uint32_t *rd)
+{
+	uint32_t rb = 0, fin = 0;
+	struct smc_res rc = { 0, 0, 0, 0 };
+	int rok2 = 0, fin_ok;
+
+	smc_priv_rmw_clear(&rc);
+	(void)poll_bit(0u, &rb, &rok2);
+	wait_ticks(counter_freq() / ISO_FINAL_DIV);
+	fin_ok = try_read32(ISO_REG, &fin);
+	*rd = fin_ok ? fin : 0u;
+	return (rok2 && !(rb & 1u) && fin_ok && !(fin & 1u)) ? 0 : 2;
+}""")
+
+
 def check_wlansmc_source_text(src: str, name: str = "wlansmc.c") -> None:
     """Two views of the same file: without the WLAN_ISO_RUN blocks (the W2a image: ONE smc, READ only) and the WLAN_ISO_RUN blocks themselves (W2c: exactly two more, RMW set / clear)."""
     iso_parts = _ISO_BLOCK_RX.findall(src)
@@ -2509,8 +2542,14 @@ def _check_wlansmc_iso(iso_src: str, full_src: str, name: str) -> None:
         if f"__attribute__((noipa))staticvoid{fn}(structsmc_res*r)" not in norm:
             raise AssertionError(f"{name}: {fn} must be noipa with the only parameter `struct smc_res *r`")
     for fn, n in (("smc_priv_rmw_set", 1), ("smc_priv_rmw_clear", 1)):
-        if len(re.findall(r"\b" + fn + r"\s*\(", fcode)) != 2:	# the definition and exactly one call
-            raise AssertionError(f"{name}: {fn} has exactly one call site")
+        if len(re.findall(r"\b" + fn + r"\s*\(", fcode)) != 3:	# the definition, the call in wlan_iso_run and the call in the --wlan-link wrapper
+            raise AssertionError(f"{name}: {fn} has exactly two call sites (wlan_iso_run, the wlan_link_iso_* wrapper)")
+    if "#ifndef WLAN_LINK_RUN" not in iso_src or "#endif\t/* !WLAN_LINK_RUN */" not in iso_src or "#ifdef WLAN_LINK_RUN" not in iso_src:
+        raise AssertionError(f"{name}: wlan_iso_run must be compiled out of a --wlan-link image and the wrappers into it")
+    for fn, want in (("wlan_link_iso_set", _WLANSMC_LINK_SET), ("wlan_link_iso_clear", _WLANSMC_LINK_CLEAR)):
+        wa, wb = _c_function_span(code, fn)
+        if re.sub(r"\s+", "", code[wa:wb]) != want:
+            raise AssertionError(f"{name}: {fn} is not the audited wrapper")
     ra, rb = _c_function_span(code, "wlan_iso_run")
     run = re.sub(r"\s+", "", code[ra:rb])
     s_at, c_at = run.find("smc_priv_rmw_set(&rs);"), run.find("smc_priv_rmw_clear(&rc);")
@@ -2561,6 +2600,11 @@ def wlansmc_source_selftest() -> int:
         ("a raw writer", good.replace("static void emit(", "static void evil(void) { try_write32(0x17463EC4UL, 1); }\nstatic void emit(", 1)),
         ("a third address read", good.replace("\tr0 = one(WLAN_PMU_PCIE0_ISO, &m0, &amb0);", "\tr0 = one(WLAN_PMU_PCIE0_ISO, &m0, &amb0);\n\t(void)one(WLAN_PMU_PCIE1_ISO + 4, &m0, &amb0);", 1)),
         ("a retry loop", good.replace("\trc = smc_priv_read(pa, &r);", "\trc = smc_priv_read(pa, &r);\n\twhile (rc)\n\t\trc = smc_priv_read(pa, &r);", 1)),
+        # --wlan-link wrappers
+        ("link set without the SMC READ check", good.replace("if ((before & 1u) || smc_priv_read(ISO_REG, &r) || (int32_t)(uint32_t)r.a0 < 0 || (uint32_t)r.a0 != before)", "if (before & 1u)", 1)),
+        ("link clear made conditional", good.replace("\tsmc_priv_rmw_clear(&rc);\n\t(void)poll_bit(0u, &rb, &rok2);", "\tif (*rd)\n\t\tsmc_priv_rmw_clear(&rc);\n\t(void)poll_bit(0u, &rb, &rok2);", 1)),
+        ("link set sends the clear value", good.replace("\tsmc_priv_rmw_set(&rs);\n\treached = poll_bit(1u, &after, &rok);", "\tsmc_priv_rmw_clear(&rs);\n\treached = poll_bit(1u, &after, &rok);", 1)),
+        ("wlan_iso_run left in the link image", good.replace("#ifndef WLAN_LINK_RUN\t/* the --wlan-iso procedure; a --wlan-link image has the two steps below instead */\n", "", 1)),
         # W2c part
         ("rmw: option WRITE", good.replace("#define PRIV_REG_OPTION_RMW\t2UL", "#define PRIV_REG_OPTION_RMW\t1UL", 1)),
         ("rmw: mask widened", good.replace("#define ISO_MASK\t\t1UL", "#define ISO_MASK\t\t3UL", 1)),
@@ -2746,12 +2790,416 @@ def wlansmc_object_selftest(obj_path: pathlib.Path, iso: bool = False) -> int:
     return caught
 
 
+# ---- --wlan-link: the table (soc/google/gs101/wlan_seq.json -> out/wlan_seq.h), the interpreter wlanlink.c, the objects (docs/research/29 section 14) ----
+_WLAN_SEQ_SHA = "b04131601a3bd5d8f3d94774124c4ba1bfd4c438dd68ddbdf950fc25aa4754ab"
+_WLAN_SEQ_COUNTS = {"rows": 242, "teardown": 28, "write_rows": 241, "distinct_targets": 180}
+_WLAN_SEQ_TARGET_BLOCKS = {"DBI": 1, "ELBI": 12, "GPH2": 6, "GPP14": 6, "IA": 37, "PCS": 5, "PMA": 113}
+_WLAN_WRITE_KINDS = ("gpio_dat", "gpio_con", "mmio_rmw", "mmio_write")
+_WLAN_WIN = {"GPP14": 0x18, "GPH2": 0x18, "PMA": 0x2000, "PCS": 0x1000, "ELBI": 0x2000, "IA": 0x1000, "DBI": 0x1000, "PMU": 0x4000}
+_WLAN_ELBI_OK = {0x054, 0x080, 0x388, 0x3A0, 0x3A4, 0x3A8, 0x3BC, 0x474, 0x1078, 0x1400, 0x1404, 0x1408}
+_WLAN_HDR_ROW = re.compile(r"\{ (\d+)u, WLK_(\w+), WLB_(\w+), (0x[0-9a-f]+)u, (0x[0-9a-f]+)u, (0x[0-9a-f]+)u, (\d+)u, (\d+)u \},")
+
+
+def _wlan_boards():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("boards", pathlib.Path(__file__).resolve().parent / "boards.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _wlan_row_allowed(blk, off, mask) -> bool:
+    """The Python twin of wlanlink.c w32_allowed (windows, per-block rules, pin masks), for the TABLE audit."""
+    if blk in ("GPP14", "GPH2"):
+        w = {0x00: 4, 0x08: 4, 0x0C: 4, 0x14: 4, 0x04: 1, 0x10: 2}.get(off)
+        if w is None or off >= _WLAN_WIN[blk]:
+            return False
+        pins = (1 << 2) if blk == "GPP14" else (1 << 0) | (1 << 1)
+        allowed = sum(((1 << w) - 1) << (p * w) for p in range(8) if pins & (1 << p))
+        return mask != 0 and (mask & ~allowed) == 0
+    if blk in ("PMA", "PCS"):
+        return off % 4 == 0 and off < _WLAN_WIN[blk]
+    if blk == "IA":
+        return off % 4 == 0 and off < 0x180
+    if blk == "ELBI":
+        return off in _WLAN_ELBI_OK
+    if blk == "DBI":
+        return off == 0x890
+    return False
+
+
+def check_wlan_seq_table(doc: dict, header: str, pin: str | None = _WLAN_SEQ_SHA, name: str = "wlan_seq.json") -> None:
+    import hashlib
+    rows, tear = doc["rows"], doc["teardown"]
+    sha = hashlib.sha256(json.dumps({"rows": rows, "teardown": tear}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    if sha != doc["table_sha256"]:
+        raise AssertionError(f"{name}: table_sha256 does not match the rows")
+    if pin is not None and sha != pin:
+        raise AssertionError(f"{name}: the table hash {sha} is not the audited {pin}: a changed table needs a new review and a new pin in tools/test-bluejay-boot.py")
+    # header = table (the allowlist the interpreter uses is exactly the audited table)
+    hdr = _WLAN_HDR_ROW.findall(header)
+    want = [(str(r["step"]), r["kind"].upper(), r["blk"] or "NONE", hex(r["off"]), hex(r["mask"]), hex(r["value"]),
+             str(r["delay_us"] if r["kind"] in ("delay", "wait_eq", "wait_mask") else (1 if r.get("probe") else 0)), str(r["polls"])) for r in rows]
+    want += [(str(t["requires"]), t["kind"].upper(), t["blk"] or "NONE", hex(t["off"]), hex(t["mask"]), hex(t["value"]), str(t["delay_us"]), str(t["polls"])) for t in tear]
+    if hdr != want or f'WLAN_SEQ_SHA256 "{sha}"' not in header:
+        raise AssertionError(f"{name}: out/wlan_seq.h differs from the JSON table")
+    # coverage
+    steps = sorted({r["step"] for r in rows})
+    if steps != [s for s in range(0, 24) if s != 22] or any(u["step"] == 22 for u in doc["unknown"]) is False or doc["last_step"] != 23 or doc["default_last_step"] != 19:
+        raise AssertionError(f"{name}: step coverage must be S00..S21 and S23 with S22 UNKNOWN, last 23, default 19: {steps}")
+    if [r["step"] for r in rows] != sorted(r["step"] for r in rows) or [r["id"] for r in rows] != list(range(len(rows))):
+        raise AssertionError(f"{name}: rows must be in step order with sequential ids")
+    # the default run (N = 19) must not release PERST nor enable the LTSSM
+    for r in rows:
+        if r["step"] <= doc["default_last_step"] and r["kind"] in _WLAN_WRITE_KINDS:
+            if r["blk"] == "GPH2" and r["off"] == 4 and (r["mask"] & r["value"] & 1):
+                raise AssertionError(f"{name}: row {r['id']} (S{r['step']:02d}) raises PERST inside the default run")
+            if r["blk"] == "ELBI" and r["off"] == 0x54:
+                raise AssertionError(f"{name}: row {r['id']} enables the LTSSM inside the default run")
+    if not any(r["step"] == 20 and r["blk"] == "GPH2" and r["off"] == 4 and r["value"] & 1 for r in rows):
+        raise AssertionError(f"{name}: S20 must be the PERST release")
+    # every write is inside the allowlist; every write kind has bounded parameters; every row has a cite and a valid tag
+    wr = [x for x in rows + tear if x["kind"] in _WLAN_WRITE_KINDS]
+    for x in wr:
+        if not _wlan_row_allowed(x["blk"], x["off"], x["mask"]):
+            raise AssertionError(f"{name}: {x['id']} writes {x['blk']}+{x['off']:#x} mask {x['mask']:#x}, outside the allowlist")
+    for x in rows + tear:
+        if not x["cite"] or x["tag"] not in ("read from source", "observed", "guess") or x["delay_us"] > 250000 or x["polls"] > 20000:
+            raise AssertionError(f"{name}: {x['id']}: cite/tag/bounds")
+        if x["kind"] in ("wait_eq", "wait_mask") and x["polls"] < 1:
+            raise AssertionError(f"{name}: {x['id']}: a wait needs a poll count")
+        if x["kind"] == "smc_iso" and (x["blk"], x["off"], x["mask"], x["value"] & ~1) != ("PMU", 0x3EC4, 1, 0):
+            raise AssertionError(f"{name}: {x['id']}: the only SMC target is PMU 0x3EC4 mask 1 value 0/1")
+    if any(x["kind"] == "smc_iso" for x in rows) is False or sum(1 for x in tear if x["kind"] == "smc_iso") != 1 or [x["kind"] for x in tear if x["requires"] == 5] != ["smc_iso"]:
+        raise AssertionError(f"{name}: exactly one isolation clear in the teardown")
+    last_t = max(i for i, x in enumerate(tear) if x["kind"] == "smc_iso")
+    if any(x["blk"] in ("PMA", "PCS", "ELBI", "IA", "DBI") for x in tear[last_t + 1:]) or tear[0]["requires"] != 20 or tear[0]["off"] != 4 or tear[0]["value"] != 0:
+        raise AssertionError(f"{name}: the teardown starts with PERST low and the isolation clear comes after every PHY/controller access")
+    ids = {t["id"] for t in tear}
+    exempt = lambda r: r["step"] == 7 and (r["off"] >= 8 or r["kind"] == "gpio_con" and r["restore"] is None)
+    for r in rows:
+        if r["kind"] in _WLAN_WRITE_KINDS + ("smc_iso",) and r["restore"] not in ids and not exempt(r):
+            raise AssertionError(f"{name}: row {r['id']} (S{r['step']:02d}) has no restore action")
+    # the numbers the report quotes
+    targets = {(x["blk"], x["off"]) for x in wr}
+    counts = {"rows": len(rows), "teardown": len(tear), "write_rows": len(wr), "distinct_targets": len(targets)}
+    per_blk = {}
+    for b, _ in targets:
+        per_blk[b] = per_blk.get(b, 0) + 1
+    if pin is not None and (counts != _WLAN_SEQ_COUNTS or per_blk != _WLAN_SEQ_TARGET_BLOCKS):
+        raise AssertionError(f"{name}: counts {counts} / {per_blk} differ from the audited {_WLAN_SEQ_COUNTS} / {_WLAN_SEQ_TARGET_BLOCKS}")
+
+
+def wlan_seq_selftest() -> int:
+    import copy
+    root = pathlib.Path(__file__).resolve().parents[1]
+    boards = _wlan_boards()
+    doc = json.loads((root / "soc/google/gs101/wlan_seq.json").read_text())
+    header = boards.wlan_seq_render(doc)
+    check_wlan_seq_table(doc, header)  # control must pass
+
+    def mut(fn, pin=None):
+        d = copy.deepcopy(doc)
+        fn(d)
+        h = boards.wlan_seq_render(d) if pin is not False else header
+        return d, h
+
+    def add_row(d, **kw):
+        base = {"id": len(d["rows"]), "step": 19, "kind": "mmio_write", "blk": "PMA", "off": 0, "mask": 0xFFFFFFFF, "value": 0, "delay_us": 0, "polls": 0, "restore": "T07", "cite": "x", "tag": "guess", "probe": False}
+        base.update(kw)
+        d["rows"].append(base)
+        d["rows"].sort(key=lambda r: r["step"])  # stable: the mutation lands in step order, so the renderer's order check does not pre-empt the audit under test
+        for n, r in enumerate(d["rows"]):
+            r["id"] = n
+
+    def resha(d):
+        import hashlib
+        d["table_sha256"] = hashlib.sha256(json.dumps({"rows": d["rows"], "teardown": d["teardown"]}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+    def f_extra_pa(d):
+        add_row(d, blk="PMA", off=0x2000)
+        resha(d)
+
+    def f_other_pin(d):
+        add_row(d, kind="gpio_dat", blk="GPH2", off=4, mask=1 << 5, value=1 << 5, restore="T01")
+        resha(d)
+
+    def f_perst_early(d):
+        add_row(d, kind="gpio_dat", blk="GPH2", off=4, mask=1, value=1, restore="T01")
+        resha(d)
+
+    def f_unknown_row(d):
+        add_row(d, step=22, kind="mmio_write", blk="ELBI", off=0x54, value=1, restore="T02")
+        resha(d)
+
+    def f_dbi(d):
+        add_row(d, blk="DBI", off=0x8BC, value=1, step=19)
+        resha(d)
+
+    def f_restore_removed(d):
+        next(r for r in d["rows"] if r["step"] == 8 and r["kind"] == "mmio_write")["restore"] = None
+        resha(d)
+
+    def f_iso_last(d):
+        d["teardown"].append(dict(d["teardown"][0], id=f"T{len(d['teardown']) + 1:02d}", blk="PMA", off=0x400, kind="mmio_write", requires=8))
+        resha(d)
+
+    def f_other_smc(d):
+        r = next(x for x in d["rows"] if x["kind"] == "smc_iso")
+        r["off"] = 0x3EC0
+        resha(d)
+
+    def f_step_overflow(d):
+        add_row(d, step=24)
+        resha(d)
+
+    cases = [
+        ("an extra write beyond a window", f_extra_pa, None, "outside the allowlist"),
+        ("an extra pin of a GPIO bank", f_other_pin, None, "outside the allowlist"),
+        ("an extra DBI register", f_dbi, None, "outside the allowlist"),
+        ("PERST raised inside the default run", f_perst_early, None, "default run"),
+        ("rows for the UNKNOWN step S22", f_unknown_row, None, "step coverage"),
+        ("a restore removed", f_restore_removed, None, "no restore action"),
+        ("a PHY access after the isolation clear", f_iso_last, None, "isolation clear"),
+        ("another SMC target", f_other_smc, None, "only SMC target"),
+        ("a step index overflow", f_step_overflow, None, "malformed"),
+        ("a changed value (hash pin)", lambda d: (d["rows"][7].__setitem__("value", 2), resha(d)), _WLAN_SEQ_SHA, "audited"),
+    ]
+    caught = 0
+    for label, fn, pin, why in cases:
+        d = copy.deepcopy(doc)
+        fn(d)
+        try:
+            h = boards.wlan_seq_render(d)
+            check_wlan_seq_table(d, h, pin=pin)
+        except (AssertionError, ValueError) as exc:
+            caught += 1
+            print(f"self-test caught: wlan_seq {label} -> {exc}")
+            assert why in str(exc) or why == "malformed", (label, str(exc))
+        else:
+            raise AssertionError(f"wlan_seq self-test FAILED to catch: {label}")
+    # the header must be the table: edit one cell of the header
+    bad = header.replace(", 0x28u, 0u, 0u },", ", 0x29u, 0u, 0u },", 1)
+    assert bad != header
+    try:
+        check_wlan_seq_table(doc, bad)
+    except AssertionError as exc:
+        caught += 1
+        print(f"self-test caught: wlan_seq a header cell differing from the JSON -> {exc}")
+    else:
+        raise AssertionError("wlan_seq self-test FAILED to catch a header cell")
+    # a hand edit that keeps the old hash is refused when the header is generated
+    d = copy.deepcopy(doc)
+    d["rows"][7]["value"] = 2
+    try:
+        boards.wlan_seq_render(d)
+    except ValueError as exc:
+        caught += 1
+        print(f"self-test caught: wlan_seq a row edited without the hash -> {exc}")
+    else:
+        raise AssertionError("wlan_seq self-test FAILED to catch an edit with the old hash")
+    print(f"PASS wlan_seq table self-test: {caught}/{len(cases) + 2} bad tables rejected")
+    return caught
+
+
+_WLANLINK_KW = dict(base_macro=None, strict=True, guard_funcs=("w32_allowed",))
+_WLANLINK_ALLOWED_UNDEF = {"try_read32", "try_write32", "con_str", "counter_freq", "wait_ticks", "touch_ticks", "pstore_save", "wlan_link_iso_set", "wlan_link_iso_clear"}
+_WLANLINK_PINS = {
+    "w32_allowed": "if(((old^v)&~mask)!=0u)return0;if(pa>=WLAN_GPP14&&pa<WLAN_GPP14+0x18u)return(mask&~gpio_field_mask((uint32_t)(pa-WLAN_GPP14),1u<<(unsigned)WLAN_GPP14_EN_PIN))==0u&&mask!=0u;"
+                   "if(pa>=WLAN_GPH2&&pa<WLAN_GPH2+0x18u)return(mask&~gpio_field_mask((uint32_t)(pa-WLAN_GPH2),(1u<<(unsigned)WLAN_GPH2_PERST_PIN)|2u))==0u&&mask!=0u;"
+                   "if(pa>=WLAN_PMA&&pa<WLAN_PMA+0x2000u)return!(pa&3u);if(pa>=WLAN_PCS&&pa<WLAN_PCS+0x1000u)return!(pa&3u);if(pa>=WLAN_IA&&pa<WLAN_IA+0x180u)return!(pa&3u);"
+                   "if(pa>=WLAN_ELBI&&pa<WLAN_ELBI+0x2000u)returnelbi_ok((uint32_t)(pa-WLAN_ELBI));if(pa==WLAN_DBI+0x890u)return1;return0;",
+    "elbi_ok": "returnoff==0x054u||off==0x080u||off==0x388u||off==0x3a0u||off==0x3a4u||off==0x3a8u||off==0x3bcu||off==0x474u||off==0x1078u||off==0x1400u||off==0x1404u||off==0x1408u;",
+    "size_of": "if(blk==WLB_GPP14||blk==WLB_GPH2)return0x18u;if(blk==WLB_PMA||blk==WLB_ELBI)return0x2000u;if(blk==WLB_PCS||blk==WLB_IA||blk==WLB_DBI)return0x1000u;if(blk==WLB_PMU)return0x4000u;return0u;",
+    "gpio_field_mask": "uint32_tm=0,w;if(off==0x00u||off==0x08u||off==0x0cu||off==0x14u)w=4u;elseif(off==0x04u)w=1u;elseif(off==0x10u)w=2u;elsereturn0;for(unsignedpin=0;pin<8u;pin++)if(pins&(1u<<pin))m|=((1u<<w)-1u)<<(pin*w);returnm;",
+}
+
+# sha256 of the whitespace-stripped body of each safety-critical function (reviewed text, 2026-10-23). A change needs a new review AND a new pin here: these are what guarantee the teardown runs, a
+# block is probed before it is touched, the address is bounded and the writer's mask rule holds (Opus review H1: the text pins above cover only the allowlist).
+_WLANLINK_BODY_SHA = {
+    "w32": "cb467892742fbe9a64e2338f61fb5f4e6c1a81afc37303e63defcfee49868bce",
+    "pa_of": "9d86b866272f0aa42d1adb2ad38ddecf54d9bba0d5e69825d725eb95ec04a2a6",
+    "base_of": "0469f7f00771c93ec8ae6681e257e345b85db6f576adce7f1c8ac6acf7e14a50",
+    "need_probe": "f1cdcfd58982cc5be5d8b192ab4355a6dea79183379420c3cb529fbf050c89b8",
+    "delay_us": "10a70ec802b5fa345f4b514fa73dd3b1a3e383a977aedb6f4f5f1271c386dfcd",
+    "poll_row": "2bab73a5704648f41011acc830dfa02985d0a67c197f790eb79765ab0b5a6877",
+    "run_row": "3675109c7d9e0db8a330efc2452711a7287235db1bf762bcff750a341bdd7b0d",
+    "wlan_link_run": "c2af77c8d0da0d28f8e8aeb0f1e8c6a8abc724fd9c3e24d9becca0af39100cd2",
+}
+
+
+def check_wlanlink_source_text(src: str, name: str = "wlanlink.c") -> None:
+    check_usbgadget_source_text(src, name, **_WLANLINK_KW)
+    code = _strip_c_comments(src)
+    norm = re.sub(r"\s+", "", code)
+    for bad in ("volatile", "__asm__", "asm", "goto", "smc", "hvc"):
+        if re.search(r"\b" + bad + r"\b", code):
+            raise AssertionError(f"{name}: '{bad}' is banned here (the SMC steps are wlan_link_iso_set/clear in wlansmc.c)")
+    if re.search(r"\bdo\s*\{|for\s*\(\s*;", code):
+        raise AssertionError(f"{name}: unbounded loop construct")
+    for fn, want in _WLANLINK_PINS.items():
+        a, b = _c_function_span(code, fn)
+        body = re.sub(r"\s+", "", code[a:b])
+        body = body[body.index("{") + 1:-1]
+        if body != want:
+            raise AssertionError(f"{name}: {fn} is not the audited text: {body}")
+    import hashlib
+    for fn, want in _WLANLINK_BODY_SHA.items():
+        a, b = _c_function_span(code, fn)
+        body = re.sub(r"\s+", "", code[a:b])
+        got = hashlib.sha256(body[body.index("{") + 1:-1].encode()).hexdigest()
+        if got != want:
+            raise AssertionError(f"{name}: {fn} is not the reviewed text (sha256 {got}); a change needs a new review and a new pin in tools/test-bluejay-boot.py")
+    # reads can have side effects on MMIO: try_read32 only inside r32 (PMU words 0x3EC0/0x3EC4 + block windows) and w32 (the RMW old value)
+    spans = [_c_function_span(code, f) for f in ("r32", "w32")]
+    for m in re.finditer(r"\btry_read32\s*\(", code):
+        if not any(x <= m.start() < y for x, y in spans):
+            raise AssertionError(f"{name}: try_read32 outside r32/w32")
+    # the single writer
+    wa, wb = _c_function_span(code, "w32")
+    w = re.sub(r"\s+", "", code[wa:wb])
+    for need in ("if(!get_row(idx,tear,&r))return-2;", "if(r.kind!=WLK_GPIO_DAT&&r.kind!=WLK_GPIO_CON&&r.kind!=WLK_MMIO_RMW&&r.kind!=WLK_MMIO_WRITE)return-2;", "if(!tear&&r.step>WLAN_LINK_N)return-2;",
+                 "pa=pa_of(r.blk,r.off);if(!pa)return-2;", "if(r.kind==WLK_MMIO_WRITE){old=r.val;}elseif(!try_read32(pa,&old)){return-1;}", "v=(old&~r.mask)|(r.val&r.mask);",
+                 "if(!w32_allowed(pa,r.mask,old,v))return-2;", "returntry_write32(pa,v)?0:-1;"):
+        if need not in w:
+            raise AssertionError(f"{name}: w32 lost '{need}'")
+    if "__attribute__((noipa))staticintw32(unsignedidx,inttear)" not in norm:
+        raise AssertionError(f"{name}: w32 must be noipa with the signature (unsigned idx, int tear): the row comes from the const table, never from the caller")
+    if len(re.findall(r"\bw32\s*\(", code)) != 2 or "e=w32(idx,tear);" not in norm:
+        raise AssertionError(f"{name}: w32 has exactly one call site: run_row")
+    if len(re.findall(r"\bwlan_link_iso_set\s*\(", code)) != 1 or len(re.findall(r"\bwlan_link_iso_clear\s*\(", code)) != 1 or "e=(r.val&1u)?wlan_link_iso_set(rd):wlan_link_iso_clear(rd);" not in norm:
+        raise AssertionError(f"{name}: the SMC steps: exactly one call each, only for a smc_iso row")
+    if "if(r.blk!=WLB_PMU||r.off!=0x3EC4u||r.mask!=1u)returnST_REFUSED;" not in norm:
+        raise AssertionError(f"{name}: the SMC row must be PMU 0x3EC4 mask 1")
+    # pins: constants, probe rule, refusal before the first write, teardown always, bounded loops
+    for need in ("#defineDELAY_MAX_US250000u", "#definePOLL_CAP20000u", "#defineWLAN_LINK_NWLAN_SEQ_DEFAULT_N", "if(r.a>DELAY_MAX_US)returnST_REFUSED;",
+                 "if(r.blk!=WLB_NONE&&(need_probe(r.blk)&~*probed)&&!(r.kind==WLK_READ_ONLY&&r.a==1u))returnST_REFUSED;",
+                 "if(r.a==1u)*probed|=need_probe(r.blk);", "if(blk==WLB_PMU&&off!=0x3EC0u&&off!=0x3EC4u)return0;",
+                 "if(!nrows){step_line('S',s,\"refused:UNKNOWNstep(nocitedrows),nothingwritten\",0,0,0,0,0,0);return2;}",
+                 "if(need_probe(r.blk)&~probed)continue;", "for(i=0;started&&i<WLAN_SEQ_NTEAR;i++){", "if(!get_row(i,1,&r)||r.step>hi)continue;",
+                 "if(!counter_freq()){", "if(stopped==ST_OK)step_line('S',s,\"ok\"", "for(s=0;s<=WLAN_LINK_N&&stopped==ST_OK;s++){", "pstore_save();//the lastline"):
+        if need.replace("//the lastline", "") not in norm:
+            raise AssertionError(f"{name}: lost '{need}'")
+    ra, rb = _c_function_span(code, "wlan_link_run")
+    run = re.sub(r"\s+", "", code[ra:rb])
+    plan, main, tdn = run.find("for(s=0;s<=WLAN_LINK_N;s++){"), run.find("for(s=0;s<=WLAN_LINK_N&&stopped==ST_OK;s++){"), run.find("for(i=0;started&&i<WLAN_SEQ_NTEAR;i++){")
+    if not 0 < plan < main < tdn or run.count("run_row(") != 2 or "if(started&&" in run or "if(stopped" in run[tdn - 40:tdn]:
+        raise AssertionError(f"{name}: order = plan check, steps, teardown (unconditional)")
+    allowed_for = [r"i<sizeof\(t\)&&v", r"i<digits&&pos\+1<cap", r"pin<8u", r"i<r->b&&i<POLL_CAP", r"i<16u", r"s<=WLAN_LINK_N;", r"s<=WLAN_LINK_N&&stopped==ST_OK", r"i<WLAN_SEQ_NROWS", r"started&&i<WLAN_SEQ_NTEAR"]
+    for m in re.finditer(r"\bfor\s*\(((?:[^()]|\([^()]*\))*)\)", code):
+        h = re.sub(r"\s+", "", m.group(1))
+        if not any(re.search(a, h) for a in allowed_for):
+            raise AssertionError(f"{name}: unaudited loop header 'for ({m.group(1)})'")
+    for m in re.finditer(r"\bwhile\b", code):
+        if not any(a <= m.start() < b for a, b in [_c_function_span(code, "put_txt"), _c_function_span(code, "put_dec")]):
+            raise AssertionError(f"{name}: 'while' outside the string helpers")
+
+
+def wlanlink_source_selftest() -> int:
+    good = (pathlib.Path(__file__).resolve().parents[1] / "shim" / "wlanlink.c").read_text()
+    check_wlanlink_source_text(good)  # control must pass
+    ins = "static int get_row"
+    cases = [
+        ("inline asm store", good.replace(ins, 'static void evil(void) { __asm__ volatile("str wzr, [x0]"); }\n' + ins, 1)),
+        ("second write path", good.replace(ins, "static void evil(void) { try_write32(0x14440004UL, 0); }\n" + ins, 1)),
+        ("w32 skips the allowlist", good.replace("if (!w32_allowed(pa, r.mask, old, v))", "if (0)", 1)),
+        ("w32 ignores the step bound", good.replace("if (!tear && r.step > WLAN_LINK_N)", "if (0)", 1)),
+        ("w32 takes the row from the caller", good.replace("static int w32(unsigned idx, int tear)", "static int w32(unsigned idx, int tear, uint32_t extra)", 1)),
+        ("allowlist: GPP14 any pin", good.replace("1u << (unsigned)WLAN_GPP14_EN_PIN)) == 0u && mask != 0u;", "0xffu)) == 0u && mask != 0u;", 1)),
+        ("allowlist: GPH2 pin 2", good.replace("(1u << (unsigned)WLAN_GPH2_PERST_PIN) | 2u", "(1u << (unsigned)WLAN_GPH2_PERST_PIN) | 6u", 1)),
+        ("allowlist: DBI +0x8bc", good.replace("pa == WLAN_DBI + 0x890u", "pa == WLAN_DBI + 0x8bcu", 1)),
+        ("allowlist: ELBI +0x2c8", good.replace("off == 0x054u ||", "off == 0x054u || off == 0x2c8u ||", 1)),
+        ("allowlist: PMA window wider", good.replace("pa < WLAN_PMA + 0x2000u", "pa < WLAN_PMA + 0x4000u", 1)),
+        ("window size", good.replace("if (blk == WLB_PMA || blk == WLB_ELBI)\n\t\treturn 0x2000u;", "if (blk == WLB_PMA || blk == WLB_ELBI)\n\t\treturn 0x20000u;", 1)),
+        ("no probe rule", good.replace("(need_probe(r.blk) & ~*probed) && ", "0 && ", 1)),
+        ("probe never recorded", good.replace("\t\tif (r.a == 1u)\n\t\t\t*probed |= need_probe(r.blk);", "", 1)),
+        ("no UNKNOWN-step refusal", good.replace("\t\tif (!nrows) {", "\t\tif (0) {", 1)),
+        ("teardown conditional on the result", good.replace("for (i = 0; started && i < WLAN_SEQ_NTEAR; i++) {", "for (i = 0; started && stopped == ST_OK && i < WLAN_SEQ_NTEAR; i++) {", 1)),
+        ("teardown skips nothing it should run", good.replace("if (!get_row(i, 1, &r) || r.step > hi)", "if (!get_row(i, 1, &r))", 1)),
+        ("a second smc call", good.replace("e = (r.val & 1u) ? wlan_link_iso_set(rd) : wlan_link_iso_clear(rd);", "e = (r.val & 1u) ? wlan_link_iso_set(rd) : wlan_link_iso_clear(rd);\n\t\t(void)wlan_link_iso_set(rd);", 1)),
+        ("a retry loop", good.replace("\t\t\tst = run_row(i, 0, &probed, &rd);\n\t\t\tif (st != ST_OK) {", "\t\t\tst = run_row(i, 0, &probed, &rd);\n\t\t\twhile (st == ST_TIMEOUT)\n\t\t\t\tst = run_row(i, 0, &probed, &rd);\n\t\t\tif (st != ST_OK) {", 1)),
+        ("unbounded poll", good.replace("i < r->b && i < POLL_CAP", "i < r->b", 1)),
+        ("longer delay", good.replace("#define DELAY_MAX_US	250000u", "#define DELAY_MAX_US	2500000u", 1)),
+        ("another default N", good.replace("#define WLAN_LINK_N	WLAN_SEQ_DEFAULT_N", "#define WLAN_LINK_N	WLAN_SEQ_LAST", 1)),
+        ("teardown never marked started", good.replace("\t\tstarted = 1;\n", "", 1)),
+        ("teardown hi not tracked", good.replace("\t\thi = s;\n", "", 1)),
+        ("no probe needed", good.replace("return (blk == WLB_PMA || blk == WLB_PCS", "return 0u && (blk == WLB_PMA || blk == WLB_PCS", 1)),
+        ("pa_of without the window bound", good.replace(" || off >= size_of(blk))", ")", 1)),
+        ("swapped block base", good.replace("return WLAN_PCS;", "return WLAN_PMA;", 1)),
+        ("value tweaked after the allowlist", good.replace("\treturn try_write32(pa, v) ? 0 : -1;", "\tv |= 0x80u;\n\treturn try_write32(pa, v) ? 0 : -1;", 1)),
+        ("partial-mask full write allowed", good.replace("r.kind == WLK_MMIO_WRITE && r.mask != 0xFFFFFFFFu", "0", 1)),
+        ("GPIO read-back removed", good.replace("\t\tif ((v & r.mask) != (r.val & r.mask))\n\t\t\treturn ST_FAULT;", "", 1)),
+        ("poll timeout reported as ok", good.replace("\treturn ST_TIMEOUT;\n}", "\treturn ST_OK;\n}", 1)),
+        ("teardown stops at the first failure", good.replace("\t\t\ttear_bad++;", "\t\t\ttear_bad++;\n\t\t\tbreak;", 1)),
+        ("a raw read of another register", good.replace(ins, "static void evil(uint32_t *v) { (void)try_read32(0x17463EC8UL, v); }\n" + ins, 1)),
+    ]
+    caught = 0
+    for label, bad in cases:
+        assert bad != good, f"wlanlink source selftest case did not mutate: {label}"
+        try:
+            check_wlanlink_source_text(bad, "selftest")
+        except AssertionError as exc:
+            caught += 1
+            print(f"self-test caught: wlanlink source {label} -> {exc}")
+        else:
+            raise AssertionError(f"wlanlink source self-test FAILED to catch: {label}")
+    print(f"PASS wlanlink source self-test: {caught}/{len(cases)} bad sources rejected")
+    return caught
+
+
+_WLANLINK_W32_CONSTS = (r"#0x890\b", r"movk\s+x\d+, #0x1480, lsl #16", r"cmp\s+x\d+, #0x17f\b", r"cmp\s+x\d+, #0xfff\b", r"cmp\s+x\d+, #0x17\b", r"cmp\s+w\d+, #0x54\b", r"cmp\s+w\d+, #0x80\b",
+                        r"cmp\s+w\d+, #0x474\b", r"cmp\s+w\d+, #0x3bc\b")
+
+
+def check_wlanlink_w32_object_text(disasm: str, name: str = "wlanlink.o") -> None:
+    """The COMPILED w32 keeps its independent allowlist (review B1 of wlanen: a specialised helper loses its address compare): the window / offset compare constants are in it, there is one
+    try_write32 call and one try_read32 call in it, and w32 is called from exactly one place."""
+    blocks = re.split(r"(?m)^(?=[0-9a-f]+ <[^>]+>:$)", disasm)
+    w = [b for b in blocks if re.match(r"[0-9a-f]+ <w32>:", b)]
+    if len(w) != 1:
+        raise AssertionError(f"{name}: expected exactly one w32 function, found {len(w)}")
+    for rx in _WLANLINK_W32_CONSTS:
+        if not re.search(rx, w[0]):
+            raise AssertionError(f"{name}: the compiled w32 lost the allowlist compare /{rx}/ (specialised away?)")
+    if len(re.findall(r"R_AARCH64_CALL26\s+try_write32", w[0])) != 1 or len(re.findall(r"R_AARCH64_CALL26\s+try_read32", w[0])) != 1:
+        raise AssertionError(f"{name}: w32 has exactly one try_write32 and one try_read32 call")
+    callers = [b.splitlines()[0] for b in blocks if b is not w[0] and re.search(r"\bbl\s+[0-9a-f]+ <w32>", b)]
+    if len(callers) != 1 or "<run_row" not in callers[0]:
+        raise AssertionError(f"{name}: w32 must have exactly one caller, run_row: {callers}")
+
+
+def wlanlink_object_selftest(obj_path: pathlib.Path) -> int:
+    disasm = _touch_obj_info(obj_path)[0]
+    check_wlanlink_w32_object_text(disasm, "wlanlink selftest")  # control
+    wblk = re.search(r"(?ms)^[0-9a-f]+ <w32>:\n.*?(?=^[0-9a-f]+ <|\Z)", disasm).group(0)
+    cases = [
+        ("w32 specialised: no compares", disasm.replace(wblk, "0000000000000100 <w32>:\n 100:\ta9bd7bfd \tstp\tx29, x30, [sp, #-48]!\n 104:\t94000000 \tbl\t0 <try_read32>\n\t\t\t104: R_AARCH64_CALL26\ttry_read32\n 108:\t94000000 \tbl\t0 <try_write32>\n\t\t\t108: R_AARCH64_CALL26\ttry_write32\n 10c:\td65f03c0 \tret\n", 1)),
+        ("DBI offset changed", disasm.replace("#0x890", "#0x8bc", 1)),
+        ("IA window widened", re.sub(r"(cmp\s+x\d+, )#0x17f\b", r"\1#0x1ff", disasm, count=1)),
+        ("ELBI offset dropped", re.sub(r"(cmp\s+w\d+, )#0x54\b", r"\1#0x55", disasm, count=1)),
+        ("a second try_write32 in w32", disasm.replace("R_AARCH64_CALL26\ttry_write32", "R_AARCH64_CALL26\ttry_write32\n 1fc:\t94000000 \tbl\t0 <try_write32>\n\t\t\t1fc: R_AARCH64_CALL26\ttry_write32", 1)),
+        ("a second caller of w32", disasm + "0000000000fff000 <evil>:\n fff000:\t97fffe78 \tbl\t100 <w32>\n fff004:\td65f03c0 \tret\n"),
+    ]
+    caught = 0
+    for label, bad in cases:
+        assert bad != disasm, f"wlanlink object selftest case did not mutate: {label}"
+        try:
+            check_wlanlink_w32_object_text(bad, "wlanlink selftest")
+        except AssertionError as exc:
+            caught += 1
+            print(f"self-test caught: wlanlink object {label} -> {exc}")
+        else:
+            raise AssertionError(f"wlanlink object self-test FAILED to catch: {label}")
+    print(f"PASS wlanlink w32 object self-test: {caught}/{len(cases)} bad objects rejected")
+    return caught
+
+
 def check_shim_wlan_sequence(src: str, name: str = "shim.c") -> None:
     """shim.c calls wlan_rails(), wlan_smc_read() and wlan_en_run() exactly once each, inside their own flag, in the WLAN section (after wlan_probe_l1, before the level-2 gate), in that order."""
     code = _strip_c_comments(src)
     norm = re.sub(r"\s+", "", code)
     pos = []
-    for fn, flag in (("wlan_rails", "WLAN_RAILS"), ("wlan_smc_read", "WLAN_SMC_READ"), ("wlan_iso_run", "WLAN_ISO_RUN"), ("wlan_en_run", "WLAN_EN_RUN")):
+    for fn, flag in (("wlan_rails", "WLAN_RAILS"), ("wlan_link_run", "WLAN_LINK_RUN"), ("wlan_smc_read", "WLAN_SMC_READ"), ("wlan_iso_run", "WLAN_ISO_RUN"), ("wlan_en_run", "WLAN_EN_RUN")):
         if len(re.findall(r"\b" + fn + r"\s*\(", code)) != 1 or f"#ifdef{flag}" not in norm or f"(void){fn}();" not in norm:
             raise AssertionError(f"{name}: {fn}() must be called exactly once, as `(void){fn}();` inside #ifdef {flag}")
         i = norm.find(f"(void){fn}();")
@@ -2760,7 +3208,9 @@ def check_shim_wlan_sequence(src: str, name: str = "shim.c") -> None:
         pos.append(i)
     if not re.search(r"#if defined\(WLAN_ISO_RUN\) && defined\(WLAN_EN_RUN\)\n#error", src):
         raise AssertionError(f"{name}: --wlan-iso and --wlan-en must be impossible to combine (#error in shim.c)")
-    m = re.search(r"#ifdef WLAN_ISO_RUN\n(?:(?!#endif).)*?l2 skipped(?:(?!#endif).)*?#else\n(.*?)#endif\t/\* !WLAN_ISO_RUN \*/", src, re.S)
+    if not re.search(r"#if defined\(WLAN_LINK_RUN\) && \(defined\(WLAN_ISO_RUN\) \|\| defined\(WLAN_EN_RUN\) \|\| defined\(WLAN_SMC_READ\)\)\n#error", src):
+        raise AssertionError(f"{name}: --wlan-link must be impossible to combine with --wlan-iso / --wlan-en / --wlan-smc-read (#error in shim.c)")
+    m = re.search(r"#if defined\(WLAN_ISO_RUN\) \|\| defined\(WLAN_LINK_RUN\)\n(?:(?!#endif).)*?l2 skipped(?:(?!#endif).)*?#else\n(.*?)#endif\t/\* !\(WLAN_ISO_RUN \|\| WLAN_LINK_RUN\) \*/", src, re.S)
     if not m or "wlan_probe_l2_open()" not in m.group(1) or "wlan_probe_l2_group(4);" not in m.group(1) or len(re.findall(r"wlan_probe_l2_(?:open|group)\(", code)) != 3:
         raise AssertionError(f"{name}: in a WLAN_ISO_RUN image every level-2 read (wlan_probe_l2_open / _group, SUMMARY included) must sit in the #else of `#ifdef WLAN_ISO_RUN` (review 2 F2)")
     if pos != sorted(pos):
@@ -2776,9 +3226,12 @@ def wlan_shim_selftest() -> int:
         ("writer before the rails", shim_src.replace("(void)wlan_rails();", "(void)0;", 1).replace("(void)wlan_en_run();", "(void)wlan_en_run();\n\t(void)wlan_rails();", 1)),
         ("a second wlan_smc_read call", shim_src.replace("\t(void)wlan_smc_read();\n", "\t(void)wlan_smc_read();\n\t(void)wlan_smc_read();\n", 1)),
         ("wlan_smc_read outside its flag", shim_src.replace("#ifdef WLAN_SMC_READ\n", "#if 1\n", 1)),
-        ("level 2 not skipped in an iso image", shim_src.replace("#ifdef WLAN_ISO_RUN\n\t/* review 2 F2", "#if 0\n\t/* review 2 F2", 1)),
+        ("level 2 not skipped in an iso image", shim_src.replace("#if defined(WLAN_ISO_RUN) || defined(WLAN_LINK_RUN)\n\t/* review 2 F2", "#if 0\n\t/* review 2 F2", 1)),
         ("iso and en combinable", shim_src.replace("#if defined(WLAN_ISO_RUN) && defined(WLAN_EN_RUN)\n#error", "#if 0\n#error", 1)),
-        ("level-2 SUMMARY outside the skip", shim_src.replace("\twlan_probe_l2_group(4);\t\t\t/* SUMMARY, also when gated */\n#endif\t/* !WLAN_ISO_RUN */", "#endif\t/* !WLAN_ISO_RUN */\n\twlan_probe_l2_group(4);", 1)),
+        ("level-2 SUMMARY outside the skip", shim_src.replace("\twlan_probe_l2_group(4);\t\t\t/* SUMMARY, also when gated */\n#endif\t/* !(WLAN_ISO_RUN || WLAN_LINK_RUN) */", "#endif\t/* !(WLAN_ISO_RUN || WLAN_LINK_RUN) */\n\twlan_probe_l2_group(4);", 1)),
+        ("link combinable with iso", shim_src.replace("#if defined(WLAN_LINK_RUN) && (defined(WLAN_ISO_RUN) || defined(WLAN_EN_RUN) || defined(WLAN_SMC_READ))\n#error", "#if 0\n#error", 1)),
+        ("a second wlan_link_run call", shim_src.replace("\t(void)wlan_link_run();\n", "\t(void)wlan_link_run();\n\t(void)wlan_link_run();\n", 1)),
+        ("wlan_link_run outside its flag", shim_src.replace("#ifdef WLAN_LINK_RUN\n\t/* W3a", "#if 1\n\t/* W3a", 1)),
         ("a second wlan_iso_run call", shim_src.replace("\t(void)wlan_iso_run();\n", "\t(void)wlan_iso_run();\n\t(void)wlan_iso_run();\n", 1)),
         ("wlan_iso_run outside its flag", shim_src.replace("#ifdef WLAN_ISO_RUN\n", "#if 1\n", 1)),
     ]
@@ -3313,6 +3766,24 @@ def main() -> None:
     wlansmc_object_selftest(repo_root / "shim" / "out" / "wlansmc_iso.o", True)
     n_stores = check_wlansmc_object(repo_root / "shim" / "out" / "wlansmc_iso.o", True)
     print(f"PASS wlansmc_iso object audit: exactly three smc (read, rmw set, rmw clear); the RMW pair is constants only: x0 = 0x82000504, x1 = 0x17463EC4, x2 = 2, x3 = 1, x4 = 1 / 0; {n_stores} stores, all stack/argument based")
+    wlan_seq_selftest()
+    _doc = json.loads((repo_root / "soc/google/gs101/wlan_seq.json").read_text())
+    check_wlan_seq_table(_doc, (repo_root / "shim" / "out" / "wlan_seq.h").read_text())
+    print(f"PASS wlan_seq table audit: sha256 {_WLAN_SEQ_SHA[:16]} pinned; header == JSON; S00..S21 + S23 (S22 UNKNOWN); the default run (N=19) never raises PERST or enables the LTSSM; "
+          f"{_WLAN_SEQ_COUNTS['write_rows']} write rows on {_WLAN_SEQ_COUNTS['distinct_targets']} distinct registers in 7 blocks, all inside the allowlist; every write row has a restore")
+    wlanlink_source_selftest()
+    check_wlanlink_source_text((repo_root / "shim" / "wlanlink.c").read_text())
+    print("PASS wlanlink source audit: strict writer audit; the single writer w32(idx, tear) reads the row from the const table and re-checks pa/mask/value against the pinned allowlist; "
+          "probe-before-touch, UNKNOWN-step refusal before the first write, unconditional teardown, bounded loops, SMC only through wlan_link_iso_set/clear")
+    touchprobe_object_selftest(repo_root / "shim" / "out" / "wlanlink.o", _WLANLINK_ALLOWED_UNDEF, "wlanlink")
+    n_stores = check_touchprobe_object(repo_root / "shim" / "out" / "wlanlink.o", _WLANLINK_ALLOWED_UNDEF)
+    print(f"PASS wlanlink object audit: try_write32 referenced only by a bl inside w32; {n_stores} stores outside w32, all stack/argument based; undef subset")
+    wlanlink_object_selftest(repo_root / "shim" / "out" / "wlanlink.o")
+    check_wlanlink_w32_object_text(_touch_obj_info(repo_root / "shim" / "out" / "wlanlink.o")[0], "wlanlink.o")
+    print("PASS wlanlink w32 object audit: the compiled w32 keeps its window / offset compares, one try_write32, one caller (run_row)")
+    wlansmc_object_selftest(repo_root / "shim" / "out" / "wlansmc_link.o", True)
+    n_stores = check_wlansmc_object(repo_root / "shim" / "out" / "wlansmc_link.o", True)
+    print(f"PASS wlansmc_link object audit: exactly three smc (read, rmw set, rmw clear), constants only; {n_stores} stores, all stack/argument based")
     wlan_shim_selftest()
     print("PASS wlan shim sequence audit: wlan_rails(), wlan_smc_read(), wlan_iso_run() and wlan_en_run() called once each, in their own flags (+ wlan_iso_run), the read-only parts before the writers")
     gpujob_source_selftest()
