@@ -3,10 +3,10 @@
  *
  * Every value it uses comes from out/wlan_seq.h = soc/google/gs101/wlan_seq.json (tools/gen_wlan_seq.py, cites per row in the JSON). This file adds an INDEPENDENT allowlist (w32_allowed: blocks, offsets,
  * pin masks), so a corrupted table or index cannot write anywhere else, and the runtime rules:
- *  - a block (PMA, PCS, ELBI, IA, DBI, ATU) is touched only after its probe row (a fault-guarded READ) succeeded in this run (docs/research/29 section 14: first unreadable => stop);
+ *  - a block (PMA, PCS, ELBI, IA, DBI, ATU, CFG) is touched only after its probe row (a fault-guarded READ) succeeded in this run (docs/research/29 section 14: first unreadable => stop);
  *  - rows are executed in table order, the run stops at the first failing row, the teardown always runs for the steps that were started;
  *  - delays are bounded (<= 250 ms), polls are bounded by count AND by the counter.
- * Window sizes: GPP14/GPH2 banks = CON..PUDPDN (+0x00..+0x14, pinctrl-exynos-arm64.c:47-50), PMA 0x2000, PCS 0x1000, ELBI 0x2000, I/A 0x1000, DBI window 0x1000 (gs101-pcie.dtsi:57-63).
+ * Window sizes: GPP14/GPH2 banks = CON..PUDPDN (+0x00..+0x14, pinctrl-exynos-arm64.c:47-50), PMA 0x2000, PCS 0x1000, ELBI 0x2000, I/A 0x1000, DBI window 0x1000, ATU 0x1000 (DBI + 0x300000, pcie-designware.h:202, inside the 0x301000 DBI reg), CFG 0x2000 (the 'config' reg, gs101-pcie.dtsi:62) (gs101-pcie.dtsi:57-63).
  */
 #include <stdint.h>
 #include "console.h"
@@ -15,10 +15,14 @@
 #include "wlansmc.h"
 #include "wlanlink.h"
 
-#if SOC_GS101 && defined(WLAN_LINK_RUN) && defined(WLAN_GPP14) && defined(WLAN_GPH2) && defined(WLAN_PMA) && defined(WLAN_PCS) && defined(WLAN_ELBI) && defined(WLAN_IA) && defined(WLAN_DBI) && defined(WLAN_ATU) && \
+#if SOC_GS101 && defined(WLAN_LINK_RUN) && defined(WLAN_GPP14) && defined(WLAN_GPH2) && defined(WLAN_PMA) && defined(WLAN_PCS) && defined(WLAN_ELBI) && defined(WLAN_IA) && defined(WLAN_DBI) && defined(WLAN_ATU) && defined(WLAN_CFG) && \
 	defined(WLAN_PMU_ALIVE) && defined(WLAN_GPP14_EN_PIN) && defined(WLAN_GPH2_PERST_PIN)
 
 #include "wlan_seq.h"
+
+/* the two new S26 blocks: ATU is the DBI window's iATU part (pcie-designware.h:202 DEFAULT_DBI_ATU_OFFSET = 0x3 << 20), CFG is the pcie_1 'config' reg (gs101-pcie.dtsi:62), pinned apart from soc.json */
+_Static_assert(WLAN_ATU == WLAN_DBI + 0x300000u, "WLAN_ATU must be WLAN_DBI + 0x300000");
+_Static_assert(WLAN_CFG == 0x60FFE000UL, "WLAN_CFG must be the pcie_1 config window 0x60FFE000");
 
 #ifndef WLAN_LINK_N
 #define WLAN_LINK_N	WLAN_SEQ_DEFAULT_N
@@ -149,6 +153,8 @@ static uintptr_t base_of(unsigned blk)
 		return WLAN_PMU_ALIVE;
 	if (blk == WLB_ATU)
 		return WLAN_ATU;
+	if (blk == WLB_CFG)
+		return WLAN_CFG;
 	return 0;
 }
 
@@ -156,7 +162,7 @@ static uint32_t size_of(unsigned blk)
 {
 	if (blk == WLB_GPP14 || blk == WLB_GPH2)
 		return 0x18u;
-	if (blk == WLB_PMA || blk == WLB_ELBI)
+	if (blk == WLB_PMA || blk == WLB_ELBI || blk == WLB_CFG)
 		return 0x2000u;
 	if (blk == WLB_PCS || blk == WLB_IA || blk == WLB_DBI || blk == WLB_ATU)
 		return 0x1000u;
@@ -168,7 +174,7 @@ static uint32_t size_of(unsigned blk)
 /* the blocks that may only be touched after their probe read worked */
 static unsigned need_probe(unsigned blk)
 {
-	return (blk == WLB_PMA || blk == WLB_PCS || blk == WLB_ELBI || blk == WLB_IA || blk == WLB_DBI || blk == WLB_ATU) ? 1u << blk : 0u;
+	return (blk == WLB_PMA || blk == WLB_PCS || blk == WLB_ELBI || blk == WLB_IA || blk == WLB_DBI || blk == WLB_ATU || blk == WLB_CFG) ? 1u << blk : 0u;
 }
 
 static uintptr_t pa_of(unsigned blk, uint32_t off)
@@ -216,6 +222,13 @@ static int elbi_ok(uint32_t off)
 	       off == 0x1400u || off == 0x1404u || off == 0x1408u;
 }
 
+/* ATU outbound region 0 (rc.h:286-292): only the seven registers of S26 and only the values of S26 or its teardown (research 31 s.2.2; reset values observed in run w3a-n25); a full-word write only */
+static int atu_ok(uint32_t off, uint32_t v)
+{
+	return (off == 0x000u && (v == 0x4u || v == 0u)) || (off == 0x004u && (v == 0x80000000u || v == 0u)) || (off == 0x008u && (v == (uint32_t)WLAN_CFG || v == 0u)) ||
+	       (off == 0x00cu && v == 0u) || (off == 0x010u && (v == (uint32_t)WLAN_CFG + 0x1fffu || v == 0xfffu)) || (off == 0x014u && (v == 0x01000000u || v == 0u)) || (off == 0x018u && v == 0u);
+}
+
 /* v may differ from old only inside mask; pa must be inside one of the seven writable windows, with the per-block rules. */
 static int w32_allowed(uintptr_t pa, uint32_t mask, uint32_t old, uint32_t v)
 {
@@ -235,6 +248,8 @@ static int w32_allowed(uintptr_t pa, uint32_t mask, uint32_t old, uint32_t v)
 		return elbi_ok((uint32_t)(pa - WLAN_ELBI));
 	if (pa == WLAN_DBI + 0x890u)
 		return 1;
+	if (pa >= WLAN_ATU && pa < WLAN_ATU + 0x1000u)
+		return mask == 0xFFFFFFFFu && atu_ok((uint32_t)(pa - WLAN_ATU), v);
 	return 0;
 }
 

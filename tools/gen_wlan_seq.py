@@ -30,7 +30,7 @@ SOC = ROOT / "soc/google/gs101/soc.json"
 
 SRC_NAMES = {CAL: "cal.c", RC: "rc.c", RCH: "rc.h", COM: "common.h", DT_PCIE: "pcie.dtsi", DT_COMMON: "common.dtsi", DT_PINCTRL: "pinctrl.dtsi", DT_WLAN: "wlan.dtsi", DHD: "dhd_cg.c"}
 KINDS = ("gpio_dat", "gpio_con", "mmio_rmw", "mmio_write", "smc_iso", "delay", "wait_eq", "wait_mask", "read_only")
-BLOCKS = ("GPP14", "GPH2", "PMA", "PCS", "ELBI", "IA", "DBI", "PMU", "ATU")
+BLOCKS = ("GPP14", "GPH2", "PMA", "PCS", "ELBI", "IA", "DBI", "PMU", "ATU", "CFG")
 FULL = 0xFFFFFFFF
 TAG_SRC, TAG_GUESS = "read from source", "guess"
 
@@ -118,7 +118,9 @@ def check_dt():
     soc = json.loads(SOC.read_text())["wlan"]
     assert re.search(r"0x0\s+0x14800000\s+0x301000\s*/\*\s*DBI base", DT_PCIE.read_text()), "pcie_1 DBI reg is no longer 0x14800000 size 0x301000"
     assert int(soc["atu"], 0) == int(soc["dbi"], 0) + 0x300000, "soc.json wlan atu must be dbi + 0x300000 (pcie-designware.h:202 DEFAULT_DBI_ATU_OFFSET = 0x3 << 20; inside the 0x301000 DBI reg)"
+    assert re.search(r"0x0\s+0x60FFE000\s+0x2000\s*/\*\s*configuration space", DT_PCIE.read_text()), "pcie_1 config reg is no longer 0x60FFE000 size 0x2000"
     b = dt_blocks()
+    assert int(soc["cfg"], 0) == b["configuration space"] == 0x60FFE000, "soc.json wlan cfg must be the pcie_1 'config' reg 0x60FFE000 (pcie.dtsi:62; pcie_0 has 0x40FFE000 at :20)"
     want = {"elbi base": soc["elbi"], "phy base": soc["pma"], "sysreg base": soc["sysreg"], "DBI base": soc["dbi"], "phy pcs base": soc["pcs"], "I/A space": soc["ia"]}
     for k, v in want.items():
         assert b[k] == int(v, 0), f"soc.json wlan {k} {v} != pcie.dtsi {b[k]:#x}"
@@ -268,6 +270,7 @@ STEP_NAMES = {
     21: "L1 / Q-channel / NAK options", 22: "RC setup (dw_pcie_setup_rc + exynos_pcie_setup_rc)  DELIBERATELY SKIPPED (one 0 us delay row; was UNKNOWN)", 23: "LTSSM enable and wait for L0",
     24: "READ-ONLY link report: negotiated link + capability chain of the RC, from its own DBI space (explicit --wlan-link=24 only; no writes)",
     25: "READ-ONLY iATU layout (doc 31 Q2): DBI header/version/viewport words + the unrolled outbound region 0 registers at DBI+0x300000 (explicit --wlan-link=25 only; no writes)",
+    26: "iATU outbound region 0 = CFG0 -> bus 1 (7 DBI-window writes at ATU 0x14B00000, each read back) and 4 reads of the CFG window 0x60FFE000 (explicit --wlan-link=26 only; ATU torn down FIRST)",
 }
 
 
@@ -536,7 +539,37 @@ def build():
         add(25, "read_only", "ATU", ev(mac) - 0x300000, cite=f"{gc(RCH, 'define ' + mac + r'\s+0x3000')} (DBI + 0x300000 + off; unroll stride 0x200 per region: {unr}-{int(unr.split(':')[1]) + 1})", note=f"outbound region 0 {what}", **log)
     add(25, "read_only", "ELBI", ev("PCIE_ELBI_RDLH_LINKUP"), cite=f"{gc(RCH, r'define PCIE_ELBI_RDLH_LINKUP\s+0x2C8')}; same register S23 waits on", note="LTSSM state again (low 6 bits; 0x11 = L0)", **log)
 
+    # ---- S26: iATU outbound region 0 = CFG0 (doc 31 s.2.2, Linux's exynos_pcie_rc_prog_viewport_cfg0, rc.c:1361-1387 order). New block CFG = the pcie_1 'config' window (probed by a guarded read first).
+    # The ATU block was probed in S25. Each write is followed by a logged read-back; CR2 (enable) is last. Every write has a restore (teardown FIRST, before PERST low). ----
+    busdev = 1 << 24
+    bus_c = gc(RCH, r"define EXYNOS_PCIE_ATU_BUS\(x\)\s+\(\(\(x\) & 0xff\) << 24\)")
+    cfg_dt = gc(DT_PCIE, r"0x0\s+0x60FFE000\s+0x2000\s*/\* configuration space")
+    cfg_base, cfg_size = 0x60FFE000, 0x2000
+    wr_atu = (("PCIE_ATU_LOWER_BASE_OUTBOUND0", cfg_base, "LOWER_BASE := cfg0_base (the 'config' reg)", "atu_lbase", r"LOWER_BASE_OUTBOUND0, 4, pp->cfg0_base"),
+              ("PCIE_ATU_UPPER_BASE_OUTBOUND0", 0, "UPPER_BASE := cfg0_base >> 32 = 0", "atu_ubase", r"UPPER_BASE_OUTBOUND0, 4, \(pp->cfg0_base >> 32\)"),
+              ("PCIE_ATU_LIMIT_OUTBOUND0", cfg_base + cfg_size - 1, "LIMIT := cfg0_base + cfg0_size - 1 (32-bit write, no UPPER_LIMIT)", "atu_limit", r"pp->cfg0_base \+ pp->cfg0_size - 1"),
+              ("PCIE_ATU_LOWER_TARGET_OUTBOUND0", busdev, f"LOWER_TARGET := busdev = BUS(1) (secondary bus 1, dev 0, fn 0; {bus_c})", "atu_ltarget", r"LOWER_TARGET_OUTBOUND0, 4, busdev"),
+              ("PCIE_ATU_UPPER_TARGET_OUTBOUND0", 0, "UPPER_TARGET := 0", "atu_utarget", r"UPPER_TARGET_OUTBOUND0, 4, 0\)"),
+              ("PCIE_ATU_CR1_OUTBOUND0", 4, "CR1 := PCIE_ATU_TYPE_CFG0 (0x4)", "atu_cr1", r"CR1_OUTBOUND0, 4, PCIE_ATU_TYPE_CFG0"),
+              ("PCIE_ATU_CR2_OUTBOUND0", 1 << 31, "CR2 := EXYNOS_PCIE_ATU_ENABLE (bit 31): region 0 ENABLED, the last ATU write", "atu_cr2", r"CR2_OUTBOUND0, 4, EXYNOS_PCIE_ATU_ENABLE"))
+    vp = find_line(RC, r"static void exynos_pcie_rc_prog_viewport_cfg0")
+    for mac, val, what, key, rx in wr_atu:
+        o = ev(mac) - 0x300000
+        c = f"{anchor(RC, find_line(RC, rx, vp), rx)}; {gc(RCH, 'define ' + mac + r'\s+0x3000')}; offset = DBI + 0x300000 + {o:#x} (ATU block, S25)"
+        add(26, "mmio_write", "ATU", o, FULL, val, cite=c, tag=TAG_SRC, note=what + "; research 31 s.2.2", restore=key + ("_off" if key == "atu_cr2" else "_rst"))
+        add(26, "read_only", "ATU", o, cite=f"read-back of the row above (doc 31 s.2.3 step 3; Linux has no read-back for region 0: rc.c:1379-1386)", tag=TAG_GUESS, note=f"read back {what.split(' ')[0]} (expect {val:#010x})", **log)
+    add(26, "read_only", "CFG", 0x000, cite=f"{cfg_dt} (pcie_1 reg 'config' 0x60FFE000 size 0x2000; the Linux read is {anchor(RC, find_line(RC, r'dw_pcie_read.va_cfg_base . where, size, val.', vp), r'va_cfg_base')}, doc 31 s.2.3 step 2)",
+        probe=True, tag=TAG_GUESS, note="BLOCK PROBE: the first access to the CFG window 0x60FFE000 (outbound CFG0 TLP to bus 1 dev 0 fn 0 once region 0 is enabled); unreadable = stop. That the window answers (not hangs / SError) is a guess (doc 31 Q3)")
+    for o, what in ((0x00, "vendor (low half) / device (high half); vendor 0x14E4 expected (guess)"), (0x04, "command (low) / status (high)"), (0x08, "revision (low byte) / class code (high 24 bits)"), (0x0C, "cache line / latency / header type (bits 23:16) / BIST")):
+        add(26, "read_only", "CFG", o, cite=f"{cfg_dt}; window offset = config register offset (rc.c:1524 va_cfg_base + where; standard PCI type-1 header layout); doc 31 s.2.3 step 4", tag=TAG_GUESS, note=f"CFG window +{o:#x}: {what}", **log)
+
     # ---- teardown (Linux rc_poweroff order, rc.c:3622-3669; PERST low, LTSSM off first; the isolation LAST) ----
+    # ATU region 0 FIRST (before PERST low): disable it (CR2 := 0, as Linux's poweroff resets atu_ok and re-programs: rc.c:3647), then the reset values observed in run w3a-n25 (CR1 0, bases 0, LIMIT 0xFFF, targets 0)
+    cr2 = anchor(RC, find_line(RC, r"CR2_OUTBOUND0, 4, EXYNOS_PCIE_ATU_ENABLE", vp), r"EXYNOS_PCIE_ATU_ENABLE")
+    add_t(26, "mmio_write", "ATU", 0x004, FULL, 0, cite=f"{cr2} (the enable write, undone); reset value 0 observed (run w3a-n25 ATU+0x004)", tag="observed", note="ATU region 0 DISABLE: the first teardown row", key="atu_cr2_off")
+    for off, val, key, nm in ((0x000, 0, "atu_cr1_rst", "CR1"), (0x008, 0, "atu_lbase_rst", "LOWER_BASE"), (0x00C, 0, "atu_ubase_rst", "UPPER_BASE"), (0x010, 0xFFF, "atu_limit_rst", "LIMIT"),
+                              (0x014, 0, "atu_ltarget_rst", "LOWER_TARGET"), (0x018, 0, "atu_utarget_rst", "UPPER_TARGET")):
+        add_t(26, "mmio_write", "ATU", off, FULL, val, cite=f"reset value observed in run w3a-n25 (ATU+{off:#x} = {val:#x}); written by the S26 row {nm}", tag="observed", note=f"ATU {nm} back to its reset value", key=key)
     lp = find_line(RC, r"gpio_set_value\(exynos_pcie->perst_gpio, 0\)", 3560)
     add_t(20, "gpio_dat", "GPH2", pr["DAT"][0], 1, 0, cite=anchor(RC, lp, r"perst_gpio, 0"), note="PERST low", key="perst_low")
     add_t(23, "mmio_write", "ELBI", ev("PCIE_APP_LTSSM_ENABLE"), FULL, ev("PCIE_ELBI_LTSSM_DISABLE"), cite=anchor(RC, lp + 7, r"PCIE_ELBI_LTSSM_DISABLE, PCIE_APP_LTSSM_ENABLE"), note="LTSSM disable", key="ltssm_off")
@@ -568,7 +601,7 @@ def finish():
     core = {"rows": rows, "teardown": tear}
     sha = hashlib.sha256(json.dumps(core, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     doc = {"_doc": "GENERATED by tools/gen_wlan_seq.py from ~/pixelios-artifacts/refs/wlan-stage1 (docs/research/29 sections 2 and 14); do not edit. sha256 covers rows + teardown and is pinned in tools/test-bluejay-boot.py.",
-           "table_sha256": sha, "sources_sha256_16": srcs, "default_last_step": 19, "last_step": 25, "steps": meta["steps"], "unknown": meta["unknown"],
+           "table_sha256": sha, "sources_sha256_16": srcs, "default_last_step": 19, "last_step": 26, "steps": meta["steps"], "unknown": meta["unknown"],
            "kinds": list(KINDS), "blocks": list(BLOCKS), "rows": rows, "teardown": tear}
     return doc
 
