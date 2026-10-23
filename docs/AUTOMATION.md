@@ -409,3 +409,16 @@ build-time (the shim builds in seconds); an unknown word, `osc` with `top`, or o
   `SWEET TOUCH RESULT: opts=0x.. mux=.. clk=.. F=.. loop=.. rst=.. id=.. moved=F,L,R,I` (F variant F, L loopback, R reset FIFO read,
   I identify; `moved=-` means nothing moved; `id=chip-id-ok` is the FTM5 id).
 - Status: *observed on hardware* (run touch1, 2026-10-22: identify `36 48 03 00` with rails on); the recipe is in XNU patch 0095 and boot-arg `sweettouchcs=1`.
+
+## tools/phone-lock: one lock for the one phone (TP-016)
+
+```
+tools/phone-lock acquire --owner NAME [--wait S] [--ttl S] [--pid N] | release --owner NAME | status | force-release --yes
+tools/phone-lock run --owner NAME [--wait S] [--ttl S] -- CMD...     # acquire, run CMD, release in a finally (also SIGTERM/INT/HUP)
+tools/test_phone_lock.py                                              # host test, run by check-all.sh (unittest discover)
+```
+Lock = directory `$PHONE_LOCK_DIR` (default `~/pixelios-artifacts/phone.lock`, outside every worktree), created with `os.mkdir`, holding `info.json`
+(owner, pid, start, ttl, cmd). Stale (holder pid dead, or ttl over; default ttl 1800) = taken over and the takeover is printed. Same owner re-acquiring refreshes.
+`release` by another owner exits 2; `force-release --yes` removes any lock. `run` records its own pid; a bare `acquire` records pid 0 (only the ttl ends it)
+unless `--pid N`. Owner default: `$PHONE_OWNER`, else `agent-<pid>`. Last line `RESULT: PASS|FAIL|ERROR owner=NAME held_for=Ns`; exit 0 ok, 1 busy after `--wait`
+(max 3600; holder and age printed) or, for `run`, CMD's own exit code, 2 error; `status` exits 0 free / 1 held. Touches no device. Tested on the host only.
