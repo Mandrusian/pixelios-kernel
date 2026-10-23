@@ -192,6 +192,8 @@ static int r32(unsigned blk, uint32_t off, uint32_t *v)
 
 	if (!pa)
 		return 0;
+	if (blk == WLB_CFG && off >= 0x1000u)	/* PCIe config space is 4 KiB (linux/pci_regs.h:30 PCI_CFG_SPACE_EXP_SIZE); the window is 8 KiB, bit 12 is not a config register */
+		return 0;
 	if (blk == WLB_PMU && off != 0x3EC0u && off != 0x3EC4u)	/* the only PMU words this file reads */
 		return 0;
 	return try_read32(pa, v);

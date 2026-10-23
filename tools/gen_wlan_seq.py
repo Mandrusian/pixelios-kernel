@@ -31,7 +31,8 @@ SOC = ROOT / "soc/google/gs101/soc.json"
 # the Broadcom DHD tree (research 32 s.5b, fetched 2026-10-23, GPLv2 reference, not in git): chip-side config register names; absent refs make the generator fail like any other missing source
 REFS2 = Path(os.environ.get("WLAN_REFS2", str(REFS.parent / "wlan-stage2")))
 PCICFG = REFS2 / "include_pcicfg.h"
-SRC_NAMES = {PCICFG: "bcm4389/include_pcicfg.h", CAL: "cal.c", RC: "rc.c", RCH: "rc.h", COM: "common.h", DT_PCIE: "pcie.dtsi", DT_COMMON: "common.dtsi", DT_PINCTRL: "pinctrl.dtsi", DT_WLAN: "wlan.dtsi", DHD: "dhd_cg.c"}
+DHDP, SIU, AIU = REFS2 / "dhd_pcie.c", REFS2 / "siutils.c", REFS2 / "aiutils.c"
+SRC_NAMES = {PCICFG: "bcm4389/include_pcicfg.h", DHDP: "bcm4389/dhd_pcie.c", SIU: "bcm4389/siutils.c", AIU: "bcm4389/aiutils.c", CAL: "cal.c", RC: "rc.c", RCH: "rc.h", COM: "common.h", DT_PCIE: "pcie.dtsi", DT_COMMON: "common.dtsi", DT_PINCTRL: "pinctrl.dtsi", DT_WLAN: "wlan.dtsi", DHD: "dhd_cg.c"}
 KINDS = ("gpio_dat", "gpio_con", "mmio_rmw", "mmio_write", "smc_iso", "delay", "wait_eq", "wait_mask", "read_only")
 BLOCKS = ("GPP14", "GPH2", "PMA", "PCS", "ELBI", "IA", "DBI", "PMU", "ATU", "CFG")
 FULL = 0xFFFFFFFF
@@ -273,8 +274,8 @@ STEP_NAMES = {
     21: "L1 / Q-channel / NAK options", 22: "RC setup (dw_pcie_setup_rc + exynos_pcie_setup_rc)  DELIBERATELY SKIPPED (one 0 us delay row; was UNKNOWN)", 23: "LTSSM enable and wait for L0",
     24: "READ-ONLY link report: negotiated link + capability chain of the RC, from its own DBI space (explicit --wlan-link=24 only; no writes)",
     25: "READ-ONLY iATU layout (doc 31 Q2): DBI header/version/viewport words + the unrolled outbound region 0 registers at DBI+0x300000 (explicit --wlan-link=25 only; no writes)",
-    27: "READ-ONLY dump of the endpoint config space (36 dwords of bus 1 dev 0 fn 0 through the CFG window left enabled by S26) + the iATU outbound region 1 reset values (7 reads); explicit --wlan-link=27 only; no write",
     26: "iATU outbound region 0 = CFG0 -> bus 1 (7 DBI-window writes at ATU 0x14B00000, each read back, CR2 re-checked once) and 4 reads of the CFG window 0x60FFE000 (explicit --wlan-link=26 only; ATU torn down FIRST)",
+    27: "READ-ONLY dump of the endpoint config space (56 dwords of bus 1 dev 0 fn 0 through the CFG window left enabled by S26) + the iATU outbound region 1 reset values (7 reads); 0x8C-0xA8 deliberately not read (0xA4 PCI_BACKPLANE_DATA is a backplane access, 0x90/0x98 interrupt/mailbox), 0xAC kept; explicit --wlan-link=27 only; no write",
 }
 
 
@@ -572,7 +573,8 @@ def build():
         add(26, "read_only", "CFG", o, cite=f"{cfg_dt}; window offset = config register offset (rc.c:1524 va_cfg_base + where; standard PCI type-1 header layout); doc 31 s.2.3 step 4", tag=TAG_GUESS, note=f"CFG window +{o:#x}: {what}", **log)
 
     # ---- S27: READ-ONLY endpoint config dump (research 32 s.4.2 "step A") through the CFG window S26 left enabled (block already probed in S26), then iATU outbound region 1 reset values (ATU probed in S25).
-    # Every row is a 32-bit read printed as `LINK R27 row=<i> rd=0x..`; no write, no restore, no teardown row (S26's ATU teardown covers the run). An offset whose source cannot be cited is NOT a row. ----
+    # Every row is a 32-bit read printed as `LINK R27 row=<i> rd=0x..`; no write, no restore, no teardown row (S26's ATU teardown covers the run). An offset is a row only if its source is cited, or it is tagged guess with the capability-walk cite (0x40-0x7C, 0xC0-0xFC).
+    # 0x8C-0xA8 are DELIBERATELY NOT read: 0xA4 PCI_BACKPLANE_DATA (include_pcicfg.h:496-497) is a backplane access (a read can touch the backplane), 0x90/0x98 are interrupt/mailbox registers (:493, :495); 0xAC (candidate PCIe capability header) is kept. ----
     PCIP = Path(PCI_REGS)
     pcr = lambda nm: gc(PCIP, r"define " + nm + r"\s")
     pcg = lambda rx: anchor(PCICFG, find_line(PCICFG, rx), rx)
@@ -587,11 +589,18 @@ def build():
         (0x3C, f"{pcr('PCI_INTERRUPT_LINE')}; {ss}", TAG_SRC, "interrupt line / pin (low half), min_gnt / max_lat (high half)"),
         *[(o, capw, TAG_GUESS, f"config dword {o:#x} (capability area 0x40..0x7C)") for o in range(0x40, 0x80, 4)],
         (0x80, f"{pcg(r'define\s+PCI_BAR0_WIN\s+0x80')}; {ss}", TAG_SRC, "PCI_BAR0_WIN: backplane address seen through BAR0 (reset value decides whether step C needs a write)"),
-        (0x88, f"{pcg(r'define\s+PCI_SPROM_CONTROL\s+0x88')}; {ss}", TAG_SRC, "PCI_SPROM_CONTROL (the attach code reads it; 0xFFFFFFFF aborts attach)"),
-        (0xAC, f"{pcg(r'define\s+PCI_BAR0_WIN2\s+0xac')}; {ss} (research 32 s.1.1 item 5 guessed the PCIe capability here: the dump decides)", TAG_SRC, "PCI_BAR0_WIN2 (2nd 4 KiB BAR0 window) or the PCIe capability header"),
-        (0xBC, f"{rcw('WIFI_L1SS_LINKCTRL')} (link status 0xBE = high half, {rcw('WIFI_LINK_STATUS')}); {ss}", TAG_SRC, "EP link control (low) / link status (high: speed [3:0], width [9:4])"),
+        (0x84, f"{pcg(r'define\s+PCI_BAR1_WIN\s+0x84')}; {ss}", TAG_SRC, "PCI_BAR1_WIN: backplane address seen through BAR1"),
+        (0x88, f"{pcg(r'define\s+PCI_SPROM_CONTROL\s+0x88')}, PCIE_CFG_SUBSYSTEM_CONTROL on PCIe devices {pcg(r'define\s+PCIE_CFG_SUBSYSTEM_CONTROL\s+0x88')}; read by the attach code, 0xFFFFFFFF aborts attach ({anchor(DHDP, find_line(DHDP, r'val = OSL_PCI_READ_CONFIG.osh, PCI_SPROM_CONTROL'), r'PCI_SPROM_CONTROL')}-{find_line(DHDP, r'goto fail', find_line(DHDP, r'val = OSL_PCI_READ_CONFIG.osh, PCI_SPROM_CONTROL'))}: read + goto fail; {anchor(SIU, find_line(SIU, r'PCI_SPROM_CONTROL, sizeof'), r'PCI_SPROM_CONTROL')}: there it switches to SI_BUS instead); {ss}", TAG_SRC, "PCI_SPROM_CONTROL / PCIE_CFG_SUBSYSTEM_CONTROL (the attach code reads it; 0xFFFFFFFF aborts attach)"),
+        (0xAC, f"{pcg(r'define\s+PCI_BAR0_WIN2\s+0xac')} is the non-Gen2 register ({anchor(AIU, find_line(AIU, r'PCI_BAR0_WIN2, 4, wrap') - 3, r'PCIE_GEN2')}-{find_line(AIU, r'PCI_BAR0_WIN2, 4, wrap')}: Gen2 cores use PCIE2_BAR0_WIN2 0x70); {pcg(r'define\s+PCIE_CFG_DEVICE_CAPABILITY\s+0xb0')}, {pcg(r'define\s+PCIE_CFG_DEVICE_CONTROL\s+0xb4')} put DEVCAP/DEVCTL at 0xB0/0xB4 in PCIE devices, so the capability header is at 0xAC; {rcw('WIFI_L1SS_LINKCTRL')} = 0xAC+0x10 ({gc(PCIP, r'define\s+PCI_EXP_LNKCTL\s')}), {rcw('WIFI_PCI_EXP_DEVCTL2')} = 0xAC+0x28 ({gc(PCIP, r'define\s+PCI_EXP_DEVCTL2\s')}); {ss}", TAG_GUESS, "PCIe capability header (cap id 0x10 expected: guess)"),
+        (0xB0, f"{pcg(r'define\s+PCIE_CFG_DEVICE_CAPABILITY\s+0xb0')}; {ss}", TAG_SRC, "device capability in PCIE devices (PCIe capability + 0x04 if the capability is at 0xAC: guess)"),
+        (0xB4, f"{pcg(r'define\s+PCIE_CFG_DEVICE_CONTROL\s+0xb4')}; {ss}", TAG_SRC, "device control in PCIE devices (MPS / MRRS for step B/C; PCIe capability + 0x08 if the capability is at 0xAC: guess)"),
+        (0xB8, f"{pcg(r'define\s+PCIE_CFG_DEVICE_CONTROL\s+0xb4')} (0xB8 = DEVCTL+4); {gc(PCIP, r'define\s+PCI_EXP_LNKCAP\s')}; {ss}", TAG_GUESS, "LNKCAP if the PCIe capability is at 0xAC (guess; the non-PCIe meaning is PCI_GPIO_OUTEN)"),
+        (0xBC, f"{rcw('WIFI_L1SS_LINKCTRL')} (link status 0xBE = high half, {rcw('WIFI_LINK_STATUS')}; speed [3:0] = {gc(PCIP, r'define\s+PCI_EXP_LNKSTA_CLS\s')}, width [9:4] = {gc(PCIP, r'define\s+PCI_EXP_LNKSTA_NLW\s')}); {ss}", TAG_SRC, "EP link control (low) / link status (high: speed [3:0], width [9:4])"),
+        *[(o, capw, TAG_GUESS, f"config dword {o:#x} (rest of the PCIe capability / any capability above 0x7C)") for o in (0xC0, 0xC4, 0xC8, 0xCC, 0xD0)],
         (0xD4, f"{rcw('WIFI_PCI_EXP_DEVCTL2')}; {ss}", TAG_SRC, "EP device control 2 (completion timeout range)"),
+        *[(o, capw, TAG_GUESS, f"config dword {o:#x} (rest of the PCIe capability / any capability above 0x7C)") for o in range(0xD8, 0x100, 4)],
         (0x100, f"{pcg(r'define PCIE_EXTCFG_OFFSET\s+0x100')}, {pcg(r'define PCI_ADV_ERR_CAP\s+0x100')}; {ss}", TAG_SRC, "first extended capability header (AER expected)"),
+        (0x1B4, f"{rcw('WIFI_L1SS_LTR_LATENCY')}; {ss}", TAG_SRC, "L1SS LTR latency"),
         *[(0x240 + 4 * n, f"{rcw(nm)}; {ss}", TAG_SRC, f"L1SS {what}") for n, (nm, what) in enumerate((("WIFI_L1SS_CAPID", "capability header"), ("WIFI_L1SS_CAP", "capabilities"), ("WIFI_L1SS_CONTROL", "control 1"), ("WIFI_L1SS_CONTROL2", "control 2")))],
     ]
     extra = {0x48: f"{ss}: PM capability guessed at 0x48 from {rcw('WIFI_PM_MNG_STATUS_CON')} (PM CSR = cap + 4; research 32 s.1.1 item 5)",
@@ -643,7 +652,7 @@ def finish():
     srcs = {SRC_NAMES[p]: hashlib.sha256(p.read_bytes()).hexdigest()[:16] for p in SRC_NAMES}
     core = {"rows": rows, "teardown": tear}
     sha = hashlib.sha256(json.dumps(core, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-    doc = {"_doc": "GENERATED by tools/gen_wlan_seq.py from ~/pixelios-artifacts/refs/wlan-stage1 (docs/research/29 sections 2 and 14); do not edit. sha256 covers rows + teardown and is pinned in tools/test-bluejay-boot.py.",
+    doc = {"_doc": "GENERATED by tools/gen_wlan_seq.py from ~/pixelios-artifacts/refs/wlan-stage1 and wlan-stage2 (docs/research/29 sections 2 and 14); do not edit. sha256 covers rows + teardown and is pinned in tools/test-bluejay-boot.py.",
            "table_sha256": sha, "sources_sha256_16": srcs, "default_last_step": 19, "last_step": 27, "steps": meta["steps"], "unknown": meta["unknown"],
            "kinds": list(KINDS), "blocks": list(BLOCKS), "rows": rows, "teardown": tear}
     return doc

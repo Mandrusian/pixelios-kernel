@@ -2791,8 +2791,8 @@ def wlansmc_object_selftest(obj_path: pathlib.Path, iso: bool = False) -> int:
 
 
 # ---- --wlan-link: the table (soc/google/gs101/wlan_seq.json -> out/wlan_seq.h), the interpreter wlanlink.c, the objects (docs/research/29 section 14) ----
-_WLAN_SEQ_SHA = "5b671020056a4ad79b8801679f0fa212b326f9eae5aedeb6587ec1a964f32210"
-_WLAN_SEQ_COUNTS = {"rows": 330, "teardown": 35, "write_rows": 251, "distinct_targets": 183}
+_WLAN_SEQ_SHA = "c7b2f3ceef716c0cad009fbeb69e355a47eebd2fee013f9e63d718aa44bb208a"
+_WLAN_SEQ_COUNTS = {"rows": 350, "teardown": 35, "write_rows": 251, "distinct_targets": 183}
 _WLAN_SEQ_TARGET_BLOCKS = {"ATU": 7, "DBI": 1, "ELBI": 12, "GPH2": 6, "GPP14": 2, "IA": 37, "PCS": 5, "PMA": 113}
 FULL_MASK = 0xFFFFFFFF
 _WLAN_WRITE_KINDS = ("gpio_dat", "gpio_con", "mmio_rmw", "mmio_write")
@@ -2801,8 +2801,8 @@ _WLAN_WIN = {"GPP14": 0x18, "GPH2": 0x18, "PMA": 0x2000, "PCS": 0x1000, "ELBI": 
 _WLAN_ATU_OK = {(0x000, 0x4), (0x000, 0), (0x004, 0x80000000), (0x004, 0), (0x008, 0x60FFE000), (0x008, 0), (0x00C, 0), (0x010, 0x60FFFFFF), (0x010, 0xFFF), (0x014, 0x01000000), (0x014, 0), (0x018, 0)}
 _WLAN_S26_WRITES = ((0x008, 0x60FFE000), (0x00C, 0), (0x010, 0x60FFFFFF), (0x014, 0x01000000), (0x018, 0), (0x000, 0x4), (0x004, 0x80000000))	# the order of Linux's exynos_pcie_rc_prog_viewport_cfg0, CR2 (enable) last
 _WLAN_S26_TEAR = ((0x004, 0), (0x000, 0), (0x008, 0), (0x00C, 0), (0x010, 0xFFF), (0x014, 0), (0x018, 0))	# CR2 (disable) FIRST, then the reset values observed in run w3a-n25
-# S27 (research 32 s.4.2 step A): the endpoint config dwords read through the CFG window (BAR0..5, CardBus, subsystem, cap pointer, int line, capability area 0x40..0x7C, Broadcom window/SPROM registers 0x80/0x88/0xAC, link, DEVCTL2, ext header, L1SS) and ATU region 1 (+0x200..+0x218)
-_WLAN_S27_CFG = (0x10, 0x14, 0x18, 0x1C, 0x20, 0x24, 0x28, 0x2C, 0x34, 0x3C) + tuple(range(0x40, 0x80, 4)) + (0x80, 0x88, 0xAC, 0xBC, 0xD4, 0x100, 0x240, 0x244, 0x248, 0x24C)
+# S27 (research 32 s.4.2 step A): the endpoint config dwords read through the CFG window (BAR0..5, CardBus, subsystem, cap pointer, int line, capability area 0x40..0x7C, Broadcom window/SPROM registers 0x80/0x84/0x88/0xAC, PCIe capability 0xB0..0xFC, ext header, L1SS LTR, L1SS); 0x8C..0xA8 are deliberately NOT read (0xA4 PCI_BACKPLANE_DATA is a backplane access) and ATU region 1 (+0x200..+0x218)
+_WLAN_S27_CFG = (0x10, 0x14, 0x18, 0x1C, 0x20, 0x24, 0x28, 0x2C, 0x34, 0x3C) + tuple(range(0x40, 0x80, 4)) + (0x80, 0x84, 0x88, 0xAC) + tuple(range(0xB0, 0x100, 4)) + (0x100, 0x1B4, 0x240, 0x244, 0x248, 0x24C)
 _WLAN_S27_ATU = (0x200, 0x204, 0x208, 0x20C, 0x210, 0x214, 0x218)
 _WLAN_ELBI_OK = {0x054, 0x080, 0x388, 0x3A0, 0x3A4, 0x3A8, 0x3BC, 0x474, 0x1078, 0x1400, 0x1404, 0x1408}
 _WLAN_HDR_ROW = re.compile(r"\{ (\d+)u, WLK_(\w+), WLB_(\w+), (0x[0-9a-f]+)u, (0x[0-9a-f]+)u, (0x[0-9a-f]+)u, (\d+)u, (\d+)u \},")
@@ -2904,6 +2904,8 @@ def check_wlan_seq_table(doc: dict, header: str, pin: str | None = _WLAN_SEQ_SHA
     if any(x["blk"] == "CFG" and (x["kind"] != "read_only" or x.get("step", x.get("requires")) not in (26, 27)) for x in rows + tear) or any(x["blk"] == "CFG" for x in tear):
         raise AssertionError(f"{name}: the CFG window is read-only, only in S26 and S27, never in the teardown")
     # S27: the READ-ONLY endpoint config dump (explicit --wlan-link=27 only): the pinned CFG window offsets, then ATU outbound region 1 CR1..UPPER_TARGET; every row read_only + log (a = 2, never a probe), no write, no restore, nothing else
+    if any(r["step"] == 27 and r["blk"] == "CFG" and 0x8C <= r["off"] <= 0xA8 for r in rows):
+        raise AssertionError(f"{name}: no S27 CFG row may lie in 0x8C..0xA8 (0xA4 PCI_BACKPLANE_DATA is a backplane access; 0xAC is allowed)")
     s27 = [(r["kind"], r["blk"], r["off"], r.get("log"), r.get("probe"), r["restore"]) for r in rows if r["step"] == 27]
     s27_want = [("read_only", "CFG", o, True, None, None) for o in _WLAN_S27_CFG] + [("read_only", "ATU", o, True, None, None) for o in _WLAN_S27_ATU]
     if s27 != s27_want or any(r["kind"] != "read_only" or r["mask"] != FULL_MASK or r["delay_us"] or r["polls"] for r in rows if r["step"] == 27):
@@ -3162,6 +3164,7 @@ def wlan_seq_selftest() -> int:
         ("an S27 ATU region 1 read removed", f_s27_removed(blk="ATU", off=0x210), None, "S27 must be exactly"),
         ("an S27 CFG read at another offset", set_row(27, "off", 0x1000, blk="CFG", off=0x100), None, "S27 must be exactly"),
         ("an S27 ATU read of region 0", set_row(27, "off", 0x004, blk="ATU", off=0x204), None, "S27 must be exactly"),
+        ("an S27 CFG read at 0xA4 (PCI_BACKPLANE_DATA)", lambda d: (add_row(d, step=27, kind="read_only", blk="CFG", off=0xA4, restore=None, log=True), resha(d)), None, "0x8C..0xA8"),
         ("an S27 CFG write", lambda d: (add_row(d, step=27, blk="CFG", off=0x10, value=0xFFFFFFFF, restore="T01"), resha(d)), None, "CFG window is read-only"),
         ("an S27 ATU region 1 write", lambda d: (add_row(d, step=27, blk="ATU", off=0x204, value=0x80000000, restore="T01"), resha(d)), None, "S27 must be exactly"),
         ("an S27 ATU region 1 write (teardown)", tear_append(blk="ATU", off=0x204, kind="mmio_write", mask=0xFFFFFFFF, value=0, requires=27), None, "ATU writes are only"),
@@ -3244,7 +3247,7 @@ _WLANLINK_PINS = {
 _WLANLINK_BODY_SHA = {
     "w32": "cb467892742fbe9a64e2338f61fb5f4e6c1a81afc37303e63defcfee49868bce",
     "get_row": "d73e01074e7c551f652a4322ee7bfde2a53d8f3c0a76087a53c8247c354406c9",
-    "r32": "d03e22024c23e0221538c17949c0a45b92ceddaf055b9e1b6f2fcc4d7e6580ae",
+    "r32": "792e4db6044940877783b0d2e41bbdf33f80c2efadf6af279cbd9b3fa3b7a80b",
     "pa_of": "9d86b866272f0aa42d1adb2ad38ddecf54d9bba0d5e69825d725eb95ec04a2a6",
     "base_of": "a4b1e51f8360bc2025b319c126e3460d822a33e184a3e982315496639f9e8675",
     "need_probe": "9280568a6a8748ecfde3e8da1589f6dd0e3fef5b4e176ce0c6f10d58d93c905c",
