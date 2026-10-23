@@ -22,6 +22,10 @@ Review criteria are in `REVIEW.md`.
 6. **Delegates are cheap volume, the driver verifies.** Only the driver agent delegates. Delegate prompts start with
    "Work alone. Do not spawn subagents ..." and carry numbered requirements and a verification command. Review
    hardware-touching code with a different model family than the author, never the same one.
+7. **Never assume; check.** Every fact a change relies on (register, offset, unit, layout, flag, API, behaviour) is
+   checked against a cited source, a decompile or a measured result before it is implemented. If it is still not certain,
+   do not implement it: reverse/measure it first, and keep any gate for it closed until then.
+8. **Code that writes hardware and has not passed an independent review stays on a local `wip/*` branch**, unpushed.
 
 ## Commands
 
