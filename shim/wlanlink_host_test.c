@@ -1,8 +1,8 @@
 /* Host test for wlanlink.c (--wlan-link, docs/research/29 section 14) against a FAKE SoC: GPIO banks with Samsung semantics (a pin whose CON field is 1 reads its DAT latch, any other pin the external
  * level), plain register files for PMA / PCS / ELBI / I/A / DBI that read back what was written, lock bits that appear after k polls, the PMU isolation word behind a fake of the two EL3 steps
- * (wlan_link_iso_set / _clear), and fault / timeout / ignored-write injection. Built once per N (-DWLAN_LINK_N=7|8|10|19|20|21|22|23), see build.sh. Checks: the default run (N = 19) never raises PERST,
+ * (wlan_link_iso_set / _clear), and fault / timeout / ignored-write injection. Built once per N (-DWLAN_LINK_N=7|8|10|19|20|21|22|23|24), see build.sh. Checks: the default run (N = 19) never raises PERST,
  * never enables the LTSSM and ends with the pins, the isolation and the PHY back where they were; N = 20 / 21 add the PERST release and the options; N = 22 adds the documented S22 skip (one 0 us delay row, no write); N = 23 enables the LTSSM and waits for L0 (fake: ELBI 0x2C8 == 0x11
- * after k polls, never, or a read fault), with a fault injected at EVERY forward write row and the teardown checked against the table order; every failure branch (unreadable probe, lock timeout, write fault, refused / failed isolation, failed restore) stops, tears down in the table order with the isolation clear LAST and is
+ * after k polls, never, or a read fault), with a fault injected at EVERY forward write row and the teardown checked against the table order; N = 24 adds S24, read-only rows whose `log` flag prints `LINK R24 row=<i> rd=0x..` (the link report), no write, teardown unchanged; every failure branch (unreadable probe, lock timeout, write fault, refused / failed isolation, failed restore) stops, tears down in the table order with the isolation clear LAST and is
  * loud; the writer's independent allowlist refuses every other register. Uses the REAL generated board macros and out/wlan_seq.h. Build (also run by build.sh):
  *   gcc -O1 -Wall -Wextra -Werror -DWLAN_LINK_RUN -DWLAN_LINK_N=19 -I. -Iout -include out/board_config.h -o out/wlanlink_host_test19 wlanlink_host_test.c */
 #include <assert.h>
@@ -14,6 +14,12 @@
 #define WLAN_STR(x) WLAN_STR2(x)
 #ifndef WLAN_LINK_N
 #define WLAN_LINK_N 19
+#endif
+/* S24 reads ELBI 0x2C8 once more, after the L0 wait: one extra poll of the L0 fake */
+#if WLAN_LINK_N >= 24
+#define L0X 1u
+#else
+#define L0X 0u
 #endif
 #define WLAN_LINK_N_STR WLAN_STR(WLAN_LINK_N)
 #include "wlanlink.c"
@@ -34,7 +40,7 @@ static int never_pll, unreadable_blk, iso_set_ret, iso_clear_ret, write_fault_n,
 static uintptr_t ignore_pa, fault_read_pa;
 static uint64_t freq, tick, waited_us;
 static unsigned nsave;
-static char lines[256][RAMLOG_LINE_MAX + 8];
+static char lines[320][RAMLOG_LINE_MAX + 8];
 static unsigned nl;
 enum { EV_W, EV_ISO_SET, EV_ISO_CLR };
 static struct { int t; uintptr_t pa; uint32_t v; } ev[600];
@@ -46,7 +52,7 @@ uint64_t touch_ticks(void) { return tick += 3; }
 void pstore_save(void) { nsave++; }
 void con_str(const char *l, const char *s)
 {
-	assert(nl < 256 && strlen(s) < RAMLOG_LINE_MAX);
+	assert(nl < 320 && strlen(s) < RAMLOG_LINE_MAX);
 	snprintf(lines[nl++], sizeof(lines[0]), "%s %s", l, s);
 }
 
@@ -308,7 +314,7 @@ int main(void)
 {
 	struct wlan_row r;
 
-	EXPECT(WLAN_SEQ_LAST == 23 && WLAN_SEQ_DEFAULT_N == 19 && WLAN_SEQ_NROWS > 200 && WLAN_LINK_N <= WLAN_SEQ_LAST);
+	EXPECT(WLAN_SEQ_LAST == 24 && WLAN_SEQ_DEFAULT_N == 19 && WLAN_SEQ_NROWS > 200 && WLAN_LINK_N <= WLAN_SEQ_LAST);
 	/* the independent allowlist refuses every other register (a corrupted table / index cannot reach them) */
 	EXPECT(!w32_allowed(WLAN_GPP14 + 4, 1u << 3, 0, 0) && !w32_allowed(WLAN_GPP14 + 4, 1u << 2, 0, 1u << 3) && w32_allowed(WLAN_GPP14 + 4, 1u << 2, 0, 1u << 2));
 	EXPECT(!w32_allowed(WLAN_GPH2 + 4, 1u << 2, 0, 0) && w32_allowed(WLAN_GPH2 + 4, 3u, 0, 1) && !w32_allowed(WLAN_GPH2, 0xf00u, 0, 0) && !w32_allowed(WLAN_GPP14 + 0x18, 1, 0, 0));
@@ -353,6 +359,9 @@ int main(void)
 	EXPECT(wrote(WLAN_DBI + 0x890, 0xffffffff, 0x12000));
 #endif
 	baseline_restored();
+#if WLAN_LINK_N < 24
+	EXPECT(!has("LINK R"));					/* the log flag exists only on the S24 rows */
+#endif
 	if (getenv("WLAN_DUMP")) {
 		for (unsigned i = 0; i < nl; i++)
 			printf("%s\n", lines[i]);
@@ -396,9 +405,44 @@ int main(void)
 #endif
 #if WLAN_LINK_N >= 23
 	/* S23: LTSSM enable = ELBI 0x54 := 1, then the L0 wait polls ELBI 0x2C8 until (v & 0x3f) == 0x11 (fake: the 3rd poll), then the teardown disables the LTSSM */
-	EXPECT(wrote(WLAN_ELBI + 0x54, 0xffffffff, 1) && l0_polls == 3 && has("LINK S23 ok rows=2") && wrote(WLAN_ELBI + 0x54, 0xffffffff, 0) && !has("!!!"));
+	EXPECT(wrote(WLAN_ELBI + 0x54, 0xffffffff, 1) && l0_polls == 3u + L0X && has("LINK S23 ok rows=2") && wrote(WLAN_ELBI + 0x54, 0xffffffff, 0) && !has("!!!"));
 	EXPECT(last_ev(EV_W, WLAN_ELBI + 0x54, WLAN_ELBI + 0x55) > 0 && ev[last_ev(EV_W, WLAN_ELBI + 0x54, WLAN_ELBI + 0x55) - 1].v == 0);	/* the LTSSM ends disabled */
 	teardown_tail_is_table_order(23);
+#endif
+#if WLAN_LINK_N >= 24
+	{	/* S24: 13 read-only log rows (DBI/ELBI, a == 2 = log, never a probe), no write; every one prints `LINK R24 row=<i> rd=0x<value>` with the value the fake holds */
+		unsigned n24 = 0, nR = 0;
+		uint32_t want[32];
+		unsigned wid[32];
+		char b[64];
+
+		world();
+		dbi[0x000 / 4] = 0xA5A5144Du; dbi[0x034 / 4] = 0x40u; dbi[0x070 / 4] = 0x00000010u; dbi[0x07C / 4] = 0x0000D123u; dbi[0x080 / 4] = 0x00220040u; dbi[0x0A0 / 4] = 0x00020002u;
+		dbi[0x710 / 4] = 0x00010120u; dbi[0x80C / 4] = 0x00010000u | 0x0Cu; elbi[0x2C8 / 4] = 0x0300AA00u;
+		for (unsigned i = 0; i < WLAN_SEQ_NROWS; i++)
+			if (get_row(i, 0, &r) && r.step == 24) {
+				EXPECT(r.kind == WLK_READ_ONLY && r.a == 2u && (r.blk == WLB_DBI || r.blk == WLB_ELBI) && n24 < 32);
+				wid[n24++] = i;
+			}
+		EXPECT(n24 == 13);
+		for (unsigned j = 0; j < n24; j++)
+			(void)get_row(wid[j], 0, &r), want[j] = r.blk != WLB_DBI ? 0x0300AA11u : r.off == 0x890u ? 0x12000u : dbi[r.off / 4];	/* ELBI 0x2C8: L0 once the LTSSM is enabled and the fake counted 3 polls */
+		EXPECT(wlan_link_run() == 0 && has("LINK S24 ok rows=13") && !has("!!!"));
+		for (unsigned j = 0; j < n24; j++) {
+			snprintf(b, sizeof b, "LINK R24 row=%u rd=0x%08X", wid[j], (unsigned)want[j]);
+			EXPECT(has(b));
+		}
+		for (unsigned i = 0; i < nl; i++)
+			if (strstr(lines[i], "LINK R"))
+				nR++;
+		EXPECT(nR == n24 && !has("LINK R23") && !has("LINK R19"));
+		teardown_tail_is_table_order(24);
+		baseline_restored();
+		world(); fault_read_pa = WLAN_DBI + 0x70;		/* an unreadable capability word stops S24 (fault at that row), teardown unchanged, restore ok */
+		EXPECT(wlan_link_run() == 1 && has("LINK S24 fault row=244") && has("stopped=fault at=S24 row=244 restore=ok") && !has("!!!") && has("LINK R24 row=243"));
+		teardown_tail_is_table_order(24);
+		baseline_restored();
+	}
 #endif
 
 	/* ---- failure branches: each stops, tears down, is loud where it must be ---- */
@@ -510,7 +554,7 @@ int main(void)
 	teardown_tail_is_table_order(23);
 	baseline_restored();
 	world(); l0_after = 4000;					/* a late L0 (poll 4000, ~48 ms) is still ok; one that never comes is a timeout */
-	EXPECT(wlan_link_run() == 0 && l0_polls == 4000u);
+	EXPECT(wlan_link_run() == 0 && l0_polls == 4000u + L0X);
 	world(); l0_after = 4801;
 	EXPECT(wlan_link_run() == 1 && has("stopped=timeout at=S23"));
 	world(); freq = 1000000;					/* a slow counter does not turn the wait into a hang: still <= 4800 polls */

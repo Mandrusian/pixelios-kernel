@@ -82,8 +82,10 @@ static void step_line(char pfx, unsigned n, const char *what, int have_row, unsi
 	line[p++] = pfx;
 	p = put_dec(line, sizeof(line), p, n / 10u);
 	p = put_dec(line, sizeof(line), p, n % 10u);
-	p = put_txt(line, sizeof(line), p, " ");
-	p = put_txt(line, sizeof(line), p, what);
+	if (what[0]) {
+		p = put_txt(line, sizeof(line), p, " ");
+		p = put_txt(line, sizeof(line), p, what);
+	}
 	if (have_rows) {
 		p = put_txt(line, sizeof(line), p, " rows=");
 		p = put_dec(line, sizeof(line), p, rows);
@@ -317,6 +319,8 @@ static int run_row(unsigned idx, int tear, unsigned *probed, uint32_t *rd)
 		*rd = v;
 		if (r.a == 1u)
 			*probed |= need_probe(r.blk);
+		if (r.a == 2u)		/* log flag (a = 2: a non-probe row whose value is printed) */
+			step_line('R', r.step, "", 1, idx, 1, v, 0, 0);
 		return ST_OK;
 	}
 	if (r.kind == WLK_WAIT_EQ || r.kind == WLK_WAIT_MASK) {

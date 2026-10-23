@@ -264,14 +264,18 @@ STEP_NAMES = {
     11: "PHY reset pulse (ELBI)", 12: "PHY config B (PMA/PCS tables)", 13: "PHY reset release and extras", 14: "I/A (CDR lock helper)", 15: "PHY lock waits (PLL, CDR, offset calibration)",
     16: "soft power reset", 17: "ELBI device type", 18: "non-sticky reset", 19: "DBI 'EQ off'", 20: "PERST high  <-- the first step that lets the endpoint out of reset",
     21: "L1 / Q-channel / NAK options", 22: "RC setup (dw_pcie_setup_rc + exynos_pcie_setup_rc)  DELIBERATELY SKIPPED (one 0 us delay row; was UNKNOWN)", 23: "LTSSM enable and wait for L0",
+    24: "READ-ONLY link report: negotiated link + capability chain of the RC, from its own DBI space (explicit --wlan-link=24 only; no writes)",
 }
 
 
-def add(step, kind, blk=None, off=0, mask=FULL, value=0, us=0, polls=0, cite="", tag=TAG_SRC, note=None, restore=None, probe=False):
+def add(step, kind, blk=None, off=0, mask=FULL, value=0, us=0, polls=0, cite="", tag=TAG_SRC, note=None, restore=None, probe=False, log=False):
     assert kind in KINDS and (blk is None or blk in BLOCKS) and step in STEP_NAMES
     r = {"id": len(rows), "step": step, "kind": kind, "blk": blk, "off": off, "mask": mask & FULL, "value": value & FULL, "delay_us": us, "polls": polls, "restore": restore, "cite": cite, "tag": tag}
     if probe:
         r["probe"] = True
+    if log:
+        assert kind == "read_only" and not probe, "log is for non-probe read_only rows"
+        r["log"] = True
     if note:
         r["note"] = note
     rows.append(r)
@@ -478,6 +482,34 @@ def build():
     lw = find_line(RC, r"while \(count < MAX_TIMEOUT\)", EL)
     add(23, "wait_eq", "ELBI", ev("PCIE_ELBI_RDLH_LINKUP"), ev("PCIE_ELBI_LTSSM_STATE_MASK"), ev("S_L0"), us=12, polls=ev("MAX_TIMEOUT"), cite=f"rc.c:{lw}-{lw + 9} (MAX_TIMEOUT common.h:20 polls of usleep_range(10, 12))", note="LTSSM == L0")
 
+    # ---- S24: READ-ONLY link report (explicit --wlan-link=24 only). Every row: DBI/ELBI read, logged as `LINK R24 row=<i> rd=0x..`. No write, no teardown row. DBI was probed at S19. ----
+    PCI_REGS = "/usr/include/linux/pci_regs.h"
+    GEN = REFS / "dwc-generic"
+
+    def gc(path, rx, start=1):
+        n = find_line(path, rx, start)
+        return f"{path.parent.name}/{path.name}:{n}"
+    own = gc(RC, r"rd_own_conf\(pp, PCI_VENDOR_ID, 4, &val\)", 3400)
+    pcc = gc(RC, r"rc_dbi_base \+ PCI_CAPABILITY_LIST")
+    pmo, pco = gc(RCH, r"define PM_CAP_OFFSET\s+0x40"), gc(RCH, r"define PCIE_CAP_OFFSET\s+0x70")
+    use_pm, use_pc = gc(RC, r"u32 pm_cap_off = PM_CAP_OFFSET"), gc(RC, r"u32 pcie_cap_off = PCIE_CAP_OFFSET")
+    lnkcap, lnkctl2 = gc(RC, r"pcie_cap_off \+ PCI_EXP_LNKCAP, 4, &val", 2700), gc(RC, r"pcie_cap_off \+ PCI_EXP_LNKCTL2, 4, &val", 2700)
+    lnkctl = gc(RC, r"exp_cap_off \+ PCI_EXP_LNKCTL,", 3837)
+    log = dict(log=True)
+    add(24, "read_only", "DBI", 0x000, cite=f"{own} (PCI_VENDOR_ID = 0x00, {PCI_REGS}:38)", note="vendor/device id word (driver writes Samsung/Exynos ids there, rc.c:2738-2740); S19 read 0xA5A5144D (observed)", **log)
+    add(24, "read_only", "DBI", 0x004, cite=f"{gc(GEN / 'pcie-designware-host.c', r'dw_pcie_readl_dbi\(pci, PCI_COMMAND\)')} (PCI_COMMAND = 0x04, {PCI_REGS}:40; status in the high half, :53)", note="command/status", **log)
+    add(24, "read_only", "DBI", 0x008, cite=f"{gc(REFS / 'dwc' / 'pcie-exynos-rc.c', r'where == PCI_CLASS_REVISION')} (PCI_CLASS_REVISION = 0x08, {PCI_REGS}:71)", note="class (high 24 bits; expect 0x0604xx = PCI bridge) / revision", **log)
+    add(24, "read_only", "DBI", 0x034, cite=f"{pcc} (PCI_CAPABILITY_LIST = 0x34, {PCI_REGS}:122)", note="capability pointer (low byte): the runtime start of the chain S22 needs", **log)
+    add(24, "read_only", "DBI", 0x040, cite=f"{pmo}, used {use_pm}", tag=TAG_GUESS, note="expected PM capability header (id 0x01, next at byte 1): driver constant, not yet measured", **log)
+    add(24, "read_only", "DBI", 0x070, cite=f"{pco}, used {use_pc}", tag=TAG_GUESS, note="expected PCIe capability header (id 0x10): driver constant PCIE_CAP_OFFSET, not yet measured", **log)
+    add(24, "read_only", "DBI", 0x07C, cite=f"{lnkcap} (0x70 + PCI_EXP_LNKCAP 0x0c, {PCI_REGS}:534)", tag=TAG_GUESS, note="expected LNKCAP (max speed [3:0], max width [9:4]); valid only if the PCIe capability is at 0x70", **log)
+    add(24, "read_only", "DBI", 0x080, cite=f"{lnkctl} (0x70 + PCI_EXP_LNKCTL 0x10, {PCI_REGS}:553; LNKSTA 0x12 :566 = high half)", tag=TAG_GUESS, note="expected LNKCTL (low) / LNKSTA (high: current speed [3:0], negotiated width [9:4]); valid only if the capability is at 0x70", **log)
+    add(24, "read_only", "DBI", 0x0A0, cite=f"{lnkctl2} (0x70 + PCI_EXP_LNKCTL2 0x30, {PCI_REGS}:689; LNKSTA2 0x32 :700 = high half)", tag=TAG_GUESS, note="expected LNKCTL2 (target speed [3:0]) / LNKSTA2; valid only if the capability is at 0x70", **log)
+    add(24, "read_only", "DBI", 0x710, cite=f"{gc(GEN / 'pcie-designware.h', r'define PCIE_PORT_LINK_CONTROL\s+0x710')}, {gc(RCH, r'define PCIE_PORT_LINK_CONTROL\s+0x710')}", note="DWC port logic PORT_LINK_CONTROL (link mode / lane count)", **log)
+    add(24, "read_only", "DBI", 0x80C, cite=f"{gc(GEN / 'pcie-designware.h', r'define PCIE_LINK_WIDTH_SPEED_CONTROL\s+0x80C')}, {gc(RCH, r'define PCIE_LINK_WIDTH_SPEED_CONTROL\s+0x80C')}", note="DWC PCIE_LINK_WIDTH_SPEED_CONTROL (GEN2_CTRL): number of lanes, speed-change bit", **log)
+    add(24, "read_only", "DBI", 0x890, cite=f"rc.c:{find_line(RC, r'exynos_pcie_rc_wr_own_conf.pp, 0x890, 4, 0x12000.', EL)} (the S19 write target)", note="read back what S19 wrote (0x12000 expected)", **log)
+    add(24, "read_only", "ELBI", ev("PCIE_ELBI_RDLH_LINKUP"), cite=f"{gc(RCH, r'define PCIE_ELBI_RDLH_LINKUP\s+0x2C8')}; same register S23 waits on", note="LTSSM state again (low 6 bits; 0x11 = L0)", **log)
+
     # ---- teardown (Linux rc_poweroff order, rc.c:3622-3669; PERST low, LTSSM off first; the isolation LAST) ----
     lp = find_line(RC, r"gpio_set_value\(exynos_pcie->perst_gpio, 0\)", 3560)
     add_t(20, "gpio_dat", "GPH2", pr["DAT"][0], 1, 0, cite=anchor(RC, lp, r"perst_gpio, 0"), note="PERST low", key="perst_low")
@@ -510,7 +542,7 @@ def finish():
     core = {"rows": rows, "teardown": tear}
     sha = hashlib.sha256(json.dumps(core, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     doc = {"_doc": "GENERATED by tools/gen_wlan_seq.py from ~/pixelios-artifacts/refs/wlan-stage1 (docs/research/29 sections 2 and 14); do not edit. sha256 covers rows + teardown and is pinned in tools/test-bluejay-boot.py.",
-           "table_sha256": sha, "sources_sha256_16": srcs, "default_last_step": 19, "last_step": 23, "steps": meta["steps"], "unknown": meta["unknown"],
+           "table_sha256": sha, "sources_sha256_16": srcs, "default_last_step": 19, "last_step": 24, "steps": meta["steps"], "unknown": meta["unknown"],
            "kinds": list(KINDS), "blocks": list(BLOCKS), "rows": rows, "teardown": tear}
     return doc
 

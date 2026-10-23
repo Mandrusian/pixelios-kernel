@@ -2791,8 +2791,8 @@ def wlansmc_object_selftest(obj_path: pathlib.Path, iso: bool = False) -> int:
 
 
 # ---- --wlan-link: the table (soc/google/gs101/wlan_seq.json -> out/wlan_seq.h), the interpreter wlanlink.c, the objects (docs/research/29 section 14) ----
-_WLAN_SEQ_SHA = "a9bebe41343e07457984775ab8e3090be60e5f0f578e30ebb04a93ec1e8be901"
-_WLAN_SEQ_COUNTS = {"rows": 239, "teardown": 28, "write_rows": 237, "distinct_targets": 176}
+_WLAN_SEQ_SHA = "86b55942e43315328bb998a16e03b9d918c2010d3826481e6f011f7b4994df08"
+_WLAN_SEQ_COUNTS = {"rows": 252, "teardown": 28, "write_rows": 237, "distinct_targets": 176}
 _WLAN_SEQ_TARGET_BLOCKS = {"DBI": 1, "ELBI": 12, "GPH2": 6, "GPP14": 2, "IA": 37, "PCS": 5, "PMA": 113}
 FULL_MASK = 0xFFFFFFFF
 _WLAN_WRITE_KINDS = ("gpio_dat", "gpio_con", "mmio_rmw", "mmio_write")
@@ -2840,14 +2840,14 @@ def check_wlan_seq_table(doc: dict, header: str, pin: str | None = _WLAN_SEQ_SHA
     # header = table (the allowlist the interpreter uses is exactly the audited table)
     hdr = _WLAN_HDR_ROW.findall(header)
     want = [(str(r["step"]), r["kind"].upper(), r["blk"] or "NONE", hex(r["off"]), hex(r["mask"]), hex(r["value"]),
-             str(r["delay_us"] if r["kind"] in ("delay", "wait_eq", "wait_mask") else (1 if r.get("probe") else 0)), str(r["polls"])) for r in rows]
+             str(r["delay_us"] if r["kind"] in ("delay", "wait_eq", "wait_mask") else (1 if r.get("probe") else 0) | (2 if r.get("log") else 0)), str(r["polls"])) for r in rows]
     want += [(str(t["requires"]), t["kind"].upper(), t["blk"] or "NONE", hex(t["off"]), hex(t["mask"]), hex(t["value"]), str(t["delay_us"]), str(t["polls"])) for t in tear]
     if hdr != want or f'WLAN_SEQ_SHA256 "{sha}"' not in header:
         raise AssertionError(f"{name}: out/wlan_seq.h differs from the JSON table")
     # coverage
     steps = sorted({r["step"] for r in rows})
-    if steps != list(range(0, 24)) or any(u["step"] == 22 for u in doc["unknown"]) is False or doc["last_step"] != 23 or doc["default_last_step"] != 19:
-        raise AssertionError(f"{name}: step coverage must be S00..S23 with S22 a documented skip (unknown text kept), last 23, default 19: {steps}")
+    if steps != list(range(0, 25)) or any(u["step"] == 22 for u in doc["unknown"]) is False or doc["last_step"] != 24 or doc["default_last_step"] != 19:
+        raise AssertionError(f"{name}: step coverage must be S00..S24 with S22 a documented skip (unknown text kept), last 24, default 19: {steps}")
     # S22 (RC setup) is a DOCUMENTED SKIP (driver decision 2026-10-23): exactly one row, a 0 us delay, no write, tagged guess, saying so; its blocker text stays in `unknown`
     s22 = [r for r in rows if r["step"] == 22]
     if len(s22) != 1 or s22[0]["kind"] != "delay" or s22[0]["delay_us"] != 0 or s22[0]["tag"] != "guess" or s22[0]["blk"] is not None or "deliberately skipped" not in s22[0].get("note", "") \
@@ -2857,6 +2857,13 @@ def check_wlan_seq_table(doc: dict, header: str, pin: str | None = _WLAN_SEQ_SHA
     s23 = [(r["kind"], r["blk"], r["off"], r["mask"], r["value"], r["delay_us"], r["polls"]) for r in rows if r["step"] == 23]
     if s23 != [("mmio_write", "ELBI", 0x54, FULL_MASK, 1, 0, 0), ("wait_eq", "ELBI", 0x2C8, 0x3F, 0x11, 12, 4800)]:
         raise AssertionError(f"{name}: S23 must be exactly LTSSM enable (ELBI 0x54 = 1) and the L0 wait (ELBI 0x2C8 & 0x3F == 0x11, 4800 polls x 12 us): {s23}")
+    # S24: the READ-ONLY link report (explicit --wlan-link=24 only): the pinned DBI / ELBI offsets, every row read_only + log (a = 2, never a probe), no write kind, no restore, nothing else in the step
+    s24 = [(r["kind"], r["blk"], r["off"], r.get("log"), r.get("probe"), r["restore"]) for r in rows if r["step"] == 24]
+    s24_offs = [("DBI", o) for o in (0x000, 0x004, 0x008, 0x034, 0x040, 0x070, 0x07C, 0x080, 0x0A0, 0x710, 0x80C, 0x890)] + [("ELBI", 0x2C8)]
+    if s24 != [("read_only", b, o, True, None, None) for b, o in s24_offs]:
+        raise AssertionError(f"{name}: S24 must be exactly the 13 read_only log rows {s24_offs}, no write, no probe, no restore: {s24}")
+    if any(r.get("log") and (r["kind"] != "read_only" or r.get("probe") or r["step"] != 24) for r in rows + tear) or any("log" in t for t in tear):
+        raise AssertionError(f"{name}: the log flag is only for the non-probe read_only rows of S24")
     if [r["step"] for r in rows] != sorted(r["step"] for r in rows) or [r["id"] for r in rows] != list(range(len(rows))):
         raise AssertionError(f"{name}: rows must be in step order with sequential ids")
     # the default run (N = 19) must not release PERST nor enable the LTSSM
@@ -3044,7 +3051,7 @@ _WLANLINK_BODY_SHA = {
     "need_probe": "f1cdcfd58982cc5be5d8b192ab4355a6dea79183379420c3cb529fbf050c89b8",
     "delay_us": "10a70ec802b5fa345f4b514fa73dd3b1a3e383a977aedb6f4f5f1271c386dfcd",
     "poll_row": "2bab73a5704648f41011acc830dfa02985d0a67c197f790eb79765ab0b5a6877",
-    "run_row": "3675109c7d9e0db8a330efc2452711a7287235db1bf762bcff750a341bdd7b0d",
+    "run_row": "b65add0b34e68bbba31b7a53502b011888083742fef68ef26555a0faa910d57a",
     "wlan_link_run": "c2af77c8d0da0d28f8e8aeb0f1e8c6a8abc724fd9c3e24d9becca0af39100cd2",
 }
 
@@ -3168,7 +3175,7 @@ def wlanlink_source_selftest() -> int:
     return caught
 
 
-def check_wlan_link_n(effective: int, explicit: str | None, default: int = 19, last: int = 23) -> None:
+def check_wlan_link_n(effective: int, explicit: str | None, default: int = 19, last: int = 24) -> None:
     """Build-time policy: an image whose effective step bound N is >= 20 (PERST release, LTSSM enable) is accepted ONLY when the builder typed `--wlan-link=N` with exactly that N; anything without an
     explicit N is the default run (N = default_last_step = 19: no PERST, no LTSSM). `effective` is read from the preprocessed wlanlink.c by shim/build.sh."""
     if not 0 <= effective <= last:
@@ -3207,10 +3214,10 @@ def wlan_link_n_selftest() -> int:
     root = pathlib.Path(__file__).resolve().parents[1]
     src, sh = (root / "shim" / "wlanlink.c").read_text(), (root / "shim" / "build.sh").read_text()
     check_wlan_link_n_sources(src, sh)  # control must pass
-    for eff, exp in ((19, None), (19, ""), (7, "7"), (20, "20"), (23, "23")):
+    for eff, exp in ((19, None), (19, ""), (7, "7"), (20, "20"), (23, "23"), (24, "24")):
         check_wlan_link_n(eff, exp)
     caught = 0
-    bad_n = [(19, "20"), (20, None), (21, ""), (23, "22"), (24, "24"), (20, "x"), (22, "019")]
+    bad_n = [(19, "20"), (20, None), (21, ""), (23, "22"), (24, None), (25, "25"), (24, "23"), (20, "x"), (22, "019")]
     for eff, exp in bad_n:
         try:
             check_wlan_link_n(eff, exp)
