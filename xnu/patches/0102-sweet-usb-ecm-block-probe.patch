@@ -1,0 +1,265 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -1 +1,2 @@
+ bsd/dev/sweet_usb.c			standard
++bsd/dev/sweet_usbblk_proto.c		standard
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -33,10 +33,11 @@
+ #include <net/if_ether.h>
+ #include <net/ether_if_module.h>
+ #include <net/kpi_interface.h>
+ #include <net/kpi_protocol.h>
+ #include <netinet/in.h>
++#include "sweet_usbblk_proto.h"
+ #include <net/if_media.h>
+ #include <net/dlil.h>
+ #include <sys/kern_event.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+@@ -255,10 +256,23 @@
+ 	unsigned    txq_head, txq_count;
+ 	bool        tx_busy;
+ 	uint64_t    rx_frames, tx_frames;
+ } ud;
+ 
++/* Read-only USB-ECM block probe. Opt-in sweetusbblk=1, gs101 only. */
++#define PX_ETHERTYPE 0x88B5u
++#define PX_ETH_FRAME (14u + PX_RESPONSE_BYTES)
++static const uint8_t px_host_mac[6] = { 0x02, 0x00, 0x5e, 0x77, 0xee, 0x01 };
++static struct {
++	bool enabled;
++	bool awaiting;
++	bool finished;
++	uint32_t verified;
++	uint32_t started;
++	uint32_t retries;
++} px;
++
+ static inline void
+ dwc_wr(uint32_t off, uint32_t v)
+ {
+ 	*(volatile uint32_t *)(ud.dwc + off) = v;
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+@@ -516,17 +530,52 @@
+ ud_rx_arm(void)
+ {
+ 	ud_start_trb(EP_RX, UD_TRB_RX, UD_RX, UD_FRAME_MAX, TRBCTL_NORMAL);
+ }
+ 
++/* Consume only the test EtherType; leave ordinary ECM/IP traffic untouched. */
++static bool
++ud_px_rx(const uint8_t *frame, uint32_t length)
++{
++	if (!px.enabled || length < 14u) return false;
++	if (frame[12] != (PX_ETHERTYPE >> 8) || frame[13] != (PX_ETHERTYPE & 255u))
++		return false;
++	if (length != PX_ETH_FRAME || !px.awaiting || px.finished ||
++	    memcmp(frame, ud_phone_mac, 6) != 0 ||
++	    memcmp(frame + 6, px_host_mac, 6) != 0) {
++		printf("SWEET USBPX: ignored malformed/unexpected block frame length=%u\n", length);
++		return true;
++	}
++	uint32_t seq = px.verified + 1u;
++	int result = px_response_check(frame + 14, length - 14, seq);
++	if (result != 0) {
++		printf("SWEET USBPX: REJECT seq=%u reason=%d\n", seq, result);
++		return true;
++	}
++	px.verified++;
++	px.awaiting = false;
++	px.retries = 0;
++	printf("SWEET USBPX: verified %u/%u lba=%llu\n", px.verified,
++	    PX_TEST_READS, px_lba(seq));
++	if (px.verified == PX_TEST_READS) {
++		px.finished = true;
++		printf("SWEET USBPX: PASS blocks=8 bytes=4096\n");
++	}
++	return true;
++}
++
+ static void
+ ud_rx_done(void)
+ {
+ 	volatile uint32_t *t = (volatile uint32_t *)(ud.dma + UD_TRB_RX);
+ 	ud_sync(UD_TRB_RX, 16);
+ 	uint32_t len = UD_FRAME_MAX - (t[2] & 0xffffff);
+ 	ud_sync(UD_RX, UD_FRAME_MAX);
++	if (len <= UD_FRAME_MAX && ud_px_rx((const uint8_t *)(ud.dma + UD_RX), len)) {
++		ud_rx_arm();
++		return;
++	}
+ 	if (ud.ifp != NULL && len >= ETHER_HDR_LEN && len <= ETHER_MAX_LEN) {
+ 		/*
+ 		 * One mbuf with a 2 KiB cluster holds any frame. (mbuf_allocpacket
+ 		 * may return a first mbuf of length 0: stripping the header from
+ 		 * it panicked "Failed mbuf validity check: len -14".)
+@@ -579,10 +628,64 @@
+ 		ud.tx_frames++;
+ 		ud_start_trb(EP_TX, UD_TRB_TX, UD_TX, (uint32_t)len, TRBCTL_NORMAL);
+ 	}
+ }
+ 
++/* Enqueue one raw ECM Ethernet frame without involving the BSD IP stack. */
++static bool
++ud_px_send(uint32_t seq)
++{
++	uint8_t frame[14 + PX_REQUEST_BYTES];
++	memcpy(frame, px_host_mac, 6);
++	memcpy(frame + 6, ud_phone_mac, 6);
++	frame[12] = (uint8_t)(PX_ETHERTYPE >> 8);
++	frame[13] = (uint8_t)PX_ETHERTYPE;
++	px_request(frame + 14, seq);
++	mbuf_t m = NULL;
++	if (mbuf_gethdr(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) != 0) return false;
++	if (mbuf_maxlen(m) < sizeof(frame)) {
++		mbuf_freem(m);
++		return false;
++	}
++	memcpy(mbuf_data(m), frame, sizeof(frame));
++	mbuf_setlen(m, sizeof(frame));
++	mbuf_pkthdr_setlen(m, sizeof(frame));
++	lck_mtx_lock(ud.lock);
++	if (ud.txq_count == UD_TXQ || !ud.configured) {
++		lck_mtx_unlock(ud.lock);
++		mbuf_freem(m);
++		return false;
++	}
++	ud.txq[(ud.txq_head + ud.txq_count) % UD_TXQ] = m;
++	ud.txq_count++;
++	ud_tx_kick_locked();
++	lck_mtx_unlock(ud.lock);
++	return true;
++}
++
++static void
++ud_px_tick(uint32_t tick)
++{
++	if (!px.enabled || px.finished || !ud.configured || ud.data_alt != 1 || ud.lock == NULL)
++		return;
++	if (px.awaiting && (uint32_t)(tick - px.started) < 3000u) return;
++	if (px.awaiting && px.retries >= 3u) {
++		px.finished = true;
++		printf("SWEET USBPX: FAIL timeout seq=%u\n", px.verified + 1u);
++		return;
++	}
++	uint32_t seq = px.verified + 1u;
++	if (px.verified >= PX_TEST_READS) return;
++	if (ud_px_send(seq)) {
++		px.awaiting = true;
++		px.started = tick;
++		px.retries++;
++		printf("SWEET USBPX: READ seq=%u lba=%llu try=%u\n",
++		    seq, px_lba(seq), px.retries);
++	}
++}
++
+ static errno_t
+ ud_if_output(ifnet_t ifp, mbuf_t m)
+ {
+ 	lck_mtx_lock(ud.lock);
+ 	if (ud.txq_count == UD_TXQ || !ud.configured) {
+@@ -814,11 +917,12 @@
+ 				}
+ 				ud_event(ev);
+ 			}
+ 			dwc_wr(GEVNTCOUNT, count);
+ 		}
+-		if ((++ticks % 30000) == 0) {
++		ud_px_tick(++ticks);
++		if ((ticks % 30000) == 0) {
+ 			printf("SWEET USB: ue0 rx %llu tx %llu frames\n", ud.rx_frames, ud.tx_frames);
+ 		}
+ 		ud_sleep_ms(1);
+ 	}
+ }
+@@ -996,10 +1100,14 @@
+ 		if (!pn) {
+ 			return;
+ 		}
+ 		ud.dma_pa = ptoa_64(pn);
+ 	}
++	int px_enable = 0;
++	PE_parse_boot_argn("sweetusbblk", &px_enable, sizeof(px_enable));
++	px.enabled = ud.gs101 && px_enable == 1;
++	if (px.enabled) printf("SWEET USBPX: probe enabled, read-only 8 sectors via ECM\n");
+ 	ud_if_create();
+ 
+ 	/* Device controller soft reset (PHY and global setup stay as ABL left them). */
+ 	dwc_wr(DCTL, DCTL_CSFTRST);
+ 	int i;
+--- /dev/null
++++ b/bsd/dev/sweet_usbblk_proto.c
+@@ -0,0 +1,55 @@
++#include "sweet_usbblk_proto.h"
++static uint32_t px_u32(const uint8_t *p)
++{
++    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
++        ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
++}
++static uint64_t px_u64(const uint8_t *p)
++{
++    return (uint64_t)px_u32(p) | ((uint64_t)px_u32(p + 4) << 32);
++}
++static void px_put32(uint8_t *p, uint32_t n)
++{
++    for (unsigned i = 0; i < 4; ++i) p[i] = (uint8_t)(n >> (i * 8));
++}
++static void px_put64(uint8_t *p, uint64_t n)
++{
++    px_put32(p, (uint32_t)n);
++    px_put32(p + 4, (uint32_t)(n >> 32));
++}
++uint32_t px_crc32(const uint8_t *p, size_t n)
++{
++    uint32_t crc = 0xffffffffu;
++    for (size_t i = 0; i < n; i++) {
++        crc ^= p[i];
++        for (unsigned b = 0; b < 8; b++)
++            crc = (crc >> 1) ^ (0xedb88320u & (0u - (crc & 1u)));
++    }
++    return ~crc;
++}
++uint64_t px_lba(uint32_t seq)
++{
++    if (seq == 0 || seq > PX_TEST_READS) return UINT64_MAX;
++    return (((uint64_t)(seq - 1) * 977u) + 293u) % PX_SECTORS;
++}
++void px_request(uint8_t out[PX_REQUEST_BYTES], uint32_t seq)
++{
++    out[0] = 'P'; out[1] = 'X'; out[2] = 'B'; out[3] = 'Q';
++    px_put32(out + 4, seq);
++    px_put64(out + 8, px_lba(seq));
++    px_put32(out + 16, PX_BLOCK_BYTES);
++    px_put32(out + 20, 0);
++}
++int px_response_check(const uint8_t *p, size_t n, uint32_t seq)
++{
++    if (!p || n != PX_RESPONSE_BYTES || !seq || seq > PX_TEST_READS) return -1;
++    if (p[0] != 'P' || p[1] != 'X' || p[2] != 'B' || p[3] != 'R') return -2;
++    uint64_t lba = px_lba(seq);
++    if (px_u32(p + 4) != seq || px_u64(p + 8) != lba ||
++        px_u32(p + 16) != PX_BLOCK_BYTES) return -3;
++    if (px_u32(p + 20) != px_crc32(p + 24, PX_BLOCK_BYTES)) return -4;
++    for (unsigned i = 0; i < PX_BLOCK_BYTES; i++)
++        if (p[24 + i] != (uint8_t)(((i * 37u + (unsigned)lba * 17u) ^ 0xa5u) & 255u))
++            return -5;
++    return 0;
++}
+--- /dev/null
++++ b/bsd/dev/sweet_usbblk_proto.h
+@@ -0,0 +1,14 @@
++#ifndef SWEET_USBBLK_PROTO_H
++#define SWEET_USBBLK_PROTO_H
++#include <stddef.h>
++#include <stdint.h>
++#define PX_BLOCK_BYTES 512u
++#define PX_RESPONSE_BYTES 536u
++#define PX_REQUEST_BYTES 24u
++#define PX_SECTORS 4096u
++#define PX_TEST_READS 8u
++uint32_t px_crc32(const uint8_t *p, size_t n);
++uint64_t px_lba(uint32_t seq);
++void px_request(uint8_t out[PX_REQUEST_BYTES], uint32_t seq);
++int px_response_check(const uint8_t *data, size_t length, uint32_t seq);
++#endif
