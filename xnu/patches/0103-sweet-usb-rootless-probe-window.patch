@@ -1,0 +1,28 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -628,12 +628,25 @@
+ 	}
+ 
+ 	if (SecureDTLookupEntry(NULL, "/sweet-ufs", &node) != kSuccess ||
+ 	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||
+ 	    size < 2 * sizeof(uintptr_t)) {
+ 		printf("SWEET UFS: no /sweet-ufs node in the device tree\n");
++		/* Probe-only Raven boot: allow the ECM thread to finish before the
++		 * intentionally missing root device stops this boot. No UFS MMIO
++		 * or block access is attempted because the ADT node is absent. */
++		int px_probe = 0;
++		PE_parse_boot_argn("sweetusbblk", &px_probe, sizeof(px_probe));
++		if (px_probe == 1) {
++			uint64_t deadline;
++			printf("SWEET USBPX: no UFS root, 45-second ECM test window\n");
++			clock_interval_to_deadline(45, NSEC_PER_SEC, &deadline);
++			(void)assert_wait_deadline((event_t)&px_probe, THREAD_UNINT, deadline);
++			thread_block(THREAD_CONTINUE_NULL);
++			printf("SWEET USBPX: probe window ended; expected missing-root error follows\n");
++		}
+ 		return ENXIO;
+ 	}
+ 	{
+ 		char const *compat = NULL;
+ 		unsigned int csize = 0;
+ 		if (SecureDTGetProperty(node, "compatible", (void const **)&compat, &csize) == kSuccess &&
