@@ -1,0 +1,72 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -160,12 +160,14 @@
+  * thread (no interrupt), like the UFS driver. DMA is not cache coherent
+  * (DT qcom,gsi-disable-io-coherency): buffers are cleaned/invalidated.
+  * Register layout and the control-transfer state machine follow the
+  * Synopsys DWC3 databook as used by Linux drivers/usb/dwc3 (gadget.c,
+  * ep0.c).
+  */
++#define GUSB2PHYCFG0    0xc200
++#define GUSB2PHYCFG_PM_MASK ((1u << 6) | (1u << 8))
+ #define GCTL            0xc110
+ #define GEVNTADRLO      0xc400
+ #define GEVNTADRHI      0xc404
+ #define GEVNTSIZ        0xc408
+ #define GEVNTCOUNT      0xc40c
+ #define DCFG            0xc700
+@@ -300,13 +302,13 @@
+ 	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
+ 	(void)assert_wait_deadline(&ud.sleep_chan, THREAD_UNINT, deadline);
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
+ 
+ static int
+-ud_epcmd(unsigned ep, uint32_t cmd, uint32_t p0, uint32_t p1, uint32_t p2)
++ud_epcmd_raw(unsigned ep, uint32_t cmd, uint32_t p0, uint32_t p1, uint32_t p2)
+ {
+ 	dwc_wr(DEPCMDPAR0(ep), p0);
+ 	dwc_wr(DEPCMDPAR1(ep), p1);
+ 	dwc_wr(DEPCMDPAR2(ep), p2);
+ 	dwc_wr(DEPCMD(ep), cmd | DEPCMD_CMDACT);
+ 	/* gs101: the shim waits up to 10 ms per endpoint command (shim/usbgadget.c USBG_CMD_TIMEOUT_MS) */
+@@ -321,12 +323,39 @@
+ 			return 0;
+ 		}
+ 		delay(1);
+ 	}
+ 	printf("SWEET USB: ep%u cmd 0x%x timeout\n", ep, cmd & 0xf);
+ 	return -1;
++}
++
++/* Phase 4C: Raven USB2 PHY wake guard, adapted from the working
++ * shim/usbgadget.c RAVEN_PHY_WAKE_V5 implementation. Probe-only.
++ * Keep the command logic unchanged; restore exactly the PHY suspend/LPM
++ * bits present before the command, including timeout/error paths. */
++static int
++ud_epcmd(unsigned ep, uint32_t cmd, uint32_t p0, uint32_t p1, uint32_t p2)
++{
++	if (!ud.gs101 || !px.enabled) {
++		return ud_epcmd_raw(ep, cmd, p0, p1, p2);
++	}
++	uint32_t phy = dwc_rd(GUSB2PHYCFG0);
++	uint32_t saved = phy & GUSB2PHYCFG_PM_MASK;
++	if (saved != 0) {
++		dwc_wr(GUSB2PHYCFG0, phy & ~GUSB2PHYCFG_PM_MASK);
++	}
++	if (ep == 0 && (cmd & 0xffu) == DEPCMD_DEPSTARTCFG) {
++		printf("SWEET USBPX: PHY guard cfg=0x%08x cleared=0x%08x\n",
++		    phy, phy & ~GUSB2PHYCFG_PM_MASK);
++	}
++	int result = ud_epcmd_raw(ep, cmd, p0, p1, p2);
++	if (saved != 0) {
++		uint32_t current = dwc_rd(GUSB2PHYCFG0);
++		dwc_wr(GUSB2PHYCFG0, current | saved);
++	}
++	return result;
+ }
+ 
+ /* One TRB (at DMA offset trb) on physical endpoint ep. */
+ static void
+ ud_start_trb(unsigned ep, uint32_t trb, uint32_t buf, uint32_t len, uint32_t ctl)
+ {
