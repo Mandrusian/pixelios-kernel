@@ -1,0 +1,450 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -115,3 +115,5 @@
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/sweet_usbblk_proto.c		standard
++bsd/dev/sweet_usbroot_proto.c		standard
++bsd/dev/sweet_usbroot.c			standard
+ bsd/dev/sweet_keys_gs101.c		standard
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -36,6 +36,8 @@
+ #include <net/kpi_protocol.h>
+ #include <netinet/in.h>
+ #include "sweet_usbblk_proto.h"
++#include "sweet_usbroot_proto.h"
++#include <sys/errno.h>
+ #include <net/if_media.h>
+ #include <net/dlil.h>
+ #include <sys/kern_event.h>
+@@ -273,6 +275,22 @@
+ 	uint32_t retries;
+ } px;
+ 
++/* Independent arbitrary-LBA host-backed disk (EtherType 0x88B6). One read
++ * outstanding at a time. USB event thread is the sole RX producer. */
++#define UR_ETHERTYPE 0x88B6u
++static struct {
++    bool enabled;
++    volatile bool pending;
++    volatile bool done;
++    uint32_t seq;
++    uint64_t lba;
++    uint32_t count;
++    uint32_t result;
++    uint64_t capacity;
++    uint8_t data[UR_MAX_READ_BYTES];
++} ur;
++static uint32_t ur_next_seq;
++
+ static inline void
+ dwc_wr(uint32_t off, uint32_t v)
+ {
+@@ -335,7 +353,7 @@
+ static int
+ ud_epcmd(unsigned ep, uint32_t cmd, uint32_t p0, uint32_t p1, uint32_t p2)
+ {
+-	if (!ud.gs101 || !px.enabled) {
++	if (!ud.gs101 || (!px.enabled && !ur.enabled)) {
+ 		return ud_epcmd_raw(ep, cmd, p0, p1, p2);
+ 	}
+ 	uint32_t phy = dwc_rd(GUSB2PHYCFG0);
+@@ -592,6 +610,28 @@
+ 	return true;
+ }
+ 
++/* The USB RX callback runs on the USB event thread. Never sleep here. */
++static bool
++ud_ur_rx(const uint8_t *frame, uint32_t length)
++{
++    if (!ur.enabled || length < 14u ||
++        frame[12] != (UR_ETHERTYPE >> 8) ||
++        frame[13] != (UR_ETHERTYPE & 255u)) return false;
++    if (!ur.pending ||
++        memcmp(frame, ud_phone_mac, 6) ||
++        memcmp(frame + 6, px_host_mac, 6)) return true;
++    uint32_t expect=ur.count ? ur.count : UR_CAP_BYTES;
++    uint8_t temp[UR_MAX_READ_BYTES];
++    if (ur_check_reply(frame + 14, length - 14,ur.seq,ur.lba,expect,temp))
++        return true; /* Ignore malformed/stale data, retry at the deadline. */
++    if (ur.count) memcpy(ur.data,temp,ur.count);
++    else ur.capacity=ur_u64(temp);
++    __asm__ volatile ("dmb ish" ::: "memory");
++    ur.done=true;
++    ur.pending=false;
++    return true;
++}
++
+ static void
+ ud_rx_done(void)
+ {
+@@ -599,6 +639,10 @@
+ 	ud_sync(UD_TRB_RX, 16);
+ 	uint32_t len = UD_FRAME_MAX - (t[2] & 0xffffff);
+ 	ud_sync(UD_RX, UD_FRAME_MAX);
++    if (len <= UD_FRAME_MAX && ud_ur_rx((const uint8_t *)(ud.dma + UD_RX), len)) {
++        ud_rx_arm();
++        return;
++    }
+ 	if (len <= UD_FRAME_MAX && ud_px_rx((const uint8_t *)(ud.dma + UD_RX), len)) {
+ 		ud_rx_arm();
+ 		return;
+@@ -691,6 +735,87 @@
+ 	return true;
+ }
+ 
++/* A small bounded raw Ethernet frame goes through the established TX queue.
++ * Never bypass the endpoint lock or touch controller registers from BSD I/O. */
++static bool
++ud_ur_send(uint32_t seq, uint64_t lba, uint32_t len, uint32_t op)
++{
++    uint8_t frame[14+UR_REQ_BYTES];
++    memcpy(frame,px_host_mac,6);
++    memcpy(frame+6,ud_phone_mac,6);
++    frame[12]=(uint8_t)(UR_ETHERTYPE>>8);
++    frame[13]=(uint8_t)UR_ETHERTYPE;
++    if (ur_make_request(frame+14,seq,lba,len,op))return false;
++    mbuf_t m=NULL;
++    if (mbuf_gethdr(MBUF_DONTWAIT,MBUF_TYPE_DATA,&m)!=0)return false;
++    if (mbuf_maxlen(m)<sizeof(frame)){mbuf_freem(m);return false;}
++    memcpy(mbuf_data(m),frame,sizeof(frame));
++    mbuf_setlen(m,sizeof(frame));
++    mbuf_pkthdr_setlen(m,sizeof(frame));
++    lck_mtx_lock(ud.lock);
++    if(ud.txq_count==UD_TXQ || !ud.configured || ud.data_alt!=1){
++        lck_mtx_unlock(ud.lock);mbuf_freem(m);return false;
++    }
++    ud.txq[(ud.txq_head+ud.txq_count)%UD_TXQ]=m;
++    ud.txq_count++;
++    ud_tx_kick_locked();
++    lck_mtx_unlock(ud.lock);
++    return true;
++}
++
++/* Called only by the serialized BSD disk strategy or root initialization.
++ * Each request has its own seq: late replies cannot satisfy newer reads. */
++static int
++ur_exchange(uint64_t lba,uint32_t count,uint32_t op,uint8_t *out)
++{
++    if (!ur.enabled || !ud.gs101 || ud.lock==NULL)return ENXIO;
++    if (op==UR_OP_READ && (count!=512 && count!=1024))return EINVAL;
++    if (op==UR_OP_CAP && (lba!=0 || count!=0))return EINVAL;
++    uint64_t deadline;
++    clock_interval_to_deadline(30000,NSEC_PER_MSEC,&deadline);
++    while ((!ud.configured || ud.data_alt!=1) && mach_absolute_time()<deadline)
++        ud_sleep_ms(5);
++    if (!ud.configured || ud.data_alt!=1)return ETIMEDOUT;
++    for (unsigned retry=0;retry<4;retry++) {
++        uint32_t seq=++ur_next_seq;
++        if (!seq)seq=++ur_next_seq;
++        ur.seq=seq;ur.lba=lba;ur.count=count;
++        ur.done=false;ur.pending=true;
++        __asm__ volatile ("dmb ish" ::: "memory");
++        if (!ud_ur_send(seq,lba,count,op)) {
++            ur.pending=false;
++            ud_sleep_ms(5);
++            continue;
++        }
++        clock_interval_to_deadline(3000,NSEC_PER_MSEC,&deadline);
++        while (!ur.done && mach_absolute_time()<deadline)ud_sleep_ms(5);
++        __asm__ volatile ("dmb ish" ::: "memory");
++        if(ur.done){
++            if(out && count)memcpy(out,ur.data,count);
++            return 0;
++        }
++        ur.pending=false;
++    }
++    printf("SWEET USBROOT: transport timeout lba=%llu count=%u
++",lba,count);
++    return ETIMEDOUT;
++}
++
++int sweet_usbroot_capacity(uint64_t *sectors);
++int sweet_usbroot_capacity(uint64_t *sectors)
++{
++    int e=ur_exchange(0,0,UR_OP_CAP,NULL);
++    if(!e && sectors)*sectors=ur.capacity;
++    return e;
++}
++
++int sweet_usbroot_read_sectors(uint64_t lba,uint32_t nsect,uint8_t *dest);
++int sweet_usbroot_read_sectors(uint64_t lba,uint32_t nsect,uint8_t *dest)
++{
++    if(!dest || !(nsect==1 || nsect==2))return EINVAL;
++    return ur_exchange(lba,nsect*UR_SECTOR_BYTES,UR_OP_READ,dest);
++}
++
+ static void
+ ud_px_tick(uint32_t tick)
+ {
+@@ -1134,6 +1259,10 @@
+ 	int px_enable = 0;
+ 	PE_parse_boot_argn("sweetusbblk", &px_enable, sizeof(px_enable));
+ 	px.enabled = ud.gs101 && px_enable == 1;
++    int ur_enable=0;
++    PE_parse_boot_argn("sweetusbroot",&ur_enable,sizeof(ur_enable));
++    ur.enabled=ud.gs101 && ur_enable==1 && !px.enabled;
++    if(ur.enabled)printf("SWEET USBROOT: ECM arbitrary-sector transport enabled (read-only)\n");
+ 	if (px.enabled) printf("SWEET USBPX: probe enabled, read-only 8 sectors via ECM\n");
+ 	ud_if_create();
+ 
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -778,4 +778,17 @@
+ 		*oflags = 0;
+ 		goto iofrootx;
+ 	}
++	if (strcmp(rdBootVar, "usbroot0") == 0) {
++		extern int sweet_usbroot_rootdev(dev_t *dev);
++		OSSafeReleaseNULL(matching);
++		int usb_error = sweet_usbroot_rootdev(root);
++		if (usb_error) {
++			panic("IOFindBSDRoot: SWEET USB root %s unavailable: %d", rdBootVar, usb_error);
++		}
++		strlcpy(rootName, rdBootVar, rootNameSize);
++		IOLog("BSD root: %s, major %d, minor %d (USB read-only)\n",
++		    rootName, major(*root), minor(*root));
++		*oflags = 0;
++		goto iofrootx;
++	}
+ #endif
+--- /dev/null
++++ b/bsd/dev/sweet_usbroot_proto.c
+@@ -0,0 +1,49 @@
++#include "sweet_usbroot_proto.h"
++static uint32_t u32(const uint8_t *p) {
++    return (uint32_t)p[0] | ((uint32_t)p[1]<<8) |
++        ((uint32_t)p[2]<<16) | ((uint32_t)p[3]<<24);
++}
++uint64_t ur_u64(const uint8_t *p) {
++    return (uint64_t)u32(p) | ((uint64_t)u32(p+4)<<32);
++}
++static void put32(uint8_t *p, uint32_t v) {
++    p[0]=(uint8_t)v; p[1]=(uint8_t)(v>>8);
++    p[2]=(uint8_t)(v>>16); p[3]=(uint8_t)(v>>24);
++}
++static void put64(uint8_t *p, uint64_t v) {
++    put32(p, (uint32_t)v);put32(p+4,(uint32_t)(v>>32));
++}
++uint32_t ur_crc32(const uint8_t *p, size_t n) {
++    uint32_t crc=0xffffffffu;
++    for(size_t i=0;i<n;i++) {
++        crc^=p[i];
++        for(unsigned b=0;b<8;b++) {
++            uint32_t mask=0u-(crc&1u);
++            crc=(crc>>1) ^ (0xedb88320u & mask);
++        }
++    }
++    return ~crc;
++}
++int ur_make_request(uint8_t out[UR_REQ_BYTES], uint32_t seq, uint64_t lba,
++                    uint32_t length, uint32_t op) {
++    if(!out || !seq ||
++       (op==UR_OP_CAP ? (length!=0 || lba!=0) :
++        (op!=UR_OP_READ || !(length==512 || length==1024) ||
++         lba > UINT64_MAX-(length/512u)))) return -1;
++    for(unsigned i=0;i<UR_REQ_BYTES;i++)out[i]=0;
++    out[0]='R';out[1]='5';out[2]='Q';out[3]='1';
++    put32(out+4,seq);put64(out+8,lba);put32(out+16,length);put32(out+20,op);
++    return 0;
++}
++int ur_check_reply(const uint8_t *p, size_t n, uint32_t seq, uint64_t lba,
++                   uint32_t length, uint8_t *out) {
++    if(!p || !out || !seq || !(length==512 || length==1024 || length==8) ||
++       n!=(size_t)UR_RESP_HEADER_BYTES+length) return -1;
++    if(p[0]!='R' || p[1]!='5' || p[2]!='R' || p[3]!='1')return -2;
++    if(u32(p+4)!=seq || ur_u64(p+8)!=lba || u32(p+16)!=length)return -3;
++    if(u32(p+20)!=0 || u32(p+28)!=0)return -4;
++    if(u32(p+24)!=ur_crc32(p+UR_RESP_HEADER_BYTES,length))return -5;
++    /* Validate all fields and CRC before copying any output. */
++    for(unsigned i=0;i<length;i++)out[i]=p[UR_RESP_HEADER_BYTES+i];
++    return 0;
++}
+--- /dev/null
++++ b/bsd/dev/sweet_usbroot_proto.h
+@@ -0,0 +1,21 @@
++/* PixelIOS host-backed read-only disk protocol v1, standard C11, no XNU ABI. */
++#ifndef SWEET_USBROOT_PROTO_H
++#define SWEET_USBROOT_PROTO_H
++#include <stddef.h>
++#include <stdint.h>
++#define UR_SECTOR_BYTES 512u
++#define UR_MAX_READ_BYTES 1024u
++#define UR_REQ_BYTES 32u
++#define UR_RESP_HEADER_BYTES 32u
++#define UR_MAX_RESP_BYTES (UR_RESP_HEADER_BYTES+UR_MAX_READ_BYTES)
++#define UR_CAP_BYTES 8u
++#define UR_OP_READ 1u
++#define UR_OP_CAP 2u
++/* Negative outcomes never modify output. */
++uint32_t ur_crc32(const uint8_t *p, size_t n);
++int ur_make_request(uint8_t out[UR_REQ_BYTES], uint32_t seq, uint64_t lba,
++    uint32_t length, uint32_t op);
++int ur_check_reply(const uint8_t *p, size_t n, uint32_t seq, uint64_t lba,
++    uint32_t length, uint8_t *out);
++uint64_t ur_u64(const uint8_t *p);
++#endif
+--- /dev/null
++++ b/bsd/dev/sweet_usbroot.c
+@@ -0,0 +1,161 @@
++/*
++ * PixelIOS host-backed read-only BSD disk. No MMIO, UFS probes, physical
++ * partition reads, or writes. Root on rd=usbroot0 with sweetusbroot=1 and a
++ * Raven ADT generated with --no-ufs. All sector I/O goes to Fedora via ECM.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/buf.h>
++#include <sys/conf.h>
++#include <sys/disk.h>
++#include <sys/errno.h>
++#include <sys/proc.h>
++#include <sys/uio.h>
++#include <miscfs/devfs/devfs.h>
++#include <kern/locks.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include <libkern/libkern.h>
++#include "sweet_usbroot_proto.h"
++
++extern void sweet_usb_probe(void);
++extern int sweet_usbroot_capacity(uint64_t *sectors);
++extern int sweet_usbroot_read_sectors(uint64_t lba, uint32_t nsect, uint8_t *dst);
++
++static struct {
++    uint64_t sectors;
++    uint32_t secsize;
++    int bmajor, cmajor;
++    dev_t bdev;
++    bool ready;
++} urdisk;
++static LCK_GRP_DECLARE(ur_disk_grp, "sweet_usbroot");
++static LCK_MTX_DECLARE(ur_disk_lock, &ur_disk_grp);
++
++static int disk_open(__unused dev_t d, int flags,
++                     __unused int typ, __unused struct proc *p) {
++    if (!urdisk.ready)return ENXIO;
++    return (flags & FWRITE) ? EROFS : 0;
++}
++static int disk_close(__unused dev_t d, __unused int flags,
++                      __unused int typ, __unused struct proc *p) {return 0;}
++static void disk_strategy(buf_t bp) {
++    uint32_t count=buf_count(bp);
++    uint64_t blk;
++    caddr_t va=NULL;
++    int err=0;
++    uint32_t done=0;
++    buf_setresid(bp,count);
++    if (!(buf_flags(bp)&B_READ)) {err=EROFS;goto finish;}
++    if (!urdisk.ready || (int64_t)buf_blkno(bp)<0 ||
++        !urdisk.secsize || (count%UR_SECTOR_BYTES)) {err=EINVAL;goto finish;}
++    if ((uint64_t)buf_blkno(bp)>UINT64_MAX/urdisk.secsize) {err=EINVAL;goto finish;}
++    blk=(uint64_t)buf_blkno(bp)*(urdisk.secsize/UR_SECTOR_BYTES);
++    if (blk>urdisk.sectors || (uint64_t)(count/UR_SECTOR_BYTES)>urdisk.sectors-blk) {
++        err=EINVAL;goto finish;
++    }
++    if (!count)goto finish;
++    if (buf_map(bp,&va)) {err=EIO;goto finish;}
++    lck_mtx_lock(&ur_disk_lock);
++    while (done<count) {
++        uint8_t data[UR_MAX_READ_BYTES];
++        uint32_t bytes=MIN(count-done,UR_MAX_READ_BYTES);
++        uint32_t sectors=bytes/UR_SECTOR_BYTES;
++        err=sweet_usbroot_read_sectors(blk+done/UR_SECTOR_BYTES,sectors,data);
++        if (err)break;
++        memcpy(va+done,data,bytes);
++        done+=bytes;
++        buf_setresid(bp,count-done);
++    }
++    lck_mtx_unlock(&ur_disk_lock);
++    buf_unmap(bp);
++finish:
++    if(err)buf_seterror(bp,err);
++    buf_biodone(bp);
++}
++static int disk_ioctl(__unused dev_t dev,u_long cmd,caddr_t data,
++                      __unused int flags,__unused struct proc *p,int chr) {
++    uint32_t *u=(uint32_t *)data;
++    uint64_t *q=(uint64_t *)data;
++    switch(cmd) {
++    case DKIOCGETBLOCKSIZE: *u=urdisk.secsize;return 0;
++    case DKIOCSETBLOCKSIZE:
++        if(chr || (*u!=512 && *u!=1024 && *u!=2048 && *u!=4096))return EINVAL;
++        urdisk.secsize=*u;return 0;
++    case DKIOCGETPHYSICALBLOCKSIZE:*u=512;return 0;
++    case DKIOCGETBLOCKCOUNT:*q=urdisk.sectors/(urdisk.secsize/512);return 0;
++    case DKIOCISWRITABLE:*u=0;return 0;
++    case DKIOCSYNCHRONIZE:
++    case DKIOCSYNCHRONIZECACHE:return 0; /* Read-only, nothing to flush. */
++    case DKIOCGETMAXBLOCKCOUNTREAD:*q=UR_MAX_READ_BYTES/urdisk.secsize;
++        if(!*q)*q=1;return 0;
++    case DKIOCGETMAXBLOCKCOUNTWRITE:*q=0;return 0;
++    case DKIOCGETMAXSEGMENTCOUNTREAD:
++    case DKIOCGETMAXSEGMENTCOUNTWRITE:*q=1;return 0;
++    default:return ENOTTY;
++    }
++}
++static int disk_bioctl(dev_t d,u_long c,caddr_t a,int f,struct proc *p) {
++    return disk_ioctl(d,c,a,f,p,0);
++}
++static int disk_cioctl(dev_t d,u_long c,caddr_t a,int f,struct proc *p) {
++    return disk_ioctl(d,c,a,f,p,1);
++}
++static int disk_psize(__unused dev_t d) {
++    if (!urdisk.ready)return -1;
++    return (int)MIN(urdisk.sectors/(urdisk.secsize/512),(uint64_t)INT_MAX);
++}
++static int disk_read(dev_t dev, struct uio *uio,__unused int flags) {
++    return physio(disk_strategy,NULL,dev,B_READ,minphys,uio,(int)urdisk.secsize);
++}
++static int disk_write(__unused dev_t d,__unused struct uio *u,__unused int f) {
++    return EROFS;
++}
++static const struct bdevsw ur_bdevsw={
++    .d_open=disk_open,.d_close=disk_close,.d_strategy=disk_strategy,
++    .d_ioctl=disk_bioctl,.d_dump=eno_dump,.d_psize=disk_psize,.d_type=D_DISK
++};
++static const struct cdevsw ur_cdevsw={
++    .d_open=disk_open,.d_close=disk_close,.d_read=disk_read,.d_write=disk_write,
++    .d_ioctl=disk_cioctl,.d_stop=eno_stop,.d_reset=eno_reset,.d_ttys=NULL,
++    .d_select=eno_select,.d_mmap=eno_mmap,.d_strategy=eno_strat,
++    .d_reserved_1=eno_getc,.d_reserved_2=eno_putc,.d_type=D_DISK
++};
++
++int sweet_usbroot_rootdev(dev_t *dev);
++int sweet_usbroot_rootdev(dev_t *dev) {
++    int enabled=0;
++    DTEntry node;
++    uint64_t sectors=0;
++    int err;
++    if (urdisk.ready){*dev=urdisk.bdev;return 0;}
++    PE_parse_boot_argn("sweetusbroot",&enabled,sizeof(enabled));
++    if (enabled!=1) return ENXIO;
++    /* If the ADT declares internal UFS, refuse: the test must stay isolated. */
++    if (SecureDTLookupEntry(NULL,"/sweet-ufs",&node)==kSuccess) {
++        printf("SWEET USBROOT: refusing ADT containing internal UFS\n");
++        return EPERM;
++    }
++    printf("SWEET USBROOT: starting read-only USB disk, no internal UFS\n");
++    sweet_usb_probe();
++    err=sweet_usbroot_capacity(&sectors);
++    if(err){printf("SWEET USBROOT: capacity unavailable err=%d\n",err);return err;}
++    /* Up to 64 GiB, nonzero, full 512B sectors. Test-image guard. */
++    if(sectors<2048 || sectors>(64ull<<30)/UR_SECTOR_BYTES) return EINVAL;
++    urdisk.sectors=sectors;
++    urdisk.secsize=512;
++    urdisk.bmajor=bdevsw_add(-1,&ur_bdevsw);
++    if(urdisk.bmajor<0)return ENXIO;
++    urdisk.cmajor=cdevsw_add_with_bdev(-1,&ur_cdevsw,urdisk.bmajor);
++    if(urdisk.cmajor<0)return ENXIO;
++    urdisk.bdev=makedev(urdisk.bmajor,0);
++    devfs_make_node(urdisk.bdev,DEVFS_BLOCK,UID_ROOT,GID_OPERATOR,0440,"usbroot0");
++    devfs_make_node(makedev(urdisk.cmajor,0),DEVFS_CHAR,UID_ROOT,GID_OPERATOR,0440,"rusbroot0");
++    urdisk.ready=true;
++    *dev=urdisk.bdev;
++    printf("SWEET USBROOT: ready %llu sectors (%llu MiB), STRICTLY READ ONLY\n",
++        sectors,sectors/2048);
++    return 0;
++}
++#endif
