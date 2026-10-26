@@ -1,0 +1,93 @@
+name: Phase 6A - Static Darwin PID1
+
+on:
+  push:
+    branches:
+      - phase6a-static-init-ci
+    paths:
+      - .github/workflows/phase6a-static-init.yml
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout pinned Darwin userspace
+        uses: actions/checkout@v4
+        with:
+          repository: PixOS-Project/pixelios-userland
+          ref: a2bff336d63554bb140540945f346d4a6bfc1f54
+          path: userland
+          persist-credentials: false
+
+      - name: Assemble ARM64 Darwin PID1
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          test "$(git -C userland rev-parse HEAD)" = \
+            a2bff336d63554bb140540945f346d4a6bfc1f54
+
+          xcodebuild -version
+          mkdir -p dist
+
+          xcrun clang -target arm64-apple-ios16.0 \
+            -x assembler-with-cpp -c \
+            userland/tools/sweet-init.S \
+            -o dist/sweet-init.o
+
+          python3 userland/tools/mkinit.py \
+            dist/sweet-init.o dist/launchd
+
+          file dist/launchd
+
+      - name: Audit static Mach-O
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 - <<'PY'
+          import struct
+          from pathlib import Path
+
+          b = Path("dist/launchd").read_bytes()
+          assert len(b) > 16384
+          magic, cpu, subtype, kind, ncmds, sizeofcmds, flags, reserved = \
+              struct.unpack_from("<8I", b)
+          assert magic == 0xfeedfacf
+          assert cpu == 0x0100000c
+          assert kind == 2
+          assert 0 < ncmds <= 20
+
+          commands = []
+          off = 32
+          for _ in range(ncmds):
+              cmd, size = struct.unpack_from("<II", b, off)
+              assert size >= 8 and off + size <= len(b)
+              commands.append(cmd)
+              off += size
+
+          assert 0x5 in commands, "Missing LC_UNIXTHREAD"
+          assert 0x1d in commands, "Missing code signature"
+          assert 0xe not in commands, "Unexpected dynamic loader"
+          assert b"/dev/console" in b
+
+          print("PASS: ARM64 static Mach-O")
+          print("PASS: Entry point and code-signature commands")
+          print("PASS: No dynamic loader dependency")
+          PY
+
+          shasum -a 256 dist/launchd > dist/SHA256SUMS
+          cat dist/SHA256SUMS
+
+      - name: Upload PID1 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pixelios-phase6a-static-init
+          path: |
+            dist/launchd
+            dist/sweet-init.o
+            dist/SHA256SUMS
+          if-no-files-found: error
