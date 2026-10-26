@@ -89,7 +89,7 @@
  	if (len <= UD_FRAME_MAX && ud_px_rx((const uint8_t *)(ud.dma + UD_RX), len)) {
  		ud_rx_arm();
  		return;
-@@ -691,6 +735,87 @@
+@@ -691,6 +735,86 @@
  	return true;
  }
  
@@ -154,8 +154,7 @@
 +        }
 +        ur.pending=false;
 +    }
-+    printf("SWEET USBROOT: transport timeout lba=%llu count=%u
-+",lba,count);
++    printf("SWEET USBROOT: transport timeout lba=%llu count=%u\n", lba, count);
 +    return ETIMEDOUT;
 +}
 +
