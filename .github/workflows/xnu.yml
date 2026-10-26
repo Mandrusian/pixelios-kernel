@@ -17,7 +17,7 @@ on:
         description: xnu MACHINE_CONFIG
         default: SWEET
   push:
-    branches: [main]
+    branches: [main, phase5-macos15-toolchain-probe-ci]
     paths:
       - "xnu/patches/**"
       - "upstream-patches/**"
@@ -47,8 +47,9 @@ jobs:
           python3 tools/qr-log.py --selftest
 
   kernel:
-    # macos-14 ships Xcode 15, whose iig matches the xnu-8796 IORPC ABI (Xcode 16's does not)
-    runs-on: macos-14
+    # Toolchain compatibility experiment; xnu-8796 has previously depended on Xcode 15 iig.
+    # Explicitly test Xcode 16.0 on maintained macOS 15 runners, preserving the existing build branch.
+    runs-on: macos-15
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
@@ -69,10 +70,14 @@ jobs:
           # build.sh only checks that `xcodes` exists; Xcode is preinstalled on the runner
           printf '#!/bin/sh\nexit 0\n' | sudo tee /usr/local/bin/xcodes >/dev/null
           sudo chmod +x /usr/local/bin/xcodes
-          XC=$(ls -d /Applications/Xcode_*.app | sort -V | head -1)
+          XC=/Applications/Xcode_16.app
+          test -d "$XC/Contents/Developer" || { echo "::error::Missing Xcode 16.0 on macos-15"; exit 1; }
           echo "DEVELOPER_DIR=$XC/Contents/Developer" >> "$GITHUB_ENV"
           sudo xcode-select -s "$XC"
           xcodebuild -version
+          echo '=== iig path / version ==='
+          xcrun -f iig || true
+          xcrun iig --version || true
 
       - name: Build
         working-directory: dxb
