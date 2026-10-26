@@ -1,8 +1,13 @@
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -1 +1,2 @@
+@@ -113,6 +113,7 @@
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_spmi.c			standard
  bsd/dev/sweet_usb.c			standard
 +bsd/dev/sweet_usbblk_proto.c		standard
+ bsd/dev/sweet_keys_gs101.c		standard
+ bsd/dev/sweet_touch_gs101.c		standard
+ bsd/dev/mem.c				standard
 --- a/bsd/dev/sweet_usb.c
 +++ b/bsd/dev/sweet_usb.c
 @@ -33,10 +33,11 @@
