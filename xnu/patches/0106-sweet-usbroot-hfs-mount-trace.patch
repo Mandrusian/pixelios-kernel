@@ -1,0 +1,99 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -772,15 +772,22 @@
+         ur.done=false;ur.pending=true;
+         __asm__ volatile ("dmb ish" ::: "memory");
++        if (seq <= 96)
++            printf("P5TRACE UR SEND seq=%u lba=%llu count=%u retry=%u\n",
++                seq,(unsigned long long)lba,count,retry);
+         if (!ud_ur_send(seq,lba,count,op)) {
++            if (seq <= 96)printf("P5TRACE UR TX-QUEUE-FAIL seq=%u\n",seq);
+             ur.pending=false;
+             ud_sleep_ms(5);
+             continue;
+         }
++        if (seq <= 96)printf("P5TRACE UR QUEUED seq=%u\n",seq);
+         clock_interval_to_deadline(3000,NSEC_PER_MSEC,&deadline);
+         while (!ur.done && mach_absolute_time()<deadline)ud_sleep_ms(5);
+         __asm__ volatile ("dmb ish" ::: "memory");
+         if(ur.done){
++            if (seq <= 96)printf("P5TRACE UR VERIFIED seq=%u\n",seq);
+             if(out && count)memcpy(out,ur.data,count);
+             return 0;
+         }
++        if (seq <= 96)printf("P5TRACE UR NO-REPLY seq=%u\n",seq);
+         ur.pending=false;
+--- a/bsd/dev/sweet_usbroot.c
++++ b/bsd/dev/sweet_usbroot.c
+@@ -66,7 +66,15 @@
+         uint8_t data[UR_MAX_READ_BYTES];
+         uint32_t bytes=MIN(count-done,UR_MAX_READ_BYTES);
+         uint32_t sectors=bytes/UR_SECTOR_BYTES;
+-        err=sweet_usbroot_read_sectors(blk+done/UR_SECTOR_BYTES,sectors,data);
++        uint64_t read_lba=blk+done/UR_SECTOR_BYTES;
++        /* Metadata-only trace. No disk writes or protocol changes. */
++        if (read_lba < 64 || read_lba == 1040 || read_lba == 12304)
++            printf("P5TRACE strategy BEGIN lba=%llu sectors=%u bytes=%u\n",
++                (unsigned long long)read_lba,sectors,bytes);
++        err=sweet_usbroot_read_sectors(read_lba,sectors,data);
++        if (read_lba < 64 || read_lba == 1040 || read_lba == 12304 || err)
++            printf("P5TRACE strategy END lba=%llu err=%d\n",
++                (unsigned long long)read_lba,err);
+         if (err)break;
+         memcpy(va+done,data,bytes);
+         done+=bytes;
+--- a/bsd/sweet_hfs/core/VolumeAllocation.c
++++ b/bsd/sweet_hfs/core/VolumeAllocation.c
+@@ -1987,3 +1987,6 @@
++	printf("P5TRACE HFS bitmap IO BEGIN off=%u size=%u block=%lld\n",
++		offset,iosize,(long long)block);
+ 	err = (int) buf_meta_bread(vp, block, iosize, NOCRED, &bp);
++	printf("P5TRACE HFS bitmap IO END err=%d\n",err);
+ 
+ 	if (bp) {
+--- a/bsd/sweet_hfs/core/hfs_vfsops.c
++++ b/bsd/sweet_hfs/core/hfs_vfsops.c
+@@ -1029,3 +1029,4 @@
+ void hfs_scan_blocks (struct hfsmount *hfsmp) {
++	printf("P5TRACE HFS bitmap THREAD START\n");
+ 	/*
+ 	 * Take the allocation file lock.  Journal transactions will block until
+@@ -1065,3 +1065,5 @@
++	printf("P5TRACE HFS bitmap SCAN START\n");
+ 	(void) ScanUnmapBlocks(hfsmp);
++	printf("P5TRACE HFS bitmap SCAN RETURN\n");
+ 
+ 	(void) hfs_lock_mount (hfsmp);
+@@ -1124,2 +1124,3 @@
+ 	ronly = mp && vfs_isrdonly(mp);
++	printf("P5TRACE HFS mountfs ENTRY readonly=%d\n", ronly);
+ 	dev = vnode_specrdev(devvp);
+@@ -1666,3 +1666,5 @@
++		printf("P5TRACE HFS mount-volume ENTER\n");
+ 		retval = hfs_MountHFSPlusVolume(hfsmp, vhp, embeddedOffset, disksize, p, args, cred);
++		printf("P5TRACE HFS mount-volume RETURN err=%d\n", retval);
+ 		/*
+ 		 * If the backend didn't like our physical blocksize
+--- a/bsd/sweet_hfs/core/hfs_vfsutils.c
++++ b/bsd/sweet_hfs/core/hfs_vfsutils.c
+@@ -659,4 +659,5 @@
+ 	if (async_bitmap_scan) {
+ 		thread_t allocator_scanner;
++		printf("P5TRACE HFS bitmap ASYNC START\n");
+ 
+ 		/* Take the HFS mount mutex and wait on scan_var */
+@@ -668,4 +668,8 @@
+-		kernel_thread_start ((thread_continue_t)hfs_scan_blocks, hfsmp,
++		kern_return_t p5_kr = kernel_thread_start ((thread_continue_t)hfs_scan_blocks, hfsmp,
+ 				&allocator_scanner);
++		printf("P5TRACE HFS bitmap THREAD-CREATE result=%d\n", p5_kr);
++		/* Trace failure, but preserve the existing mount/thread semantics. */
++		if (p5_kr != KERN_SUCCESS)
++			printf("P5TRACE HFS bitmap THREAD-CREATE FAILED err=%d\n",p5_kr);
+ 
+ 		/*
+@@ -679,3 +679,4 @@
++		printf("P5TRACE HFS bitmap WAITER RELEASED flags=0x%x\n", hfsmp->scan_var);
+ 		hfs_unlock_mount(hfsmp);
+ 
+ 		thread_deallocate (allocator_scanner);
