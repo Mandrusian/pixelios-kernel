@@ -1,0 +1,57 @@
+name: Raven 7C.1+7C.2 - offline shim builder safety
+on:
+  push:
+    branches:
+      - phase7c12-raven-usbroot-build-ci
+    paths:
+      - tools/phase7c12-raven-offline-build.sh
+      - .github/workflows/phase7c12-offline-builder.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  offline-check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          set -Eeuo pipefail
+          bash -n tools/phase7c12-raven-offline-build.sh
+          python3 - <<'PY'
+          from pathlib import Path
+          src=Path("tools/phase7c12-raven-offline-build.sh").read_text()
+          for x in (
+             'GOOD_SHA="33a6461baf2c069226d6903bb0a10a8b608f44776551f135511baa2ee85d65ef"',
+             'RUN=40584045654',
+             'COMMIT="f0d0950666641ee30527ae46b4a7624aef2ce86d"',
+             'PATCH_BLOB="8f17e36d7f279465660f19b3ea0821bb93e1d261"',
+             'rd=usbroot0 ufsrw=0 rootrw=0',
+             'gh run download "$RUN" -R "$REPO" -n xnu-kernel',
+             'cp -a -- "$GOOD/workspace/." "$OUT/workspace/"',
+             'env -u XNU_UFS -u XNU_RW SKIP_HOST_TESTS=1',
+             'bash shim/build.sh --board raven --boot-xnu',
+             'blob[:8]!=b\\'ANDROID!\\'',
+             'hardware_verified\\':False',
+             'phone_accessed\\':False',
+          ):
+             assert x in src,x
+          assert "fastboot " not in src
+          assert "sudo " not in src
+          assert "git checkout" not in src
+          assert "rm -rf " not in src
+          start=0
+          blocks=0
+          while True:
+             op=src.find("<<'PY'\\n",start)
+             if op<0: break
+             op+=len("<<'PY'\\n")
+             end=src.index("\\nPY\\n",op)
+             compile(src[op:end], "embedded", "exec")
+             blocks+=1
+             start=end+4
+          assert blocks==3,blocks
+          print("PASS: builder script Bash + 3 embedded Python blocks parse")
+          print("PASS: CI pinned to hardware-proven rootless stack and trusted image")
+          print("PASS: no phone operation and no mutations to proven image/kernel")
+          PY
