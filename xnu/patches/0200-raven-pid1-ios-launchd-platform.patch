@@ -1,0 +1,33 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -7390,5 +7390,29 @@
+ 	/* Check for platform passed in spawn attr if iOS binary is being spawned */
+ 	if (proc_platform(p) == PLATFORM_IOS) {
+ 		struct _posix_spawnattr *psa = (struct _posix_spawnattr *) imgp->ip_px_sa;
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		/*
++		 * The kernel starts PID 1 using execve, without posix_spawn
++		 * attributes. The platform check below is appropriate for
++		 * ordinary children but rejects Apple iOS launchd as init.
++		 * The exception is confined to the root-filesystem PID 1
++		 * launchd with a verified code signature. Every other process
++		 * still follows the normal platform and code-signing checks.
++		 */
++		boolean_t sweet_init_launchd =
++		    p == initproc && psa == NULL &&
++		    strcmp(p->p_name, "launchd") == 0 &&
++		    imgp->ip_vp != NULLVP &&
++		    (imgp->ip_csflags & (CS_VALID | CS_SIGNED)) ==
++		    (CS_VALID | CS_SIGNED);
++		if (sweet_init_launchd) {
++			mount_t root_mount = vnode_mount(imgp->ip_vp);
++			sweet_init_launchd = root_mount != NULL &&
++			    (vfs_flags(root_mount) & MNT_ROOTFS) != 0;
++		}
++		if (sweet_init_launchd) {
++			printf("SWEET PID1: signed iOS launchd from root accepted without spawn attrs\n");
++		} else
++#endif
+ 		if (psa == NULL || psa->psa_platform == 0) {
+ 			boolean_t no_sandbox_entitled = FALSE;
