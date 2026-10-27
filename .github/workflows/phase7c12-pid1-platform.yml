@@ -23,11 +23,14 @@ jobs:
           curl -fsSL --retry 3 --max-time 75 \
             "https://raw.githubusercontent.com/apple-oss-distributions/xnu/xnu-8796.141.3/bsd/kern/kern_exec.c" \
             -o upstream-xnu/bsd/kern/kern_exec.c
+          wc -c upstream-xnu/bsd/kern/kern_exec.c
           test "$(wc -c < upstream-xnu/bsd/kern/kern_exec.c)" -gt 100000
           (
             cd upstream-xnu
-            git apply --check ../xnu/patches/0200-raven-pid1-ios-launchd-platform.patch
-            git apply ../xnu/patches/0200-raven-pid1-ios-launchd-platform.patch
+            git apply --verbose --check ../xnu/patches/0200-raven-pid1-ios-launchd-platform.patch
+            echo "PATCH CHECK PASSED"
+            git apply --verbose ../xnu/patches/0200-raven-pid1-ios-launchd-platform.patch
+            echo "PATCH APPLIED"
           )
           grep -F 'SWEET PID1: signed iOS launchd from root accepted without spawn attrs' \
             upstream-xnu/bsd/kern/kern_exec.c
