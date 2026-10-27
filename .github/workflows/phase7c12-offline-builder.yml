@@ -31,9 +31,9 @@ jobs:
              'cp -a -- "$GOOD/workspace/." "$OUT/workspace/"',
              'env -u XNU_UFS -u XNU_RW SKIP_HOST_TESTS=1',
              'bash shim/build.sh --board raven --boot-xnu',
-             'blob[:8]!=b\\'ANDROID!\\'',
-             'hardware_verified\\':False',
-             'phone_accessed\\':False',
+              "blob[:8]!=b\'ANDROID!\'",
+              "hardware_verified\':False",
+              "phone_accessed\':False",
           ):
              assert x in src,x
           assert "fastboot " not in src
