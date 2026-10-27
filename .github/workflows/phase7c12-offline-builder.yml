@@ -43,10 +43,10 @@ jobs:
           start=0
           blocks=0
           while True:
-             op=src.find("<<'PY'\\n",start)
+             op=src.find("<<'PY'\n",start)
              if op<0: break
-             op+=len("<<'PY'\\n")
-             end=src.index("\\nPY\\n",op)
+             op+=len("<<'PY'\n")
+             end=src.index("\nPY\n",op)
              compile(src[op:end], "embedded", "exec")
              blocks+=1
              start=end+4
