@@ -1,0 +1,69 @@
+name: Raven Phase 7C.1+7C.2 - Signed PID1 iOS platform gate
+
+on:
+  push:
+    branches:
+      - phase7c12-raven-pid1-ios-platform-fix
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apply patch to real Apple XNU 8796.141.3 source
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p upstream-xnu/bsd/kern
+          curl -fsSL --retry 3 --max-time 75 \
+            "https://raw.githubusercontent.com/apple-oss-distributions/xnu/xnu-8796.141.3/bsd/kern/kern_exec.c" \
+            -o upstream-xnu/bsd/kern/kern_exec.c
+          test "$(wc -c < upstream-xnu/bsd/kern/kern_exec.c)" -gt 100000
+          (
+            cd upstream-xnu
+            git apply --check ../xnu/patches/0200-raven-pid1-ios-launchd-platform.patch
+            git apply ../xnu/patches/0200-raven-pid1-ios-launchd-platform.patch
+          )
+          grep -F 'SWEET PID1: signed iOS launchd from root accepted without spawn attrs' \
+            upstream-xnu/bsd/kern/kern_exec.c
+          echo 'PASS: patch applies exactly to pristine XNU 8796.141.3'
+      - name: Verify restrictive exception and unchanged XNU platform gate
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          s=Path("upstream-xnu/bsd/kern/kern_exec.c").read_text()
+          patch=Path("xnu/patches/0200-raven-pid1-ios-launchd-platform.patch").read_text()
+          fragment=s[s.index('/* Check for platform passed in spawn attr if iOS binary is being spawned */'):]
+          fragment=fragment[:fragment.index('/* If the code signature came through the image activation path')]
+          for mark in (
+              "#if defined(ARM64_BOARD_CONFIG_SWEET)",
+              "p == initproc && psa == NULL",
+              'strcmp(p->p_name, "launchd") == 0',
+              "imgp->ip_vp != NULLVP",
+              "(imgp->ip_csflags & (CS_VALID | CS_SIGNED)) ==",
+              "(CS_VALID | CS_SIGNED);",
+              "vnode_mount(imgp->ip_vp)",
+              "vfs_flags(root_mount) & MNT_ROOTFS",
+              "if (sweet_init_launchd)",
+              "if (psa == NULL || psa->psa_platform == 0)",
+              "EXEC_EXIT_REASON_WRONG_PLATFORM",
+              "psa->psa_platform != PLATFORM_IOS",
+          ):
+              assert mark in fragment, mark
+          assert fragment.index("if (sweet_init_launchd)") < fragment.index("if (psa == NULL || psa->psa_platform == 0)")
+          assert fragment.count("EXEC_EXIT_REASON_WRONG_PLATFORM") == 2
+          assert "unentitled_ios_sim_launch = 1" not in patch
+          assert "CS_ENFORCEMENT" not in patch
+          assert "CS_KILL" not in patch
+          print("PASS: only kernel-created signed PID1 rootfs launchd can use exception")
+          print("PASS: all other spawn platform checks remain enabled")
+          print("PASS: code signing and page validation remain intact")
+          print("NOTE: build/hardware validation requires the hardware-proven Raven rootless patch stack")
+          PY
