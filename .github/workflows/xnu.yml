@@ -17,7 +17,7 @@ on:
         description: xnu MACHINE_CONFIG
         default: SWEET
   push:
-    branches: [main, phase5-macos15-toolchain-probe-ci]
+    branches: [main, phase5-macos15-toolchain-probe-ci, phase7c12-raven-usbroot-build-ci]
     paths:
       - "xnu/patches/**"
       - "upstream-patches/**"
@@ -61,6 +61,24 @@ jobs:
           git -C dxb fetch -q --depth 1 "$DXB_REPO" "$DXB_SHA"
           git -C dxb checkout -q FETCH_HEAD
           cp xnu/patches/*.patch xnu/patches/*.sh dxb/patches/ 2>/dev/null || cp xnu/patches/*.patch dxb/patches/
+          for name in \
+            0102-sweet-usb-ecm-block-probe.patch \
+            0103-sweet-usb-rootless-probe-window.patch \
+            0104-sweet-usb-gs101-phy-command-guard.patch \
+            0105-sweet-usbroot-readonly-disk.patch \
+            0106-sweet-usbroot-hfs-mount-trace.patch \
+            0200-raven-pid1-ios-launchd-platform.patch; do
+            test -s "dxb/patches/$name" || { echo "::error::Missing $name"; exit 1; }
+          done
+          echo '=== Hardware-proven USBROOT patches + PID1 platform fix ==='
+          shasum -a 256 \
+            dxb/patches/0102-sweet-usb-ecm-block-probe.patch \
+            dxb/patches/0103-sweet-usb-rootless-probe-window.patch \
+            dxb/patches/0104-sweet-usb-gs101-phy-command-guard.patch \
+            dxb/patches/0105-sweet-usbroot-readonly-disk.patch \
+            dxb/patches/0106-sweet-usbroot-hfs-mount-trace.patch \
+            dxb/patches/0200-raven-pid1-ios-launchd-platform.patch
+
           # libfirehose_kernel is built arm64e-only upstream; this kernel is plain arm64
           sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
 
