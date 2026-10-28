@@ -1,7 +1,7 @@
 diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -18,12 +18,38 @@
+@@ -18,12 +18,65 @@
  		    (CS_VALID | CS_SIGNED);
  		if (sweet_init_launchd) {
  			mount_t root_mount = vnode_mount(imgp->ip_vp);
@@ -30,12 +30,39 @@ diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 +			    sweet_boot_task_signed, sweet_boot_task_root_ro,
 +			    psa ? psa->psa_platform : 0, (unsigned int)imgp->ip_csflags);
 +		}
++		boolean_t sweet_fshelper_name =
++		    strcmp(p->p_name, "mount_hfs") == 0 ||
++		    strcmp(p->p_name, "mount_apfs") == 0;
++		boolean_t sweet_fshelper_parent =
++		    p->p_pptr != PROC_NULL &&
++		    strcmp(p->p_pptr->p_name, "mount") == 0 &&
++		    p->p_pptr->p_pptr == initproc;
++		boolean_t sweet_fshelper_signed =
++		    (imgp->ip_csflags & (CS_VALID | CS_SIGNED)) ==
++		    (CS_VALID | CS_SIGNED);
++		boolean_t sweet_fshelper_root_ro = FALSE;
++		if (sweet_fshelper_name && imgp->ip_vp != NULLVP) {
++			mount_t sweet_fshelper_mount = vnode_mount(imgp->ip_vp);
++			sweet_fshelper_root_ro = sweet_fshelper_mount != NULL &&
++			    (vfs_flags(sweet_fshelper_mount) & (MNT_ROOTFS | MNT_RDONLY)) ==
++			    (MNT_ROOTFS | MNT_RDONLY);
++		}
++		if (sweet_fshelper_name) {
++			printf("SWEET FSHELP probe: name=%s parent_mount=%d signed=%d root_ro=%d spawn_platform=%d cs=0x%x\n",
++			    p->p_name, sweet_fshelper_parent, sweet_fshelper_signed,
++			    sweet_fshelper_root_ro, psa ? psa->psa_platform : 0,
++			    (unsigned int)imgp->ip_csflags);
++		}
  		if (sweet_init_launchd) {
  			printf("SWEET PID1: signed iOS launchd from root accepted without spawn attrs\n");
 +		} else if (sweet_boot_task_name && sweet_boot_task_parent &&
 +		    sweet_boot_task_signed && sweet_boot_task_root_ro &&
 +		    (psa == NULL || psa->psa_platform == 0)) {
 +			printf("SWEET BOOTTASK: accepted signed read-only-root iOS helper %s\n", p->p_name);
++		} else if (sweet_fshelper_name && sweet_fshelper_parent &&
++		    sweet_fshelper_signed && sweet_fshelper_root_ro &&
++		    (psa == NULL || psa->psa_platform == 0)) {
++			printf("SWEET FSHELP: accepted signed read-only-root iOS filesystem helper %s\n", p->p_name);
  		} else
  #endif
  		if (psa == NULL || psa->psa_platform == 0) {
