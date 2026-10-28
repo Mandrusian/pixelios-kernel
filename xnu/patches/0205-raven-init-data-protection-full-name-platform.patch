@@ -1,0 +1,17 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -30,11 +30,12 @@
+ 		    strcmp(p->p_name, "cc_fips_test") == 0 || strcmp(p->p_name, "keybagd") == 0 ||
+ 		    strcmp(p->p_name, "xpcproxy") == 0 || strcmp(p->p_name, "watchdogd") == 0 ||
+ 		    strcmp(p->p_name, "dirhelper") == 0 || strcmp(p->p_name, "applekeystored") == 0 ||
+ 		    strcmp(p->p_name, "installd") == 0 ||
+ 		    /* proc->p_name is truncated; observed hardware name below. */
+-		    strcmp(p->p_name, "init_data_protec") == 0;
++		    strcmp(p->p_name, "init_data_protec") == 0 ||
++		    strcmp(p->p_name, "init_data_protection") == 0;
+ 		boolean_t sweet_boot_task_parent = p->p_pptr == initproc;
+ 		boolean_t sweet_boot_task_signed =
+ 		    (imgp->ip_csflags & (CS_VALID | CS_SIGNED)) ==
+ 		    (CS_VALID | CS_SIGNED);
+ 		boolean_t sweet_boot_task_root_ro = FALSE;
