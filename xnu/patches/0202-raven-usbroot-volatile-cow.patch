@@ -1,0 +1,261 @@
+diff --git a/bsd/dev/sweet_usbroot.c b/bsd/dev/sweet_usbroot.c
+--- a/bsd/dev/sweet_usbroot.c
++++ b/bsd/dev/sweet_usbroot.c
+@@ -13,8 +13,9 @@
+ #include <sys/proc.h>
+ #include <sys/uio.h>
+ #include <miscfs/devfs/devfs.h>
+ #include <kern/locks.h>
++#include <kern/kalloc.h>
+ #include <pexpert/pexpert.h>
+ #include <pexpert/device_tree.h>
+ #include <libkern/libkern.h>
+ #include "sweet_usbroot_proto.h"
+@@ -28,16 +29,71 @@
+     uint32_t secsize;
+     int bmajor, cmajor;
+     dev_t bdev;
+     bool ready;
++    bool cow_enabled;
+ } urdisk;
+ static LCK_GRP_DECLARE(ur_disk_grp, "sweet_usbroot");
+ static LCK_MTX_DECLARE(ur_disk_lock, &ur_disk_grp);
+ 
++#define UR_COW_BUCKETS 4096u
++#define UR_COW_MAX_PAGES 32768u
++struct ur_cow_page {
++    struct ur_cow_page *next;
++    uint64_t page;
++    uint8_t mask;
++    uint8_t bytes[4096];
++};
++static struct ur_cow_page *ur_cow_table[UR_COW_BUCKETS];
++static uint32_t ur_cow_pages;
++static uint64_t ur_cow_sectors_written;
++static struct ur_cow_page *
++ur_cow_find(uint64_t page)
++{
++    uint32_t bucket=(uint32_t)((page^(page>>12))&(UR_COW_BUCKETS-1));
++    for(struct ur_cow_page *p=ur_cow_table[bucket];p;p=p->next)
++        if(p->page==page)return p;
++    return NULL;
++}
++static int
++ur_cow_write(uint64_t sector,const uint8_t *src)
++{
++    uint64_t page=sector/8u;
++    uint32_t bucket=(uint32_t)((page^(page>>12))&(UR_COW_BUCKETS-1));
++    struct ur_cow_page *p=ur_cow_find(page);
++    if(!p){
++        if(ur_cow_pages>=UR_COW_MAX_PAGES)return ENOSPC;
++        p=kalloc_data(sizeof(*p),Z_WAITOK);
++        if(!p)return ENOMEM;
++        p->page=page;
++        p->mask=0;
++        p->next=ur_cow_table[bucket];
++        ur_cow_table[bucket]=p;
++        ur_cow_pages++;
++    }
++    uint32_t slot=(uint32_t)(sector&7u);
++    memcpy(p->bytes+512u*slot,src,512u);
++    p->mask|=(uint8_t)(1u<<slot);
++    ur_cow_sectors_written++;
++    if(ur_cow_sectors_written<=16 ||
++       (ur_cow_sectors_written&(ur_cow_sectors_written-1))==0)
++        printf("SWEET COW: volatile sector=%llu pages=%u writes=%llu\n",
++            (unsigned long long)sector,ur_cow_pages,
++            (unsigned long long)ur_cow_sectors_written);
++    return 0;
++}
++static void
++ur_cow_merge(uint64_t sector,uint8_t *dest)
++{
++    struct ur_cow_page *p=ur_cow_find(sector/8u);
++    uint32_t slot=(uint32_t)(sector&7u);
++    if(p && (p->mask&(1u<<slot)))memcpy(dest,p->bytes+512u*slot,512u);
++}
++
+ static int disk_open(__unused dev_t d, int flags,
+                      __unused int typ, __unused struct proc *p) {
+     if (!urdisk.ready)return ENXIO;
+-    return (flags & FWRITE) ? EROFS : 0;
++    return ((flags & FWRITE) && !urdisk.cow_enabled) ? EROFS : 0;
+ }
+ static int disk_close(__unused dev_t d, __unused int flags,
+                       __unused int typ, __unused struct proc *p) {return 0;}
+ static void disk_strategy(buf_t bp) {
+@@ -45,35 +101,39 @@
+     uint64_t blk;
+     caddr_t va=NULL;
+     int err=0;
+     uint32_t done=0;
++    bool reading=(buf_flags(bp)&B_READ)!=0;
+     buf_setresid(bp,count);
+-    if (!(buf_flags(bp)&B_READ)) {err=EROFS;goto finish;}
++    if (!reading && !urdisk.cow_enabled){err=EROFS;goto finish;}
+     if (!urdisk.ready || (int64_t)buf_blkno(bp)<0 ||
+-        !urdisk.secsize || (count%UR_SECTOR_BYTES)) {err=EINVAL;goto finish;}
+-    if ((uint64_t)buf_blkno(bp)>UINT64_MAX/urdisk.secsize) {err=EINVAL;goto finish;}
++        !urdisk.secsize || (count%UR_SECTOR_BYTES)){err=EINVAL;goto finish;}
++    if ((uint64_t)buf_blkno(bp)>UINT64_MAX/urdisk.secsize){err=EINVAL;goto finish;}
+     blk=(uint64_t)buf_blkno(bp)*(urdisk.secsize/UR_SECTOR_BYTES);
+-    if (blk>urdisk.sectors || (uint64_t)(count/UR_SECTOR_BYTES)>urdisk.sectors-blk) {
++    if (blk>urdisk.sectors || (uint64_t)(count/UR_SECTOR_BYTES)>urdisk.sectors-blk){
+         err=EINVAL;goto finish;
+     }
+     if (!count)goto finish;
+-    if (buf_map(bp,&va)) {err=EIO;goto finish;}
++    if (buf_map(bp,&va)){err=EIO;goto finish;}
+     lck_mtx_lock(&ur_disk_lock);
+     while (done<count) {
+         uint8_t data[UR_MAX_READ_BYTES];
+         uint32_t bytes=MIN(count-done,UR_MAX_READ_BYTES);
+-        uint32_t sectors=bytes/UR_SECTOR_BYTES;
+-        uint64_t read_lba=blk+done/UR_SECTOR_BYTES;
+-        /* Metadata-only trace. No disk writes or protocol changes. */
+-        if (read_lba < 64 || read_lba == 1040 || read_lba == 12304)
+-            printf("P5TRACE strategy BEGIN lba=%llu sectors=%u bytes=%u\n",
+-                (unsigned long long)read_lba,sectors,bytes);
+-        err=sweet_usbroot_read_sectors(read_lba,sectors,data);
+-        if (read_lba < 64 || read_lba == 1040 || read_lba == 12304 || err)
+-            printf("P5TRACE strategy END lba=%llu err=%d\n",
+-                (unsigned long long)read_lba,err);
+-        if (err)break;
+-        memcpy(va+done,data,bytes);
++        uint64_t sector=blk+(uint64_t)done/UR_SECTOR_BYTES;
++        if(reading){
++            err=sweet_usbroot_read_sectors(sector,bytes/UR_SECTOR_BYTES,data);
++            if(err)break;
++            if(urdisk.cow_enabled)
++                for(uint32_t i=0;i<bytes/UR_SECTOR_BYTES;i++)
++                    ur_cow_merge(sector+i,data+i*UR_SECTOR_BYTES);
++            memcpy(va+done,data,bytes);
++        }else{
++            for(uint32_t i=0;i<bytes/UR_SECTOR_BYTES;i++){
++                err=ur_cow_write(sector+i,(const uint8_t *)va+done+i*UR_SECTOR_BYTES);
++                if(err)break;
++            }
++            if(err)break;
++        }
+         done+=bytes;
+         buf_setresid(bp,count-done);
+     }
+     lck_mtx_unlock(&ur_disk_lock);
+@@ -92,14 +152,14 @@
+         if(chr || (*u!=512 && *u!=1024 && *u!=2048 && *u!=4096))return EINVAL;
+         urdisk.secsize=*u;return 0;
+     case DKIOCGETPHYSICALBLOCKSIZE:*u=512;return 0;
+     case DKIOCGETBLOCKCOUNT:*q=urdisk.sectors/(urdisk.secsize/512);return 0;
+-    case DKIOCISWRITABLE:*u=0;return 0;
++    case DKIOCISWRITABLE:*u=urdisk.cow_enabled ? 1u : 0u;return 0;
+     case DKIOCSYNCHRONIZE:
+     case DKIOCSYNCHRONIZECACHE:return 0; /* Read-only, nothing to flush. */
+     case DKIOCGETMAXBLOCKCOUNTREAD:*q=UR_MAX_READ_BYTES/urdisk.secsize;
+         if(!*q)*q=1;return 0;
+-    case DKIOCGETMAXBLOCKCOUNTWRITE:*q=0;return 0;
++    case DKIOCGETMAXBLOCKCOUNTWRITE:*q=urdisk.cow_enabled ? 2u : 0u;return 0;
+     case DKIOCGETMAXSEGMENTCOUNTREAD:
+     case DKIOCGETMAXSEGMENTCOUNTWRITE:*q=1;return 0;
+     default:return ENOTTY;
+     }
+@@ -116,10 +176,11 @@
+ }
+ static int disk_read(dev_t dev, struct uio *uio,__unused int flags) {
+     return physio(disk_strategy,NULL,dev,B_READ,minphys,uio,(int)urdisk.secsize);
+ }
+-static int disk_write(__unused dev_t d,__unused struct uio *u,__unused int f) {
+-    return EROFS;
++static int disk_write(dev_t d,struct uio *u,__unused int f) {
++    if(!urdisk.cow_enabled)return EROFS;
++    return physio(disk_strategy,NULL,d,0,minphys,u,(int)urdisk.secsize);
+ }
+ static const struct bdevsw ur_bdevsw={
+     .d_open=disk_open,.d_close=disk_close,.d_strategy=disk_strategy,
+     .d_ioctl=disk_bioctl,.d_dump=eno_dump,.d_psize=disk_psize,.d_type=D_DISK
+@@ -130,8 +191,11 @@
+     .d_select=eno_select,.d_mmap=eno_mmap,.d_strategy=eno_strat,
+     .d_reserved_1=eno_getc,.d_reserved_2=eno_putc,.d_type=D_DISK
+ };
+ 
++int sweet_usbroot_cow_active(void);
++int sweet_usbroot_cow_active(void) { return urdisk.ready && urdisk.cow_enabled; }
++
+ int sweet_usbroot_rootdev(dev_t *dev);
+ int sweet_usbroot_rootdev(dev_t *dev) {
+     int enabled=0;
+     DTEntry node;
+@@ -139,8 +203,16 @@
+     int err;
+     if (urdisk.ready){*dev=urdisk.bdev;return 0;}
+     PE_parse_boot_argn("sweetusbroot",&enabled,sizeof(enabled));
+     if (enabled!=1) return ENXIO;
++    int cow=0,ufs_rw=0,root_rw=0,usbblk=0;
++    PE_parse_boot_argn("sweetusbrootcow",&cow,sizeof(cow));
++    PE_parse_boot_argn("ufsrw",&ufs_rw,sizeof(ufs_rw));
++    PE_parse_boot_argn("rootrw",&root_rw,sizeof(root_rw));
++    PE_parse_boot_argn("sweetusbblk",&usbblk,sizeof(usbblk));
++    if(cow!=0 && cow!=1)return EINVAL;
++    if(cow && (ufs_rw!=0 || root_rw!=0 || usbblk!=0))return EPERM;
++    urdisk.cow_enabled=(cow==1);
+     /* If the ADT declares internal UFS, refuse: the test must stay isolated. */
+     if (SecureDTLookupEntry(NULL,"/sweet-ufs",&node)==kSuccess) {
+         printf("SWEET USBROOT: refusing ADT containing internal UFS\n");
+         return EPERM;
+@@ -157,13 +229,14 @@
+     if(urdisk.bmajor<0)return ENXIO;
+     urdisk.cmajor=cdevsw_add_with_bdev(-1,&ur_cdevsw,urdisk.bmajor);
+     if(urdisk.cmajor<0)return ENXIO;
+     urdisk.bdev=makedev(urdisk.bmajor,0);
+-    devfs_make_node(urdisk.bdev,DEVFS_BLOCK,UID_ROOT,GID_OPERATOR,0440,"usbroot0");
+-    devfs_make_node(makedev(urdisk.cmajor,0),DEVFS_CHAR,UID_ROOT,GID_OPERATOR,0440,"rusbroot0");
++    devfs_make_node(urdisk.bdev,DEVFS_BLOCK,UID_ROOT,GID_OPERATOR,urdisk.cow_enabled?0600:0440,"usbroot0");
++    devfs_make_node(makedev(urdisk.cmajor,0),DEVFS_CHAR,UID_ROOT,GID_OPERATOR,urdisk.cow_enabled?0600:0440,"rusbroot0");
+     urdisk.ready=true;
+     *dev=urdisk.bdev;
+-    printf("SWEET USBROOT: ready %llu sectors (%llu MiB), STRICTLY READ ONLY\n",
+-        sectors,sectors/2048);
++    printf("SWEET USBROOT: ready %llu sectors (%llu MiB), %s\n",
++        sectors,sectors/2048,urdisk.cow_enabled ?
++        "READ-ONLY HOST / VOLATILE RAM COW (128 MiB limit)" : "STRICTLY READ ONLY");
+     return 0;
+ }
+ #endif
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -20,8 +20,9 @@
+ 			mount_t root_mount = vnode_mount(imgp->ip_vp);
+ 			sweet_init_launchd = root_mount != NULL &&
+ 			    (vfs_flags(root_mount) & MNT_ROOTFS) != 0;
+ 		}
++		extern int sweet_usbroot_cow_active(void);
+ 		boolean_t sweet_boot_task_name =
+ 		    strcmp(p->p_name, "fsck") == 0 || strcmp(p->p_name, "mount") == 0 ||
+ 		    strcmp(p->p_name, "notifyd") == 0 || strcmp(p->p_name, "logd") == 0 ||
+ 		    strcmp(p->p_name, "configd") == 0 || strcmp(p->p_name, "securityd") == 0 ||
+@@ -33,10 +34,10 @@
+ 		boolean_t sweet_boot_task_root_ro = FALSE;
+ 		if (sweet_boot_task_name && imgp->ip_vp != NULLVP) {
+ 			mount_t sweet_boot_mount = vnode_mount(imgp->ip_vp);
+ 			sweet_boot_task_root_ro = sweet_boot_mount != NULL &&
+-			    (vfs_flags(sweet_boot_mount) & (MNT_ROOTFS | MNT_RDONLY)) ==
+-			    (MNT_ROOTFS | MNT_RDONLY);
++			    (vfs_flags(sweet_boot_mount) & MNT_ROOTFS) != 0 &&
++			    ((vfs_flags(sweet_boot_mount) & MNT_RDONLY) != 0 || sweet_usbroot_cow_active());
+ 		}
+ 		if (psa == NULL || psa->psa_platform != PLATFORM_IOS) {
+ 			printf("SWEET BOOTTASK probe: name=%s chosen=%d parent_init=%d signed=%d root_ro=%d spawn_platform=%d cs=0x%x\n",
+ 			    p->p_name, sweet_boot_task_name, sweet_boot_task_parent,
+@@ -56,10 +57,10 @@
+ 		boolean_t sweet_fshelper_root_ro = FALSE;
+ 		if (sweet_fshelper_name && imgp->ip_vp != NULLVP) {
+ 			mount_t sweet_fshelper_mount = vnode_mount(imgp->ip_vp);
+ 			sweet_fshelper_root_ro = sweet_fshelper_mount != NULL &&
+-			    (vfs_flags(sweet_fshelper_mount) & (MNT_ROOTFS | MNT_RDONLY)) ==
+-			    (MNT_ROOTFS | MNT_RDONLY);
++			    (vfs_flags(sweet_fshelper_mount) & MNT_ROOTFS) != 0 &&
++			    ((vfs_flags(sweet_fshelper_mount) & MNT_RDONLY) != 0 || sweet_usbroot_cow_active());
+ 		}
+ 		if (sweet_fshelper_name) {
+ 			printf("SWEET FSHELP probe: name=%s parent_mount=%d signed=%d root_ro=%d spawn_platform=%d cs=0x%x\n",
+ 			    p->p_name, sweet_fshelper_parent, sweet_fshelper_signed,
