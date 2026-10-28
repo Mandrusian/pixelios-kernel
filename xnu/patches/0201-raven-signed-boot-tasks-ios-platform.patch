@@ -1,0 +1,42 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -18,12 +18,38 @@
+ 		    (CS_VALID | CS_SIGNED);
+ 		if (sweet_init_launchd) {
+ 			mount_t root_mount = vnode_mount(imgp->ip_vp);
+ 			sweet_init_launchd = root_mount != NULL &&
+ 			    (vfs_flags(root_mount) & MNT_ROOTFS) != 0;
+ 		}
++		boolean_t sweet_boot_task_name =
++		    strcmp(p->p_name, "fsck") == 0 || strcmp(p->p_name, "mount") == 0 ||
++		    strcmp(p->p_name, "notifyd") == 0 || strcmp(p->p_name, "logd") == 0 ||
++		    strcmp(p->p_name, "configd") == 0 || strcmp(p->p_name, "securityd") == 0 ||
++		    strcmp(p->p_name, "backboardd") == 0 || strcmp(p->p_name, "SpringBoard") == 0;
++		boolean_t sweet_boot_task_parent = p->p_pptr == initproc;
++		boolean_t sweet_boot_task_signed =
++		    (imgp->ip_csflags & (CS_VALID | CS_SIGNED)) ==
++		    (CS_VALID | CS_SIGNED);
++		boolean_t sweet_boot_task_root_ro = FALSE;
++		if (sweet_boot_task_name && imgp->ip_vp != NULLVP) {
++			mount_t sweet_boot_mount = vnode_mount(imgp->ip_vp);
++			sweet_boot_task_root_ro = sweet_boot_mount != NULL &&
++			    (vfs_flags(sweet_boot_mount) & (MNT_ROOTFS | MNT_RDONLY)) ==
++			    (MNT_ROOTFS | MNT_RDONLY);
++		}
++		if (psa == NULL || psa->psa_platform != PLATFORM_IOS) {
++			printf("SWEET BOOTTASK probe: name=%s chosen=%d parent_init=%d signed=%d root_ro=%d spawn_platform=%d cs=0x%x\n",
++			    p->p_name, sweet_boot_task_name, sweet_boot_task_parent,
++			    sweet_boot_task_signed, sweet_boot_task_root_ro,
++			    psa ? psa->psa_platform : 0, (unsigned int)imgp->ip_csflags);
++		}
+ 		if (sweet_init_launchd) {
+ 			printf("SWEET PID1: signed iOS launchd from root accepted without spawn attrs\n");
++		} else if (sweet_boot_task_name && sweet_boot_task_parent &&
++		    sweet_boot_task_signed && sweet_boot_task_root_ro &&
++		    (psa == NULL || psa->psa_platform == 0)) {
++			printf("SWEET BOOTTASK: accepted signed read-only-root iOS helper %s\n", p->p_name);
+ 		} else
+ #endif
+ 		if (psa == NULL || psa->psa_platform == 0) {
+ 			boolean_t no_sandbox_entitled = FALSE;
