@@ -1,0 +1,20 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -24,11 +24,15 @@
+ 		extern int sweet_usbroot_cow_active(void);
+ 		boolean_t sweet_boot_task_name =
+ 		    strcmp(p->p_name, "fsck") == 0 || strcmp(p->p_name, "mount") == 0 ||
+ 		    strcmp(p->p_name, "notifyd") == 0 || strcmp(p->p_name, "logd") == 0 ||
+ 		    strcmp(p->p_name, "configd") == 0 || strcmp(p->p_name, "securityd") == 0 ||
+-		    strcmp(p->p_name, "backboardd") == 0 || strcmp(p->p_name, "SpringBoard") == 0;
++		    strcmp(p->p_name, "backboardd") == 0 || strcmp(p->p_name, "SpringBoard") == 0 ||
++		    strcmp(p->p_name, "cc_fips_test") == 0 || strcmp(p->p_name, "keybagd") == 0 ||
++		    strcmp(p->p_name, "xpcproxy") == 0 || strcmp(p->p_name, "watchdogd") == 0 ||
++		    strcmp(p->p_name, "dirhelper") == 0 || strcmp(p->p_name, "applekeystored") == 0 ||
++		    strcmp(p->p_name, "installd") == 0;
+ 		boolean_t sweet_boot_task_parent = p->p_pptr == initproc;
+ 		boolean_t sweet_boot_task_signed =
+ 		    (imgp->ip_csflags & (CS_VALID | CS_SIGNED)) ==
+ 		    (CS_VALID | CS_SIGNED);
+ 		boolean_t sweet_boot_task_root_ro = FALSE;
