@@ -22,10 +22,10 @@ cat > "$gate_tmp/cross-cc" <<'SH'
 set -euo pipefail
 for arg in "$@"; do
     if [[ "$arg" == usbprobe.c ]]; then
-        exec "$PIXELIOS_TARGET_CC" -fno-tree-switch-conversion -fno-jump-tables "$@"
+        exec "$PIXELIOS_TARGET_CC" -mbranch-protection=none -fno-tree-switch-conversion -fno-jump-tables "$@"
     fi
 done
-exec "$PIXELIOS_TARGET_CC" "$@"
+exec "$PIXELIOS_TARGET_CC" -mbranch-protection=none "$@"
 SH
 chmod 700 "$gate_tmp/gcc" "$gate_tmp/cross-cc"
 CROSS_CC="$gate_tmp/cross-cc" PATH="$gate_tmp:$PATH" bash tools/check-all.sh "$@"
