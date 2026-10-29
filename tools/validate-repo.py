@@ -5,7 +5,8 @@
 
 Checks:
   1. Patch sequence in xnu/patches/:
-     - Sequential numbering starting at 0001 with no duplicates or gaps.
+     - Sequential numbering starting at 0001, with the established Raven
+       transition from 0106 to 0200; no other gaps or duplicates.
      - Patch files are non-empty and have valid unified diff markers.
   2. Python script syntax:
      - All tools/*.py compile cleanly via py_compile.
@@ -60,6 +61,12 @@ def validate_patches(verbose=False):
         sorted_nums = sorted(seen_numbers.keys())
         expected = 1
         for num in sorted_nums:
+            # The Raven fork already starts its compatibility series at 0200.
+            # Permit only this exact boundary, not arbitrary gaps within either series.
+            if (expected == 107 and num == 200 and
+                    seen_numbers.get(106) == '0106-sweet-usbroot-hfs-mount-trace.patch' and
+                    seen_numbers.get(200) == '0200-raven-pid1-ios-launchd-platform.patch'):
+                expected = 200
             if num != expected:
                 errors.append(f"Gap in patch sequence: expected {expected:04d}, found {num:04d} ({seen_numbers[num]})")
                 expected = num + 1
@@ -72,7 +79,7 @@ def validate_patches(verbose=False):
             print(f"    - {err}")
         return False
 
-    print(green(f"[✓] Validated {len(patch_files)} patches (0001-{len(patch_files):04d} contiguous, format OK)"))
+    print(green(f"[✓] Validated {len(patch_files)} patches (sequence and format OK)"))
     return True
 
 
