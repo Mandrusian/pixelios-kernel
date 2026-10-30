@@ -1,0 +1,82 @@
+diff --git a/bsd/kern/mach_loader.c b/bsd/kern/mach_loader.c
+--- a/bsd/kern/mach_loader.c
++++ b/bsd/kern/mach_loader.c
+@@ -468,6 +468,11 @@
+ 
+ 	if (os_add_overflow(file_offset, macho_size, &total_size) ||
+ 	    total_size > file_size) {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		printf("SWEET MACHLOAD: file bounds vnode=%s arch_offset=0x%llx arch_size=0x%llx file_size=0x%llx\n",
++		    vp->v_name ? vp->v_name : "?", (unsigned long long)file_offset,
++		    (unsigned long long)macho_size, (unsigned long long)file_size);
++#endif
+ 		return LOAD_BADMACHO;
+ 	}
+ 
+@@ -580,6 +585,13 @@
+ 	    NULL, imgp);
+ 
+ 	if (lret != LOAD_SUCCESS) {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		if (lret == LOAD_BADMACHO) {
++			printf("SWEET MACHLOAD: parse failed vnode=%s arch_size=0x%llx file_size=0x%llx\n",
++			    vp->v_name ? vp->v_name : "?", (unsigned long long)macho_size,
++			    (unsigned long long)file_size);
++		}
++#endif
+ 		vm_map_deallocate(map); /* will lose pmap reference too */
+ 		return lret;
+ 	}
+@@ -631,6 +643,9 @@
+ 		} else
+ #endif /* __arm64__ */
+ 		{
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++			printf("SWEET MACHLOAD: missing pagezero vnode=%s requirement=4K\n", vp->v_name ? vp->v_name : "?");
++#endif
+ 			vm_map_deallocate(map); /* will lose pmap reference too */
+ 			return LOAD_BADMACHO;
+ 		}
+@@ -640,6 +655,9 @@
+ 	if (enforce_hard_pagezero && result->is_64bit_addr && (header->cputype == CPU_TYPE_ARM64)) {
+ 		/* 64 bit ARM binary must have "hard page zero" of 4GB to cover the lower 32 bit address space */
+ 		if (vm_map_has_hard_pagezero(map, 0x100000000) == FALSE) {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++			printf("SWEET MACHLOAD: missing pagezero vnode=%s requirement=4G\n", vp->v_name ? vp->v_name : "?");
++#endif
+ 			vm_map_deallocate(map); /* will lose pmap reference too */
+ 			return LOAD_BADMACHO;
+ 		}
+@@ -782,6 +800,9 @@
+ 	size_t                  offset;
+ 	size_t                  oldoffset;      /* for overflow check */
+ 	int                     pass;
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	uint32_t                sweet_last_cmd = 0;
++#endif
+ 	proc_t                  p = vfs_context_proc(imgp->ip_vfs_context);
+ 	int                     error;
+ 	int                     resid = 0;
+@@ -1056,6 +1077,9 @@
+ 			 *	Get a pointer to the command.
+ 			 */
+ 			lcp = (struct load_command *)((uintptr_t)addr + offset);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++			sweet_last_cmd = lcp->cmd;
++#endif
+ 			oldoffset = offset;
+ 
+ 			/*
+@@ -1508,6 +1532,12 @@
+ 		}
+ 	}
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	if (ret == LOAD_BADMACHO) {
++		printf("SWEET MACHLOAD: vnode=%s depth=%d pass=%d last_cmd=0x%x offset=0x%zx macho_size=0x%llx\n",
++		    vp->v_name ? vp->v_name : "?", depth, pass, sweet_last_cmd, offset, (unsigned long long)macho_size);
++	}
++#endif
+ 	if (ret == LOAD_BADMACHO && found_xhdr) {
+ 		ret = LOAD_BADMACHO_UPX;
+ 	}
