@@ -17,7 +17,7 @@ on:
         description: xnu MACHINE_CONFIG
         default: SWEET
   push:
-    branches: [main, phase5-macos15-toolchain-probe-ci, phase7c12-raven-usbroot-build-ci]
+    branches: [main, phase5-macos15-toolchain-probe-ci, phase7c12-raven-usbroot-build-ci, phase7d13-exec-failure-diagnostics-20261031]
     paths:
       - "xnu/patches/**"
       - "upstream-patches/**"
