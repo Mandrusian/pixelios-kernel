@@ -49,7 +49,7 @@ jobs:
   kernel:
     # Toolchain compatibility experiment; xnu-8796 has previously depended on Xcode 15 iig.
     # Explicitly test Xcode 16.0 on maintained macOS 15 runners, preserving the existing build branch.
-    runs-on: macos-15
+    runs-on: macos-15-intel
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
