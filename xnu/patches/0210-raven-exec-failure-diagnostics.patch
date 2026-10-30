@@ -1,0 +1,81 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -1319,8 +1319,12 @@
+ 	lret = load_machfile(imgp, mach_header, thread, &map, &load_result);
+ 	if (lret != LOAD_SUCCESS) {
+ 		error = load_return_to_errno(lret);
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+-		printf("SWEET EXECLOAD: name=%s load_return=%d errno=%d\n", p->p_name, lret, error);
++		printf("SWEET EXECLOAD: proc=%s target=%s load_return=%d errno=%d offset=0x%llx size=0x%llx magic=0x%x cpu=0x%x subtype=0x%x filetype=%u flags=0x%x\n",
++		    p->p_name, imgp->ip_vp->v_name ? imgp->ip_vp->v_name : "?", lret, error,
++		    (unsigned long long)imgp->ip_arch_offset, (unsigned long long)imgp->ip_arch_size,
++		    mach_header->magic, mach_header->cputype, mach_header->cpusubtype,
++		    mach_header->filetype, mach_header->flags);
+ #endif
+ 
+ 		KERNEL_DEBUG_CONSTANT(BSDDBG_CODE(DBG_BSD_PROC, BSD_PROC_EXITREASON_CREATE) | DBG_FUNC_NONE,
+diff --git a/bsd/kern/mach_loader.c b/bsd/kern/mach_loader.c
+--- a/bsd/kern/mach_loader.c
++++ b/bsd/kern/mach_loader.c
+@@ -586,11 +586,11 @@
+ 
+ 	if (lret != LOAD_SUCCESS) {
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+-		if (lret == LOAD_BADMACHO) {
+-			printf("SWEET MACHLOAD: parse failed vnode=%s arch_size=0x%llx file_size=0x%llx\n",
+-			    vp->v_name ? vp->v_name : "?", (unsigned long long)macho_size,
+-			    (unsigned long long)file_size);
+-		}
++		printf("SWEET MACHLOAD: parse return=%d vnode=%s filetype=%u flags=0x%x cpu=0x%x subtype=0x%x ncmds=%u sizeofcmds=0x%x arch_offset=0x%llx arch_size=0x%llx file_size=0x%llx\n",
++		    lret, vp->v_name ? vp->v_name : "?", header->filetype, header->flags,
++		    header->cputype, header->cpusubtype, header->ncmds, header->sizeofcmds,
++		    (unsigned long long)file_offset, (unsigned long long)macho_size,
++		    (unsigned long long)file_size);
+ #endif
+ 		vm_map_deallocate(map); /* will lose pmap reference too */
+ 		return lret;
+@@ -1347,6 +1347,9 @@
+ 						    MIN(PAGE_SIZE, cmds_size),
+ 						    &tainted);
+ 						if (!valid || (tainted & CS_VALIDATE_TAINTED)) {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++							printf("SWEET MACHLOAD: code-page rejection vnode=%s off=0x%llx valid=%d tainted=0x%x enforce=%d csflags=0x%x\n", vp->v_name ? vp->v_name : "?", (unsigned long long)(file_offset + off), valid, tainted, cs_process_global_enforcement(), result->csflags);
++#endif
+ 							if (cs_debug) {
+ 								printf("CODE SIGNING: %s[%d]: invalid initial page at offset %lld validated:%d tainted:%d csflags:0x%x\n",
+ 								    vp->v_name, proc_getpid(p), (long long)(file_offset + off), valid, tainted, result->csflags);
+@@ -1479,11 +1482,17 @@
+ 
+ 	if (ret == LOAD_SUCCESS) {
+ 		if (!got_code_signatures && cs_process_global_enforcement()) {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++			printf("SWEET MACHLOAD: missing code signature vnode=%s depth=%d cmd=0x%x enforce=%d\n", vp->v_name ? vp->v_name : "?", depth, sweet_last_cmd, cs_process_global_enforcement());
++#endif
+ 			ret = LOAD_FAILURE;
+ 		}
+ 
+ 		/* Make sure if we need dyld, we got it */
+ 		if (result->needs_dynlinker && !dlp) {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++			printf("SWEET MACHLOAD: required dyld command missing vnode=%s depth=%d filetype=%u flags=0x%x\n", vp->v_name ? vp->v_name : "?", depth, header->filetype, header->flags);
++#endif
+ 			ret = LOAD_FAILURE;
+ 		}
+ 
+@@ -1533,9 +1542,12 @@
+ 	}
+ 
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+-	if (ret == LOAD_BADMACHO) {
+-		printf("SWEET MACHLOAD: vnode=%s depth=%d pass=%d last_cmd=0x%x offset=0x%zx macho_size=0x%llx\n",
+-		    vp->v_name ? vp->v_name : "?", depth, pass, sweet_last_cmd, offset, (unsigned long long)macho_size);
++	if (ret != LOAD_SUCCESS) {
++		printf("SWEET MACHLOAD: parser return=%d vnode=%s depth=%d pass=%d last_cmd=0x%x offset=0x%zx macho_size=0x%llx filetype=%u flags=0x%x signed=%d needs_dyld=%d dyld_cmd=%d thread_count=%u entry_valid=%d\n",
++		    ret, vp->v_name ? vp->v_name : "?", depth, pass, sweet_last_cmd, offset,
++		    (unsigned long long)macho_size, header->filetype, header->flags,
++		    got_code_signatures, result->needs_dynlinker, dlp != NULL,
++		    result->thread_count, result->validentry);
+ 	}
+ #endif
+ 	if (ret == LOAD_BADMACHO && found_xhdr) {
