@@ -1,0 +1,108 @@
+--- a/bsd/kern/mach_loader.c
++++ b/bsd/kern/mach_loader.c
+@@ -3132,6 +3132,9 @@
+ 	ret = get_macho_vnode(name, cputype, header,
+ 	    &file_offset, &macho_size, macho_data, &vp, imgp);
+ 	if (ret) {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		printf("SWEET DYLD: vnode-load failed path=%s ret=%d\n", name, ret);
++#endif
+ 		goto novp_out;
+ 	}
+ 
+@@ -3141,6 +3144,11 @@
+ 
+ 	ret = parse_machfile(vp, map, thread, header, file_offset,
+ 	    macho_size, depth, slide, 0, myresult, result, imgp);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	if (ret != LOAD_SUCCESS) {
++		printf("SWEET DYLD: mach-parse failed path=%s ret=%d\n", name, ret);
++	}
++#endif
+ 
+ 	if (ret == LOAD_SUCCESS) {
+ 		if (result->threadstate) {
+@@ -3788,6 +3796,9 @@
+ 	NDINIT(ndp, LOOKUP, OP_OPEN, FOLLOW | LOCKLEAF, UIO_SYSSPACE, CAST_USER_ADDR_T(path), ctx);
+ 
+ 	if ((error = namei(ndp)) != 0) {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		printf("SWEET DYLDVNODE: stage=namei path=%s errno=%d\n", path, error);
++#endif
+ 		if (error == ENOENT) {
+ 			error = LOAD_ENOENT;
+ 		} else {
+@@ -3806,35 +3817,53 @@
+ 
+ 	/* get size */
+ 	if ((error = vnode_size(vp, &fsize, ctx)) != 0) {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		printf("SWEET DYLDVNODE: stage=vnode_size path=%s errno=%d\n", path, error);
++#endif
+ 		error = LOAD_FAILURE;
+ 		goto bad1;
+ 	}
+ 
+ 	/* Check mount point */
+ 	if (vp->v_mount->mnt_flag & MNT_NOEXEC) {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		printf("SWEET DYLDVNODE: stage=noexec path=%s mnt_flag=0x%x\n", path, vp->v_mount->mnt_flag);
++#endif
+ 		error = LOAD_PROTECT;
+ 		goto bad1;
+ 	}
+ 
+ 	/* check access */
+ 	if ((error = vnode_authorize(vp, NULL, KAUTH_VNODE_EXECUTE | KAUTH_VNODE_READ_DATA, ctx)) != 0) {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		printf("SWEET DYLDVNODE: stage=authorize path=%s errno=%d\n", path, error);
++#endif
+ 		error = LOAD_PROTECT;
+ 		goto bad1;
+ 	}
+ 
+ 	/* try to open it */
+ 	if ((error = VNOP_OPEN(vp, FREAD, ctx)) != 0) {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		printf("SWEET DYLDVNODE: stage=open path=%s errno=%d\n", path, error);
++#endif
+ 		error = LOAD_PROTECT;
+ 		goto bad1;
+ 	}
+ 
+ 	if ((error = vn_rdwr(UIO_READ, vp, (caddr_t)header, sizeof(*header), 0,
+ 	    UIO_SYSSPACE, IO_NODELOCKED, kerncred, &resid, p)) != 0) {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		printf("SWEET DYLDVNODE: stage=header-read path=%s errno=%d\n", path, error);
++#endif
+ 		error = LOAD_IOERROR;
+ 		goto bad2;
+ 	}
+ 
+ 	if (resid) {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		printf("SWEET DYLDVNODE: stage=short-header path=%s resid=%d\n", path, resid);
++#endif
+ 		error = LOAD_BADMACHO;
+ 		goto bad2;
+ 	}
+@@ -3845,6 +3874,9 @@
+ 	} else if (OSSwapBigToHostInt32(header->fat_header.magic) == FAT_MAGIC) {
+ 		is_fat = TRUE;
+ 	} else {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		printf("SWEET DYLDVNODE: stage=magic path=%s magic=0x%x\n", path, header->fat_header.magic);
++#endif
+ 		error = LOAD_BADMACHO;
+ 		goto bad2;
+ 	}
+@@ -3898,6 +3930,9 @@
+ 		 * refuse to load it because of this check.
+ 		 */
+ 		if ((cpu_type_t)header->mach_header.cputype != cputype) {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++			printf("SWEET DYLDVNODE: stage=cpu path=%s actual=0x%x expected=0x%x\n", path, header->mach_header.cputype, cputype);
++#endif
+ 			error = LOAD_BADARCH;
+ 			goto bad2;
+ 		}
