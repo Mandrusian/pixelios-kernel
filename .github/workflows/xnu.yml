@@ -16,6 +16,13 @@ on:
       machine_config:
         description: xnu MACHINE_CONFIG
         default: SWEET
+  pull_request:
+    branches: [phase7d13-exec-failure-diagnostics-20261031]
+    paths:
+      - "xnu/patches/**"
+      - "upstream-patches/**"
+      - "tools/setup-upstream.sh"
+      - ".github/workflows/xnu.yml"
   push:
     branches: [main, phase5-macos15-toolchain-probe-ci, phase7c12-raven-usbroot-build-ci, phase7d13-exec-failure-diagnostics-20261031, phase7d14-usermanagerd-persona-20261031]
     paths:
