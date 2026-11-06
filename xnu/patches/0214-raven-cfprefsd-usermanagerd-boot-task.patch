@@ -1,0 +1,10 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -7426,4 +7426,6 @@
+ 		    strcmp(p->p_name, "runningboardd") == 0 ||
+ 		    strcmp(p->p_name, "containermanagerd") == 0 ||
+-		    strcmp(p->p_name, "distnoted") == 0;
++		    strcmp(p->p_name, "distnoted") == 0 ||
++		    strcmp(p->p_name, "cfprefsd") == 0 ||
++		    strcmp(p->p_name, "usermanagerd") == 0;
+ 		boolean_t sweet_boot_task_parent = p->p_pptr == initproc;
