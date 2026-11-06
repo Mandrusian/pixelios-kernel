@@ -1,6 +1,9 @@
 --- a/bsd/dev/sweet_restart.c
 +++ b/bsd/dev/sweet_restart.c
-@@ -70,8 +70,124 @@
+@@ -65,14 +65,130 @@
+ 	}
+ }
+ 
 +/*
 + * Panic banner: two big digits on the boot framebuffer, a 5 s pause, then the reset below.
 + * Codes: 10 data abort, 11 instruction abort, 12 SP alignment, 14 assertion, 20 watchdog,
@@ -129,3 +132,6 @@
 +	case SWEET_PE_PANIC_NOCALL:
 +		sweet_panic_banner();
 +		sweet_machine_reset(0);
+ 	default:
+ 		return -1;      /* halt etc.: unchanged (the caller spins) */
+ 	}

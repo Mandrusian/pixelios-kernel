@@ -8,7 +8,7 @@
 +	static int sweet_op_n;
 +	char pn[32];
 +	proc_name(proc_selfpid(), pn, sizeof(pn));
-+	if (vp != NULL && sweet_op_n < 2500 && !strncmp(pn, "containermanager", 16)) {
++	if (vp != NULL && sweet_op_n < 3500 && proc_selfpid() >= 28 && proc_selfpid() <= 60) {
 +		char *pb = (char *)kalloc_data(256, Z_WAITOK | Z_ZERO);
 +		if (pb != NULL) {
 +			int pl = 256;
@@ -16,7 +16,7 @@
 +			if (vn_getpath(vp, pb, &pl) != 0) {
 +				pb[0] = 0;
 +			}
-+			printf("SWEET OPEN %s %s\n", pn, pb);
++			printf("SWEET OPEN %d %s %s\n", proc_selfpid(), pn, pb);
 +			kfree_data(pb, 256);
 +		}
 +	}
