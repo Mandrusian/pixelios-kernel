@@ -1,16 +1,24 @@
 --- a/bsd/kern/sweet_amfi.c
 +++ b/bsd/kern/sweet_amfi.c
-@@ -330,4 +330,19 @@
+@@ -330,4 +330,27 @@
 +static int
-+sweet_trace_lookup(kauth_cred_t cred __unused, struct vnode *dvp __unused,
-+    struct label *dlabel __unused, struct componentname *cnp)
++sweet_trace_open(kauth_cred_t cred __unused, struct vnode *vp,
++    struct label *label __unused, int acc_mode __unused)
 +{
-+	static int sweet_lk_n;
++	static int sweet_op_n;
 +	char pn[32];
 +	proc_name(proc_selfpid(), pn, sizeof(pn));
-+	if (cnp != NULL && cnp->cn_nameptr != NULL && sweet_lk_n < 2500 && !strncmp(pn, "containermanager", 16)) {
-+		sweet_lk_n++;
-+		printf("SWEET LOOKUP %s %.*s\n", pn, (int)cnp->cn_namelen, cnp->cn_nameptr);
++	if (vp != NULL && sweet_op_n < 2500 && !strncmp(pn, "containermanager", 16)) {
++		char *pb = (char *)kalloc_data(256, Z_WAITOK | Z_ZERO);
++		if (pb != NULL) {
++			int pl = 256;
++			sweet_op_n++;
++			if (vn_getpath(vp, pb, &pl) != 0) {
++				pb[0] = 0;
++			}
++			printf("SWEET OPEN %s %s\n", pn, pb);
++			kfree_data(pb, 256);
++		}
 +	}
 +	return 0;
 +}
@@ -18,5 +26,5 @@
  static const struct mac_policy_ops sweet_sandbox_mac_ops = {
  	.mpo_policy_syscall = sweet_sandbox_syscall,
  	.mpo_priv_grant = sweet_sandbox_priv_grant,
-+	.mpo_vnode_check_lookup = sweet_trace_lookup,
++	.mpo_vnode_check_open = sweet_trace_open,
  };
