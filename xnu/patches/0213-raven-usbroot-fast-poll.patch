@@ -1,0 +1,12 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -783,3 +783,8 @@
+         clock_interval_to_deadline(3000,NSEC_PER_MSEC,&deadline);
+-        while (!ur.done && mach_absolute_time()<deadline)ud_sleep_ms(5);
++        while (!ur.done && mach_absolute_time()<deadline) {
++            /* Was 5 ms per poll: capped the root at ~180 reads/s. */
++            uint64_t poll;clock_interval_to_deadline(100,NSEC_PER_USEC,&poll);
++            (void)assert_wait_deadline(&ud.sleep_chan,THREAD_UNINT,poll);
++            thread_block(THREAD_CONTINUE_NULL);
++        }
+         __asm__ volatile ("dmb ish" ::: "memory");
