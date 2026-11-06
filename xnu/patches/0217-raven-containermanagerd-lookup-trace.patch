@@ -1,0 +1,22 @@
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -330,4 +330,19 @@
++static int
++sweet_trace_lookup(kauth_cred_t cred __unused, struct vnode *dvp __unused,
++    struct label *dlabel __unused, const char *path, size_t pathlen __unused)
++{
++	static int sweet_lk_n;
++	char pn[32];
++	proc_name(proc_selfpid(), pn, sizeof(pn));
++	if (sweet_lk_n < 1500 && !strncmp(pn, "containermanager", 16)) {
++		sweet_lk_n++;
++		printf("SWEET LOOKUP %s %.120s\n", pn, path);
++	}
++	return 0;
++}
++
+ static const struct mac_policy_ops sweet_sandbox_mac_ops = {
+ 	.mpo_policy_syscall = sweet_sandbox_syscall,
+ 	.mpo_priv_grant = sweet_sandbox_priv_grant,
++	.mpo_vnode_check_lookup_preflight = sweet_trace_lookup,
+ };

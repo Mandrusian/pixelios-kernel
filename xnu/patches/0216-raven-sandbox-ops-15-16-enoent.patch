@@ -1,8 +1,0 @@
---- a/bsd/kern/sweet_amfi.c
-+++ b/bsd/kern/sweet_amfi.c
-@@ -300,3 +300,5 @@
- 	case 6:         /* extension consume */
-+	case 15:        /* returns data (unknown); containermanagerd crashed on empty success */
-+	case 16:
- 	case 0x43:      /* container expected */
- 		return ENOENT;
