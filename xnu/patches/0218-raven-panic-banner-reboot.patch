@@ -1,0 +1,131 @@
+--- a/bsd/dev/sweet_restart.c
++++ b/bsd/dev/sweet_restart.c
+@@ -70,8 +70,124 @@
++/*
++ * Panic banner: two big digits on the boot framebuffer, a 5 s pause, then the reset below.
++ * Codes: 10 data abort, 11 instruction abort, 12 SP alignment, 14 assertion, 20 watchdog,
++ * 30 launchd (pid 1) died, 99 other. Needs boot-arg debug bit 0x4000 so the panic path reaches PEHaltRestart.
++ * No locks, no allocation.
++ */
++extern char *debug_buf_base;
++
++static int
++sweet_has(const char *s, const char *f)
++{
++	for (int i = 0; i < 700 && s[i]; i++) {
++		int j = 0;
++		while (f[j] && s[i + j] == f[j]) {
++			j++;
++		}
++		if (!f[j]) {
++			return 1;
++		}
++	}
++	return 0;
++}
++
++static int
++sweet_panic_code(void)
++{
++	const char *b = debug_buf_base;
++	if (b == NULL) {
++		return 99;
++	}
++	if (sweet_has(b, "data abort")) {
++		return 10;
++	}
++	if (sweet_has(b, "instruction fetch abort")) {
++		return 11;
++	}
++	if (sweet_has(b, "SP alignment")) {
++		return 12;
++	}
++	if (sweet_has(b, "ssertion")) {
++		return 14;
++	}
++	if (sweet_has(b, "watchdog")) {
++		return 20;
++	}
++	if (sweet_has(b, "initproc") || sweet_has(b, "Process 1 ") || sweet_has(b, "launchd")) {
++		return 30;
++	}
++	return 99;
++}
++
++static void
++sweet_fill(unsigned int x, unsigned int y, unsigned int w, unsigned int h)
++{
++	uint8_t *base = (uint8_t *)PE_state.video.v_baseAddr;
++	for (unsigned int j = 0; j < h; j++) {
++		uint32_t *row = (uint32_t *)(base + (uint64_t)(y + j) * PE_state.video.v_rowBytes) + x;
++		for (unsigned int i = 0; i < w; i++) {
++			row[i] = 0xFFFFFFFFu;
++		}
++	}
++}
++
++static void
++sweet_panic_banner(void)
++{
++	static const uint8_t seg[10] = { 0x3f, 0x06, 0x5b, 0x4f, 0x66, 0x6d, 0x7d, 0x07, 0x7f, 0x6f };
++	unsigned int W = (unsigned int)PE_state.video.v_width, H = (unsigned int)PE_state.video.v_height;
++	int code = sweet_panic_code();
++
++	printf("SWEET PANIC code=%d\n", code);
++	if (PE_state.video.v_baseAddr != 0 && (PE_state.video.v_depth & 0xff) == 32 && W >= 600 && H >= 1000) {
++		uint8_t *base = (uint8_t *)PE_state.video.v_baseAddr;
++		for (unsigned int y = 0; y < H; y++) {
++			uint32_t *row = (uint32_t *)(base + (uint64_t)y * PE_state.video.v_rowBytes);
++			for (unsigned int x = 0; x < W; x++) {
++				row[x] = 0;
++			}
++		}
++		unsigned int dw = W / 3, dh = H / 3, t = dw / 6, gap = W / 12;
++		unsigned int y0 = H / 3;
++		for (int d = 0; d < 2; d++) {
++			unsigned int x0 = (W - 2 * dw - gap) / 2 + (unsigned int)d * (dw + gap);
++			uint8_t m = seg[d == 0 ? code / 10 : code % 10];
++			if (m & 1) {
++				sweet_fill(x0 + t, y0, dw - 2 * t, t);
++			}
++			if (m & 2) {
++				sweet_fill(x0 + dw - t, y0, t, (dh + t) / 2);
++			}
++			if (m & 4) {
++				sweet_fill(x0 + dw - t, y0 + (dh - t) / 2, t, (dh + t) / 2);
++			}
++			if (m & 8) {
++				sweet_fill(x0 + t, y0 + dh - t, dw - 2 * t, t);
++			}
++			if (m & 16) {
++				sweet_fill(x0, y0 + (dh - t) / 2, t, (dh + t) / 2);
++			}
++			if (m & 32) {
++				sweet_fill(x0, y0, t, (dh + t) / 2);
++			}
++			if (m & 64) {
++				sweet_fill(x0 + t, y0 + (dh - t) / 2, dw - 2 * t, t);
++			}
++		}
++	}
++	uint64_t now = mach_absolute_time(), span;
++	nanoseconds_to_absolutetime(5000000000ULL, &span);
++	while (mach_absolute_time() - now < span) {
++		__asm__ volatile ("yield");
++	}
++}
++
+ static int
+ sweet_halt_restart(unsigned int type)
+ {
+ 	switch (type) {
+-	case SWEET_PE_RESTART:
+-	case SWEET_PE_PANIC_RESTART:
+-	case SWEET_PE_PANIC_NOCALL:
+-		sweet_machine_reset(0);
++	case SWEET_PE_RESTART:
++		sweet_machine_reset(0);
++	case SWEET_PE_PANIC_RESTART:
++	case SWEET_PE_PANIC_NOCALL:
++		sweet_panic_banner();
++		sweet_machine_reset(0);
