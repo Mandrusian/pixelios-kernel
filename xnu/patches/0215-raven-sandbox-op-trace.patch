@@ -1,0 +1,20 @@
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -295,3 +295,17 @@
+ sweet_sandbox_syscall(struct proc *p, int call, user_addr_t arg)
+ {
++	{
++		static int sweet_sbx_n;
++		char pn[32];
++		proc_name(proc_pid(p), pn, sizeof(pn));
++		if (sweet_sbx_n < 400 && (!strncmp(pn, "containermanager", 16) || !strncmp(pn, "backboardd", 10))) {
++			uint64_t w[6] = {0};
++			sweet_sbx_n++;
++			if (arg) {
++				(void)copyin(arg, w, sizeof(w));
++			}
++			printf("SWEET SBX %s op=%d arg=0x%llx w=%llx %llx %llx %llx %llx %llx\n", pn, call,
++			    (unsigned long long)arg, w[0], w[1], w[2], w[3], w[4], w[5]);
++		}
++	}
+ 	if (call >= 0 && call < 64 && !(sweet_sandbox_seen & (1ULL << call))) {
