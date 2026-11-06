@@ -1,21 +1,16 @@
 --- a/bsd/kern/sweet_amfi.c
 +++ b/bsd/kern/sweet_amfi.c
-@@ -330,4 +330,24 @@
+@@ -330,4 +330,19 @@
 +static int
-+sweet_trace_lookup(kauth_cred_t cred __unused, struct vnode *dvp,
++sweet_trace_lookup(kauth_cred_t cred __unused, struct vnode *dvp __unused,
 +    struct label *dlabel __unused, struct componentname *cnp)
 +{
 +	static int sweet_lk_n;
 +	char pn[32];
 +	proc_name(proc_selfpid(), pn, sizeof(pn));
-+	if (sweet_lk_n < 2500 && !strncmp(pn, "containermanager", 16)) {
-+		char dp[120];
-+		int dl = sizeof(dp);
++	if (cnp != NULL && cnp->cn_nameptr != NULL && sweet_lk_n < 2500 && !strncmp(pn, "containermanager", 16)) {
 +		sweet_lk_n++;
-+		if (vn_getpath(dvp, dp, &dl) != 0) {
-+			dp[0] = 0;
-+		}
-+		printf("SWEET LOOKUP %s %s / %.*s\n", pn, dp, (int)cnp->cn_namelen, cnp->cn_nameptr);
++		printf("SWEET LOOKUP %s %.*s\n", pn, (int)cnp->cn_namelen, cnp->cn_nameptr);
 +	}
 +	return 0;
 +}
