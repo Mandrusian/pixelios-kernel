@@ -1,0 +1,9 @@
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -895,5 +895,5 @@
+ 		vm_map_unlock_read(map);
+ 	}
+-	if (sig == 6 || sig == 5) {
++	if (sig == 6 || sig == 5 || sig == 11) {
+ 		sweet_crash_strings(name);
+ 	}
