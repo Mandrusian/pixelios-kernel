@@ -1,0 +1,27 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1286,5 +1286,24 @@
+ 				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
+ 				    (size_t)w * 4);
+ 			}
+ 		}
++		static uint32_t sweet_fb_samples;
++		if (src != 0 && bpe == 4 && sweet_fb_samples < 40) {
++			uint64_t nz = 0, tot = 0;
++			uint32_t first = 0;
++			sweet_fb_samples++;
++			for (int32_t y = 0; y < h; y += 16) {
++				const uint32_t *row = (const uint32_t *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4);
++				for (int32_t x = 0; x < w; x += 16) {
++					tot++;
++					if (row[x] & 0x00ffffff) {
++						if (nz == 0) {
++							first = row[x];
++						}
++						nz++;
++					}
++				}
++			}
++			IOLog("SWEET FB: sample nonblack %llu/%llu first 0x%x\n", nz, tot, first);
++		}
+ 		s->release();
