@@ -1,0 +1,9 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -7432,5 +7432,5 @@
+ 		    strcmp(p->p_name, "MobileGestaltHelper") == 0 ||
+ 		    strcmp(p->p_name, "lsd") == 0 ||
+-		    strcmp(p->p_name, "com.apple.datami") == 0 ||
++		    strcmp(p->p_name, "com.apple.datamigrator") == 0 ||
+ 		    strncmp(p->p_name, "migrationplugin", 15) == 0;
+ 		boolean_t sweet_boot_task_parent = p->p_pptr == initproc;
