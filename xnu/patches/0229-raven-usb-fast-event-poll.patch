@@ -1,0 +1,17 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -920,5 +920,13 @@
+ 			printf("SWEET USB: ue0 rx %llu tx %llu frames\n", ud.rx_frames, ud.tx_frames);
+ 		}
+-		ud_sleep_ms(1);
++		for (unsigned fast = 0; fast < 20; fast++) {
++			uint64_t fd;
++			clock_interval_to_deadline(50, NSEC_PER_USEC, &fd);
++			(void)assert_wait_deadline(&ud.sleep_chan, THREAD_UNINT, fd);
++			thread_block(THREAD_CONTINUE_NULL);
++			if (dwc_rd(GEVNTCOUNT) & 0xffff) {
++				break;
++			}
++		}
+ 	}
+ }
