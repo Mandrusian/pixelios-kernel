@@ -1,6 +1,6 @@
 --- a/bsd/kern/sweet_amfi.c
 +++ b/bsd/kern/sweet_amfi.c
-@@ -335,6 +335,6 @@
+@@ -335,5 +335,5 @@
  	char pn[32];
  	proc_name(proc_selfpid(), pn, sizeof(pn));
 -	if (vp != NULL && sweet_op_n < 3500 && proc_selfpid() >= 28 && proc_selfpid() <= 60) {
