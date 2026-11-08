@@ -1,0 +1,37 @@
+--- a/bsd/dev/sweet_restart.c
++++ b/bsd/dev/sweet_restart.c
+@@ -21,3 +21,4 @@
+ #include <sys/proc_internal.h>
+ #include <sys/signalvar.h>
++#include <kern/task.h>
+ #include <stdint.h>
+@@ -100,4 +101,7 @@
+ static char sweet_kill_target[MAXCOMLEN * 2 + 1];
++static int sweet_kill_stack;
++extern task_t proc_task(proc_t);
++extern void sweet_sample_task(const char *name, int pid, task_t task);
+ static int
+ sweet_kill_cb(proc_t p, void *arg __unused)
+ {
+@@ -106,5 +110,9 @@
+ 	proc_name(proc_pid(p), nm, sizeof(nm));
+ 	if (strcmp(nm, sweet_kill_target) == 0) {
+-		printf("SWEET KILL: SIGABRT -> %s pid %d\n", nm, proc_pid(p));
+-		psignal(p, SIGABRT);
++		if (sweet_kill_stack) {
++			sweet_sample_task(nm, proc_pid(p), proc_task(p));
++		} else {
++			printf("SWEET KILL: SIGABRT -> %s pid %d\n", nm, proc_pid(p));
++			psignal(p, SIGABRT);
++		}
+ 	}
+ 	return PROC_RETURNED;
+@@ -133,4 +141,9 @@
+ 			strlcpy(sweet_kill_target, buf + 11, sizeof(sweet_kill_target));
+ 			proc_iterate(PROC_ALLPROCLIST, sweet_kill_cb, NULL, NULL, NULL);
++		} else if (strncmp(buf, "SWEET-STACK ", 12) == 0) {
++			strlcpy(sweet_kill_target, buf + 12, sizeof(sweet_kill_target));
++			sweet_kill_stack = 1;
++			proc_iterate(PROC_ALLPROCLIST, sweet_kill_cb, NULL, NULL, NULL);
++			sweet_kill_stack = 0;
+ 		}
