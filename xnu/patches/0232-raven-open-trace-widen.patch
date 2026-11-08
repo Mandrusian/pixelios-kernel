@@ -1,0 +1,9 @@
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -335,6 +335,6 @@
+ 	char pn[32];
+ 	proc_name(proc_selfpid(), pn, sizeof(pn));
+-	if (vp != NULL && sweet_op_n < 3500 && proc_selfpid() >= 28 && proc_selfpid() <= 60) {
++	if (vp != NULL && sweet_op_n < 6000 && proc_selfpid() >= 28 && proc_selfpid() <= 90 && strcmp(pn, "lsd") != 0 && strcmp(pn, "logd") != 0) {
+ 		char *pb = (char *)kalloc_data(256, Z_WAITOK | Z_ZERO);
+ 		if (pb != NULL) {
