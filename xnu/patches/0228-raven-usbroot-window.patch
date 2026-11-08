@@ -1,0 +1,114 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -275,4 +275,14 @@
+     uint8_t data[UR_MAX_READ_BYTES];
+ } ur;
+ static uint32_t ur_next_seq;
++/* Windowed reads: up to UR_WIN 1 KiB requests in flight at once. */
++#define UR_WIN 8u
++static struct {
++    volatile uint32_t n;
++    uint32_t seq[UR_WIN];
++    uint64_t lba[UR_WIN];
++    uint32_t cnt[UR_WIN];
++    volatile bool done[UR_WIN];
++    uint8_t data[UR_WIN][UR_MAX_READ_BYTES];
++} urw;
+ 
+@@ -612,2 +612,16 @@
+         frame[13] != (UR_ETHERTYPE & 255u)) return false;
++    if (urw.n) {
++        if (memcmp(frame, ud_phone_mac, 6) || memcmp(frame + 6, px_host_mac, 6)) return true;
++        uint8_t wtemp[UR_MAX_READ_BYTES];
++        for (uint32_t k = 0; k < urw.n; k++) {
++            if (urw.done[k]) continue;
++            if (!ur_check_reply(frame + 14, length - 14, urw.seq[k], urw.lba[k], urw.cnt[k], wtemp)) {
++                memcpy(urw.data[k], wtemp, urw.cnt[k]);
++                __asm__ volatile ("dmb ish" ::: "memory");
++                urw.done[k] = true;
++                break;
++            }
++        }
++        return true;
++    }
+     if (!ur.pending ||
+@@ -1190,5 +1190,55 @@
+     return ur_exchange(lba,nsect*UR_SECTOR_BYTES,UR_OP_READ,dest);
+ }
+ 
++/* Up to UR_WIN 1 KiB chunks outstanding at once; hides the per-request round trip. */
++int sweet_usbroot_read_win(uint64_t lba,uint32_t nsect,uint8_t *dest);
++int sweet_usbroot_read_win(uint64_t lba,uint32_t nsect,uint8_t *dest)
++{
++    uint32_t nch=(nsect+1)/2;
++    if(!dest || !nsect || nch>UR_WIN)return EINVAL;
++    if(!ur.enabled || !ud.gs101 || ud.lock==NULL)return ENXIO;
++    uint64_t deadline;
++    clock_interval_to_deadline(30000,NSEC_PER_MSEC,&deadline);
++    while ((!ud.configured || ud.data_alt!=1) && mach_absolute_time()<deadline)
++        ud_sleep_ms(5);
++    if (!ud.configured || ud.data_alt!=1)return ETIMEDOUT;
++    for(uint32_t k=0;k<nch;k++){
++        urw.lba[k]=lba+2ull*k;
++        urw.cnt[k]=(k==nch-1 && (nsect&1u))?512u:1024u;
++        urw.done[k]=false;
++    }
++    __asm__ volatile ("dmb ish" ::: "memory");
++    urw.n=nch;
++    for(unsigned retry=0;retry<4;retry++){
++        for(uint32_t k=0;k<nch;k++){
++            if(urw.done[k])continue;
++            uint32_t seq=++ur_next_seq;
++            if(!seq)seq=++ur_next_seq;
++            urw.seq[k]=seq;
++            (void)ud_ur_send(seq,urw.lba[k],urw.cnt[k],UR_OP_READ);
++        }
++        clock_interval_to_deadline(1500,NSEC_PER_MSEC,&deadline);
++        for(;;){
++            bool all=true;
++            for(uint32_t k=0;k<nch;k++)if(!urw.done[k])all=false;
++            if(all || mach_absolute_time()>=deadline)break;
++            uint64_t poll;clock_interval_to_deadline(100,NSEC_PER_USEC,&poll);
++            (void)assert_wait_deadline(&ud.sleep_chan,THREAD_UNINT,poll);
++            thread_block(THREAD_CONTINUE_NULL);
++        }
++        bool all=true;
++        for(uint32_t k=0;k<nch;k++)if(!urw.done[k])all=false;
++        if(all){
++            __asm__ volatile ("dmb ish" ::: "memory");
++            urw.n=0;
++            for(uint32_t k=0;k<nch;k++)memcpy(dest+1024u*k,urw.data[k],urw.cnt[k]);
++            return 0;
++        }
++    }
++    urw.n=0;
++    printf("SWEET USBROOT: window timeout lba=%llu nsect=%u\n", lba, nsect);
++    return ETIMEDOUT;
++}
++
+ static void
+ ud_px_tick(uint32_t tick)
+--- a/bsd/dev/sweet_usbroot.c
++++ b/bsd/dev/sweet_usbroot.c
+@@ -33,3 +33,4 @@
+ extern int sweet_usbroot_capacity(uint64_t *sectors);
+ extern int sweet_usbroot_read_sectors(uint64_t lba, uint32_t nsect, uint8_t *dst);
++extern int sweet_usbroot_read_win(uint64_t lba, uint32_t nsect, uint8_t *dst);
+ 
+@@ -118,4 +118,4 @@
+     while (done<count) {
+-        uint8_t data[UR_MAX_READ_BYTES];
+-        uint32_t bytes=MIN(count-done,UR_MAX_READ_BYTES);
++        static uint8_t data[8192];
++        uint32_t bytes=MIN(count-done,8192u);
+         uint64_t sector=blk+(uint64_t)done/UR_SECTOR_BYTES;
+@@ -123,3 +123,3 @@
+         if(reading){
+-            err=sweet_usbroot_read_sectors(sector,bytes/UR_SECTOR_BYTES,data);
++            err=sweet_usbroot_read_win(sector,bytes/UR_SECTOR_BYTES,data);
+             if(err)break;
+@@ -150,3 +150,3 @@
+     case DKIOCSYNCHRONIZECACHE:return 0; /* Read-only, nothing to flush. */
+-    case DKIOCGETMAXBLOCKCOUNTREAD:*q=UR_MAX_READ_BYTES/urdisk.secsize;
++    case DKIOCGETMAXBLOCKCOUNTREAD:*q=8192u/urdisk.secsize;
+         if(!*q)*q=1;return 0;
