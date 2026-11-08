@@ -13,7 +13,7 @@
  static int
  sweet_kill_cb(proc_t p, void *arg __unused)
  {
-@@ -106,5 +110,9 @@
+@@ -106,6 +110,10 @@
  	proc_name(proc_pid(p), nm, sizeof(nm));
  	if (strcmp(nm, sweet_kill_target) == 0) {
 -		printf("SWEET KILL: SIGABRT -> %s pid %d\n", nm, proc_pid(p));
@@ -26,7 +26,7 @@
 +		}
  	}
  	return PROC_RETURNED;
-@@ -133,4 +141,9 @@
+@@ -133,3 +141,8 @@
  			strlcpy(sweet_kill_target, buf + 11, sizeof(sweet_kill_target));
  			proc_iterate(PROC_ALLPROCLIST, sweet_kill_cb, NULL, NULL, NULL);
 +		} else if (strncmp(buf, "SWEET-STACK ", 12) == 0) {
