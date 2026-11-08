@@ -1,0 +1,34 @@
+--- a/bsd/dev/sweet_restart.c
++++ b/bsd/dev/sweet_restart.c
+@@ -19,3 +19,5 @@
+ #include <sys/socket.h>
+ #include <netinet/in.h>
++#include <sys/proc_internal.h>
++#include <sys/signalvar.h>
+ #include <stdint.h>
+@@ -97,4 +97,17 @@
+ 	}
+ }
+ 
++static char sweet_kill_target[MAXCOMLEN * 2 + 1];
++static int
++sweet_kill_cb(proc_t p, void *arg __unused)
++{
++	char nm[MAXCOMLEN * 2 + 1];
++	proc_name(proc_pid(p), nm, sizeof(nm));
++	if (strcmp(nm, sweet_kill_target) == 0) {
++		printf("SWEET KILL: SIGABRT -> %s pid %d\n", nm, proc_pid(p));
++		psignal(p, SIGABRT);
++	}
++	return PROC_RETURNED;
++}
++
+ /* sweetremote=1: block on a UDP socket, reset on the magic payload (see the header). */
+@@ -130,4 +130,7 @@
+ 		} else if (strcmp(buf, "SWEET-RESET") == 0) {
+ 			printf("SWEET RESTART: remote restart\n");
+ 			sweet_machine_reset(0);
++		} else if (strncmp(buf, "SWEET-KILL ", 11) == 0) {
++			strlcpy(sweet_kill_target, buf + 11, sizeof(sweet_kill_target));
++			proc_iterate(PROC_ALLPROCLIST, sweet_kill_cb, NULL, NULL, NULL);
+ 		}
