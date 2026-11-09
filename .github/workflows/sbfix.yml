@@ -1,5 +1,8 @@
 name: sbfix
-on: workflow_dispatch
+on:
+  workflow_dispatch:
+  push:
+    paths: ["sbfix/**", ".github/workflows/sbfix.yml"]
 jobs:
   build:
     runs-on: macos-14
