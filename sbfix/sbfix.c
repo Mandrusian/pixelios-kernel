@@ -35,3 +35,4 @@ sbfix_init(void)
 	}
 	fprintf(stderr, "sbfix: pid %d lockdown %s setup %s\n", getpid(), m ? "patched" : "MISSING", r ? "patched" : "MISSING");
 }
+/* rebuild */
