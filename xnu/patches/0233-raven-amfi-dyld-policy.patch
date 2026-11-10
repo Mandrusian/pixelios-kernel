@@ -1,27 +1,13 @@
-diff --git a/bsd/conf/files b/bsd/conf/files
---- a/bsd/conf/files
-+++ b/bsd/conf/files
-@@ -382,2 +382,3 @@
- bsd/kern/sweet_amfi.c			standard
-+bsd/kern/sweet_miniamfi.c		standard
- bsd/kern/kern_csr.c			optional config_csr
-diff --git a/bsd/kern/sweet_miniamfi.c b/bsd/kern/sweet_miniamfi.c
---- /dev/null
-+++ b/bsd/kern/sweet_miniamfi.c
-@@ -0,0 +1,59 @@
-+/*
-+ * Stand-in for AppleMobileFileIntegrity's policy syscall: dyld asks it what it may do for the
-+ * process it starts (request 0x5a, "check dyld policy"). Everything is allowed, which lets
-+ * DYLD_INSERT_LIBRARIES and friends work (our own code inside SpringBoard).
-+ */
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -340,3 +340,52 @@
+ 	    error ? "NOT registered" : "registered", error);
++	{ extern void sweet_miniamfi_register(void); sweet_miniamfi_register(); }
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
-+#include <kern/startup.h>
-+#include <sys/proc.h>
-+#include <sys/systm.h>
-+#include <security/mac_policy.h>
-+
 +void sweet_miniamfi_register(void);
-+
 +#define SWEET_AMFI_CHECK_DYLD_POLICY    0x5a
 +#define SWEET_AMFI_QUERY_BOOTARG_STATE  0x60
 +
@@ -68,11 +54,3 @@ diff --git a/bsd/kern/sweet_miniamfi.c b/bsd/kern/sweet_miniamfi.c
 +	printf("SWEET AMFI: dyld policy stand-in %s (%d)\n", error ? "NOT registered" : "registered", error);
 +}
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
-diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
---- a/bsd/kern/sweet_amfi.c
-+++ b/bsd/kern/sweet_amfi.c
-@@ -340,3 +340,4 @@
- 	    error ? "NOT registered" : "registered", error);
-+	{ extern void sweet_miniamfi_register(void); sweet_miniamfi_register(); }
- }
- #endif /* ARM64_BOARD_CONFIG_SWEET */
