@@ -1,7 +1,7 @@
 diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
 --- a/bsd/kern/sweet_amfi.c
 +++ b/bsd/kern/sweet_amfi.c
-@@ -340,3 +340,52 @@
+@@ -340,3 +340,59 @@
  	    error ? "NOT registered" : "registered", error);
 +	{ extern void sweet_miniamfi_register(void); sweet_miniamfi_register(); }
  }
@@ -12,8 +12,9 @@ diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
 +#define SWEET_AMFI_QUERY_BOOTARG_STATE  0x60
 +
 +static int
-+sweet_miniamfi_syscall(__unused struct proc *p, int call, user_addr_t arg)
++sweet_miniamfi_syscall(struct proc *p, int call, user_addr_t arg)
 +{
++	static int seen;
 +	struct {
 +		uint64_t input_flags;
 +		user_addr_t output_flags;
@@ -22,6 +23,12 @@ diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
 +	uint64_t state = 0x86ULL;
 +	int error;
 +
++	if (seen < 80) {
++		char nm[32];
++		seen++;
++		proc_name(proc_pid(p), nm, sizeof(nm));
++		printf("SWEET AMFI: syscall %s call %#x\n", nm, call);
++	}
 +	if (call == SWEET_AMFI_QUERY_BOOTARG_STATE) {
 +		return copyout(&state, arg, sizeof(state));
 +	}
