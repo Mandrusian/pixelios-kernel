@@ -1,0 +1,78 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -382,2 +382,3 @@
+ bsd/kern/sweet_amfi.c			standard
++bsd/kern/sweet_miniamfi.c		standard
+ bsd/kern/kern_csr.c			optional config_csr
+diff --git a/bsd/kern/sweet_miniamfi.c b/bsd/kern/sweet_miniamfi.c
+--- /dev/null
++++ b/bsd/kern/sweet_miniamfi.c
+@@ -0,0 +1,59 @@
++/*
++ * Stand-in for AppleMobileFileIntegrity's policy syscall: dyld asks it what it may do for the
++ * process it starts (request 0x5a, "check dyld policy"). Everything is allowed, which lets
++ * DYLD_INSERT_LIBRARIES and friends work (our own code inside SpringBoard).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <kern/startup.h>
++#include <sys/proc.h>
++#include <sys/systm.h>
++#include <security/mac_policy.h>
++
++void sweet_miniamfi_register(void);
++
++#define SWEET_AMFI_CHECK_DYLD_POLICY    0x5a
++#define SWEET_AMFI_QUERY_BOOTARG_STATE  0x60
++
++static int
++sweet_miniamfi_syscall(__unused struct proc *p, int call, user_addr_t arg)
++{
++	struct {
++		uint64_t input_flags;
++		user_addr_t output_flags;
++	} args;
++	uint64_t flags = 0xffULL;
++	uint64_t state = 0x86ULL;
++	int error;
++
++	if (call == SWEET_AMFI_QUERY_BOOTARG_STATE) {
++		return copyout(&state, arg, sizeof(state));
++	}
++	if (call != SWEET_AMFI_CHECK_DYLD_POLICY) {
++		return ENOPOLICY;
++	}
++	error = copyin(arg, &args, sizeof(args));
++	if (error == 0) {
++		error = copyout(&flags, args.output_flags, sizeof(flags));
++	}
++	return error;
++}
++
++static const struct mac_policy_ops sweet_miniamfi_ops = {
++	.mpo_policy_syscall = sweet_miniamfi_syscall,
++};
++
++static struct mac_policy_conf sweet_miniamfi_conf = {
++	.mpc_name = "AMFI",
++	.mpc_fullname = "SWEET AMFI dyld policy stand-in",
++	.mpc_ops = &sweet_miniamfi_ops,
++};
++
++static mac_policy_handle_t sweet_miniamfi_handle;
++
++void
++sweet_miniamfi_register(void)
++{
++	int error = mac_policy_register(&sweet_miniamfi_conf, &sweet_miniamfi_handle, NULL);
++	printf("SWEET AMFI: dyld policy stand-in %s (%d)\n", error ? "NOT registered" : "registered", error);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -340,3 +340,4 @@
+ 	    error ? "NOT registered" : "registered", error);
++	{ extern void sweet_miniamfi_register(void); sweet_miniamfi_register(); }
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
