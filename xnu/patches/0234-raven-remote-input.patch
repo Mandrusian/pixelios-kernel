@@ -1,0 +1,23 @@
+--- a/bsd/dev/sweet_restart.c
++++ b/bsd/dev/sweet_restart.c
+@@ -143,3 +143,20 @@
+ 			strlcpy(sweet_kill_target, buf + 11, sizeof(sweet_kill_target));
+ 			proc_iterate(PROC_ALLPROCLIST, sweet_kill_cb, NULL, NULL, NULL);
++		} else if (strncmp(buf, "SWEET-TOUCH ", 12) == 0 || strncmp(buf, "SWEET-KEY ", 10) == 0) {
++			extern void sweet_hid_touch(int, int, int, int);
++			extern void sweet_hid_key(int, int);
++			bool touch = buf[6] == 'T';
++			char *e = buf + (touch ? 12 : 10);
++			unsigned long v[4] = { 0, 0, 0, 0 };
++			for (int n = 0; n < 4 && *e; n++) {
++				v[n] = strtoul(e, &e, 10);
++				while (*e == ' ') {
++					e++;
++				}
++			}
++			if (touch) {
++				sweet_hid_touch((int)v[0], (int)v[1], (int)v[2], (int)v[3]);
++			} else {
++				sweet_hid_key((int)v[0], (int)v[1]);
++			}
+ 		} else if (strncmp(buf, "SWEET-STACK ", 12) == 0) {
